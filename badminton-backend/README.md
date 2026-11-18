@@ -1,20 +1,21 @@
-# SBE Light Vs Dark Side Tournament — Turso Backend API
+# SBE Light Vs Dark Side Tournament — Vercel + Turso
 
-This Express API persists the tournament state (`config`, `groups`, `playerSkills`, `checkIns`, `qr1Matches`, `qr2Pools`, `qr2Matches`, `semis`, `finals`) in a **Turso (libSQL / SQLite)** database.
+The app is served from `public/index.html`; Vercel runs the Express API in `badminton-backend/server.js`. Tournament state and player check-ins are stored in **Turso (libSQL), a hosted SQLite-compatible database**. Vercel's function filesystem is temporary, so do not use a local `.db` file for persistent production data.
 
-## Setup
-1. Create a Turso database if you haven't already:
+## Deploy to Vercel
+1. Import this GitHub repository into Vercel with the repository root as the project root.
+2. Create a Turso database:
    ```bash
    turso db create badminton-tournament
    turso db show badminton-tournament --url
    ```
-2. Copy `.env.example` to `.env` and fill in `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`.
-3. Install dependencies and start:
+3. Add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` as Vercel project environment variables, then deploy. The API creates its tables automatically on first request.
+4. Open the Vercel URL. Cloud Sync uses the app's same-origin `/api` endpoints by default; no backend URL is needed.
+
+## Run locally
+1. From the repository root, install and start:
    ```bash
    npm install
    npm start
    ```
-
-## Deploy & Connect
-Deploy this folder to **Render**, **Railway**, **Fly.io**, or any Node.js host with `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` set as environment variables.
-Then in the web app (`index.html`), click **Cloud Sync** in the header and paste your deployed backend URL (e.g. `https://your-app.onrender.com`).
+Without Turso environment variables, local development uses `badminton-backend/local.db`. To use Turso locally instead, copy `.env.example` to `.env` in this directory and set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. The app and API are available at `http://localhost:3001`.

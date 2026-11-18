@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@libsql/client');
@@ -7,41 +7,66 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
-  console.error('Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN environment variables.');
-  process.exit(1);
+let db;
+function getDb() {
+  if (!db) {
+    const databaseUrl = process.env.TURSO_DATABASE_URL
+      || (!process.env.VERCEL ? 'file:./badminton-backend/local.db' : '');
+    const authToken = process.env.TURSO_AUTH_TOKEN;
+    if (!databaseUrl || (databaseUrl.startsWith('file:') && process.env.VERCEL) || (!databaseUrl.startsWith('file:') && !authToken)) {
+      throw new Error('Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN environment variables.');
+    }
+    const options = { url: databaseUrl };
+    if (authToken) options.authToken = authToken;
+    db = createClient(options);
+  }
+  return db;
 }
 
-const db = createClient({
-  url: process.env.TURSO_DATABASE_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN
-});
-
+let schemaPromise;
 async function initSchema() {
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS tournaments (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      date TEXT,
-      venue TEXT,
-      phase TEXT,
-      data TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )
-  `);
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS player_checkins (
-      tournament_id TEXT NOT NULL,
-      player_name TEXT NOT NULL,
-      group_name TEXT,
-      skill INTEGER DEFAULT 5,
-      checked_in INTEGER NOT NULL DEFAULT 1,
-      checked_in_at TEXT NOT NULL,
-      source TEXT DEFAULT 'qr',
-      PRIMARY KEY (tournament_id, player_name)
-    )
-  `);
+  if (!schemaPromise) {
+    schemaPromise = (async () => {
+      await getDb().execute(`
+        CREATE TABLE IF NOT EXISTS tournaments (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          date TEXT,
+          venue TEXT,
+          phase TEXT,
+          data TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+      `);
+      await getDb().execute(`
+        CREATE TABLE IF NOT EXISTS player_checkins (
+          tournament_id TEXT NOT NULL,
+          player_name TEXT NOT NULL,
+          group_name TEXT,
+          skill INTEGER DEFAULT 5,
+          checked_in INTEGER NOT NULL DEFAULT 1,
+          checked_in_at TEXT NOT NULL,
+          source TEXT DEFAULT 'qr',
+          PRIMARY KEY (tournament_id, player_name)
+        )
+      `);
+    })().catch(err => {
+      schemaPromise = null;
+      throw err;
+    });
+  }
+  return schemaPromise;
 }
+
+app.use(async (_req, res, next) => {
+  try {
+    await initSchema();
+    next();
+  } catch (err) {
+    console.error('Failed to initialize Turso schema:', err);
+    res.status(500).json({ error: 'Database is unavailable' });
+  }
+});
 
 function checkAdminKey(req, res, next) {
   const requiredKey = process.env.ADMIN_SYNC_KEY;
@@ -55,8 +80,11 @@ function checkAdminKey(req, res, next) {
 
 app.get('/api/health', async (_req, res) => {
   try {
-    await db.execute('SELECT 1');
-    res.json({ ok: true, db: 'turso' });
+    await getDb().execute('SELECT 1');
+    res.json({
+      ok: true,
+      db: process.env.TURSO_DATABASE_URL && !process.env.TURSO_DATABASE_URL.startsWith('file:') ? 'turso' : 'sqlite'
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -65,7 +93,7 @@ app.get('/api/health', async (_req, res) => {
 // List all tournaments
 app.get('/api/tournaments', async (_req, res) => {
   try {
-    const result = await db.execute(
+    const result = await getDb().execute(
       'SELECT id, name, date, venue, phase, updated_at FROM tournaments ORDER BY updated_at DESC'
     );
     res.json({ tournaments: result.rows });
@@ -77,7 +105,7 @@ app.get('/api/tournaments', async (_req, res) => {
 // Get one tournament
 app.get('/api/tournaments/:id', async (req, res) => {
   try {
-    const result = await db.execute({
+    const result = await getDb().execute({
       sql: 'SELECT data, updated_at FROM tournaments WHERE id = ?',
       args: [req.params.id]
     });
@@ -101,7 +129,7 @@ app.put('/api/tournaments/:id', checkAdminKey, async (req, res) => {
     const id = req.params.id;
     const cfg = payload.config || {};
     const now = new Date().toISOString();
-    await db.execute({
+    await getDb().execute({
       sql: `INSERT INTO tournaments (id, name, date, venue, phase, data, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
@@ -122,8 +150,8 @@ app.put('/api/tournaments/:id', checkAdminKey, async (req, res) => {
 // Delete one tournament
 app.delete('/api/tournaments/:id', checkAdminKey, async (req, res) => {
   try {
-    await db.execute({ sql: 'DELETE FROM player_checkins WHERE tournament_id = ?', args: [req.params.id] });
-    await db.execute({ sql: 'DELETE FROM tournaments WHERE id = ?', args: [req.params.id] });
+    await getDb().execute({ sql: 'DELETE FROM player_checkins WHERE tournament_id = ?', args: [req.params.id] });
+    await getDb().execute({ sql: 'DELETE FROM tournaments WHERE id = ?', args: [req.params.id] });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -139,12 +167,12 @@ app.post('/api/tournaments/:id/checkin', async (req, res) => {
 
     const nowTime = time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     if (checkedIn === false) {
-      await db.execute({
+      await getDb().execute({
         sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
         args: [tournamentId, playerName]
       });
     } else {
-      await db.execute({
+      await getDb().execute({
         sql: `INSERT INTO player_checkins (tournament_id, player_name, group_name, skill, checked_in, checked_in_at, source)
               VALUES (?, ?, ?, ?, 1, ?, ?)
               ON CONFLICT(tournament_id, player_name) DO UPDATE SET
@@ -157,7 +185,7 @@ app.post('/api/tournaments/:id/checkin', async (req, res) => {
       });
     }
 
-    const existing = await db.execute({
+    const existing = await getDb().execute({
       sql: 'SELECT data FROM tournaments WHERE id = ?',
       args: [tournamentId]
     });
@@ -181,7 +209,7 @@ app.post('/api/tournaments/:id/checkin', async (req, res) => {
           state.groups[targetIdx].players.push(playerName);
         }
       }
-      await db.execute({
+      await getDb().execute({
         sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
         args: [JSON.stringify(state), new Date().toISOString(), tournamentId]
       });
@@ -193,12 +221,17 @@ app.post('/api/tournaments/:id/checkin', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3001;
-initSchema()
-  .then(() => {
-    app.listen(port, () => console.log(`Multi-tournament API listening on port ${port}`));
-  })
-  .catch(err => {
-    console.error('Failed to initialize Turso schema:', err);
-    process.exit(1);
-  });
+if (require.main === module) {
+  app.use(express.static(require('path').join(__dirname, '..', 'public')));
+  const port = process.env.PORT || 3001;
+  initSchema()
+    .then(() => {
+      app.listen(port, () => console.log(`Multi-tournament API listening on port ${port}`));
+    })
+    .catch(err => {
+      console.error('Failed to initialize Turso schema:', err);
+      process.exitCode = 1;
+    });
+}
+
+module.exports = app;

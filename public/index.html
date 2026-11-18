@@ -192,13 +192,25 @@
         return headers;
       }
 
+      function getSyncApiUrl() {
+        const configuredUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
+        if (configuredUrl) {
+          return configuredUrl.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(configuredUrl)
+            ? configuredUrl
+            : '';
+        }
+        const isLocalOrigin = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(window.location.origin);
+        return window.location.protocol === 'https:' || isLocalOrigin ? window.location.origin : '';
+      }
+
       async function pushToTurso(silent) {
-        const apiUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
-        if (!apiUrl || !apiUrl.startsWith('https://')) return;
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
         try {
           state.sync.status = 'syncing';
           const tid = encodeURIComponent(state.tournamentId || 'default');
           const payload = { ...state, auth: { ...state.auth, loggedIn: false }, ui: { ...state.ui, bracketOpen: false } };
+          delete payload.sync;
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, {
             method: 'PUT',
             headers: getSyncHeaders(),
@@ -221,8 +233,8 @@
       }
 
       async function pullFromTurso(silent) {
-        const apiUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
-        if (!apiUrl || !apiUrl.startsWith('https://')) return;
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
         try {
           // Also fetch tournament list from Turso so switcher shows all DB tournaments
           try {
@@ -265,8 +277,8 @@
       }
 
       async function syncCheckInToServer(playerName, groupName, skill, checkedIn, time, source, walkIn) {
-        const apiUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
-        if (!apiUrl || !apiUrl.startsWith('https://')) return;
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
         try {
           const tid = encodeURIComponent(state.tournamentId || 'default');
           await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
@@ -286,7 +298,7 @@
         state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey } }, id);
         saveRegistry();
         render();
-        if (state.sync?.apiUrl && state.sync.apiUrl.startsWith('https://')) {
+        if (getSyncApiUrl()) {
           pullFromTurso(true);
         }
       }
@@ -304,7 +316,7 @@
         state = fresh;
         saveRegistry();
         render();
-        if (state.sync?.apiUrl && state.sync.apiUrl.startsWith('https://')) {
+        if (getSyncApiUrl()) {
           pushToTurso(true);
         }
       }
@@ -322,8 +334,8 @@
         state = normalizeTournamentState({ ...registry.items[nextId], auth: keepAuth, sync: keepSync }, nextId);
         saveRegistry();
         render();
-        const apiUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
-        if (apiUrl && apiUrl.startsWith('https://')) {
+        const apiUrl = getSyncApiUrl();
+        if (apiUrl) {
           try {
             await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`, { method: 'DELETE', headers: getSyncHeaders() });
           } catch (e) {}
@@ -333,7 +345,7 @@
 
       function saveState() {
         saveRegistry();
-        if (state.sync?.apiUrl && state.sync.apiUrl.startsWith('https://')) {
+        if (getSyncApiUrl()) {
           clearTimeout(syncTimer);
           syncTimer = setTimeout(() => { pushToTurso(true); }, 600);
         }
@@ -2084,12 +2096,12 @@
         document.getElementById('open-sync-modal-btn')?.addEventListener('click', () => {
           openModal(`
             <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
-              <h3 class="text-base font-bold">Turso SQLite Cloud Sync</h3>
-              <p class="text-xs text-stone-500 dark:text-stone-400">Connect your deployed Express + Turso backend API URL to persist all tournament data and QR check-ins across devices.</p>
+              <h3 class="text-base font-bold">SQLite Cloud Sync</h3>
+              <p class="text-xs text-stone-500 dark:text-stone-400">This Vercel deployment uses its own API by default. Connect a different hosted SQLite-compatible backend only if needed.</p>
               <div class="space-y-3 text-xs">
                 <div>
-                  <label class="block font-semibold text-stone-500 mb-1">Backend API URL (HTTPS)</label>
-                  <input id="sync-api-url" type="url" value="${esc(state.sync?.apiUrl || '')}" placeholder="https://your-backend.onrender.com" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  <label class="block font-semibold text-stone-500 mb-1">Backend API URL (optional)</label>
+                  <input id="sync-api-url" type="url" value="${esc(state.sync?.apiUrl || '')}" placeholder="Leave blank to use this Vercel deployment" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
                 </div>
                 <div>
                   <label class="block font-semibold text-stone-500 mb-1">Optional Admin Sync Key</label>
@@ -2659,7 +2671,7 @@
       }
 
       render();
-      if (state.sync?.apiUrl && state.sync.apiUrl.startsWith('https://')) {
+      if (getSyncApiUrl()) {
         pullFromTurso(true);
       }
     })();

@@ -5,55 +5,49 @@ const assert = require('node:assert/strict');
 const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
 
 test('generated qualifying schedules give every player exactly the requested matches', () => {
-  for (const size of [5, 6, 9, 10]) {
+  for (const size of [4, 5, 6, 8, 9, 10, 15, 30]) {
     const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const schedule = generateGroupSchedule(players, 2, 'A', 'QR1');
+    for (const count of [1, 2, 3, 4, 5, 8]) {
+      if (size * count % 4) continue;
+      const schedule = generateGroupSchedule(players, count, 'A', 'QR1');
       const counts = Object.fromEntries(players.map(player => [player, 0]));
       const rounds = new Map();
+      assert.equal(schedule.length, size * count / 4);
       for (const match of schedule) {
-        counts[match.p1]++;
-        counts[match.p2]++;
+        const team1 = match.p1.split(' & ');
+        const team2 = match.p2.split(' & ');
+        assert.equal(team1.length, 2);
+        assert.equal(team2.length, 2);
+        const matchPlayers = [...team1, ...team2];
+        assert.equal(new Set(matchPlayers).size, 4);
+        matchPlayers.forEach(player => counts[player]++);
         const participants = rounds.get(match.round) || [];
-        participants.push(match.p1, match.p2);
+        participants.push(...matchPlayers);
         rounds.set(match.round, participants);
       }
-      assert.deepEqual(Object.values(counts), players.map(() => 2));
+      assert.deepEqual(Object.values(counts), players.map(() => count));
       for (const participants of rounds.values()) {
-        assert.ok(participants.length <= 4);
+        assert.ok(participants.length <= 8);
         assert.equal(new Set(participants).size, participants.length);
       }
     }
   }
-  assert.throws(() => generateGroupSchedule(['A', 'B', 'C'], 1, 'A', 'QR1'), /odd-sized group/);
 });
 
-test('creates the requested number of distinct opponents for every player', () => {
-  for (let size = 2; size <= 30; size++) {
-    const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
-    for (let count = 1; count < size; count++) {
-      if (size * count % 2) continue;
-      const pairs = generateGroupPairings(players, count, () => 0);
-      const opponents = new Map(players.map(player => [player, new Set()]));
-      assert.equal(pairs.length, size * count / 2);
-      pairs.forEach(([a, b]) => {
-        assert.notEqual(a, b);
-        assert.ok(!opponents.get(a).has(b));
-        opponents.get(a).add(b);
-        opponents.get(b).add(a);
-      });
-      players.forEach(player => assert.equal(opponents.get(player).size, count));
-    }
-  }
+test('rotates partners when four players play three matches', () => {
+  const matches = generateGroupPairings(['A', 'B', 'C', 'D'], 3, () => 0);
+  const partners = matches.flat().filter(team => team.includes('A')).map(team => team.find(player => player !== 'A'));
+  assert.equal(new Set(partners).size, 3);
 });
 
 test('rejects impossible or invalid per-player match counts', () => {
   const players = Array.from({ length: 9 }, (_, index) => `Player ${index}`);
-  assert.throws(() => generateGroupPairings(players, 3), /odd-sized group/);
-  assert.throws(() => generateGroupPairings(players, 9), /less than/);
+  assert.throws(() => generateGroupPairings(players, 3), /divisible by 4/);
+  assert.throws(() => generateGroupPairings(['A', 'B', 'C'], 4), /at least 4/);
   assert.throws(() => generateGroupPairings(players, 0), /positive whole number/);
   assert.throws(() => generateGroupPairings(players, 2.5), /positive whole number/);
-  assert.throws(() => generateGroupPairings(['Alice', ' alice '], 1), /distinct name/);
+  assert.throws(() => generateGroupPairings(['Alice', ' alice ', 'C', 'D'], 1), /distinct name/);
+  assert.throws(() => generateGroupPairings(['A & B', 'C', 'D', 'E'], 1), /cannot contain/);
 });
 
 test('splits ranked players into consecutive, balanced groups', () => {

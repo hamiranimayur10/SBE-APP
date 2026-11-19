@@ -1333,7 +1333,7 @@
         return order.map(k => TIEBREAKER_LABELS[k] || k).join(' → ');
       }
       function resizeTotalPlayers(targetTotal, rerender) {
-        const total = Math.max(state.groups.length * 3, Math.min(80, targetTotal));
+        const total = Math.max(state.groups.length * 4, Math.min(80, targetTotal));
         const gCount = state.groups.length;
         const base = Math.floor(total / gCount);
         const rem = total % gCount;
@@ -1389,7 +1389,6 @@
 
       function getRound1SetupError() {
         for (const group of state.groups) {
-          if (group.players.length < 3) continue;
           try {
             TournamentDraw.validateGroupPlayers(group.players, state.config.matchesPerPlayer);
           } catch (err) {
@@ -1433,40 +1432,7 @@
 
       // Ranking formula: WP = Wins * 20 + sum(win margins) - sum(loss margins)
       function computeStandings(players, matches) {
-        const stats = {};
-        players.forEach(p => {
-          stats[p] = {
-            player: p,
-            played: 0,
-            wins: 0,
-            losses: 0,
-            pf: 0,
-            pa: 0,
-            winMargins: 0,
-            lossMargins: 0,
-            wp: 0,
-            tiedFlag: false
-          };
-        });
-
-        matches.forEach(m => {
-          if (!m.completed) return;
-          const a = stats[m.p1];
-          const b = stats[m.p2];
-          if (!a || !b) return;
-          a.played++; b.played++;
-          a.pf += m.s1; a.pa += m.s2;
-          b.pf += m.s2; b.pa += m.s1;
-          if (m.s1 > m.s2) {
-            a.wins++; b.losses++;
-            a.winMargins += (m.s1 - m.s2);
-            b.lossMargins += (m.s1 - m.s2);
-          } else {
-            b.wins++; a.losses++;
-            b.winMargins += (m.s2 - m.s1);
-            a.lossMargins += (m.s2 - m.s1);
-          }
-        });
+        const stats = window.PlayerAnalytics.accumulateStandings(players, matches);
 
         const rk = state.config.ranking || { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
         const wPts = Number(rk.winPointsWeight ?? 20);
@@ -1474,7 +1440,7 @@
         const wLossM = Number(rk.lossMarginWeight ?? 1);
         const order = Array.isArray(rk.tiebreakers) && rk.tiebreakers.length ? rk.tiebreakers : ['wp', 'wins', 'pf', 'pa'];
 
-        const rows = Object.values(stats).map(r => ({
+        const rows = stats.map(r => ({
           ...r,
           diff: r.pf - r.pa,
           wp: r.wins * wPts + r.winMargins * wWinM - r.lossMargins * wLossM
@@ -1597,8 +1563,8 @@
           return;
         }
         for (const g of state.groups) {
-          if (g.players.length < 3) {
-            showToast(`${g.name} needs at least 3 players`, 'error');
+          if (g.players.length < 4) {
+            showToast(`${g.name} needs at least 4 players`, 'error');
             return;
           }
           if (!g.leader || !g.players.includes(g.leader)) {
@@ -1874,6 +1840,10 @@
         const oldName = state.groups[gi].players[pi];
         const newName = (rawNewName || '').trim();
         if (!newName || newName === oldName) return false;
+        if (newName.includes('&')) {
+          showToast('Player names cannot contain & in doubles schedules', 'error');
+          return false;
+        }
         state.groups[gi].players[pi] = newName;
         if (state.groups[gi].leader === oldName) state.groups[gi].leader = newName;
         if (state.playerSkills && state.playerSkills[oldName] !== undefined) {
@@ -1890,16 +1860,16 @@
           return str.split(' & ').map(part => part === oldName ? newName : part).join(' & ');
         };
         (state.qr1Matches || []).forEach(m => {
-          if (m.p1 === oldName) m.p1 = newName;
-          if (m.p2 === oldName) m.p2 = newName;
+          m.p1 = replaceTeamName(m.p1);
+          m.p2 = replaceTeamName(m.p2);
         });
         Object.keys(state.qr2Pools || {}).forEach(k => {
           state.qr2Pools[k] = (state.qr2Pools[k] || []).map(p => p === oldName ? newName : p);
         });
         Object.keys(state.qr2Matches || {}).forEach(k => {
           (state.qr2Matches[k] || []).forEach(m => {
-            if (m.p1 === oldName) m.p1 = newName;
-            if (m.p2 === oldName) m.p2 = newName;
+            m.p1 = replaceTeamName(m.p1);
+            m.p2 = replaceTeamName(m.p2);
           });
         });
         Object.keys(state.semis || {}).forEach(k => {
@@ -2787,7 +2757,7 @@
         const round2GroupBaseSize = Math.floor(totalPlayers / round2GroupKeys.length);
         const round2GroupRemainder = totalPlayers % round2GroupKeys.length;
         const maxRound2GroupCount = Math.min(6, Math.floor(totalPlayers / 8));
-        const invalidGroup = state.groups.find(g => g.players.length < 3 || !g.leader || !g.players.includes(g.leader));
+        const invalidGroup = state.groups.find(g => g.players.length < 4 || !g.leader || !g.players.includes(g.leader));
         const round1Error = getRound1SetupError();
         const round2Error = getRound2SetupError();
         const scheduleError = round1Error || round2Error;
@@ -2854,11 +2824,11 @@
                   </div>
                   <div>
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Total Players</label>
-                    <input id="cfg-total-players" type="number" min="${state.groups.length * 3}" max="80" value="${totalPlayers}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <input id="cfg-total-players" type="number" min="${state.groups.length * 4}" max="80" value="${totalPlayers}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Players / Group</label>
-                    <input id="cfg-players-per-group" type="number" min="3" max="12" value="${c.playersPerGroup}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <input id="cfg-players-per-group" type="number" min="4" max="12" value="${c.playersPerGroup}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
                     <label for="cfg-qr1-matches" class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 1 Matches / Player</label>
@@ -2892,7 +2862,7 @@
                     </div>
                   `).join('')}
                 </div>
-                <p class="text-xs text-stone-500">In each qualifying round, every player faces the selected number of different opponents in their group. The count must be less than the group size; odd-sized groups require an even count. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 count for Round 2 until this setting is changed.' : ''}</p>
+                <p class="text-xs text-stone-500">Qualifying matches are doubles: four different players per match, with partners rotated where possible. Each player plays exactly the selected number of matches. Group size multiplied by matches per player must be divisible by 4. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 count for Round 2 until this setting is changed.' : ''}</p>
                 ${round1Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round1Error)}</p>` : ''}
                 ${round2Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round2Error)}</p>` : ''}
                 <p class="text-xs ${totalPlayers < round2GroupKeys.length * 8 ? 'text-amber-600 dark:text-amber-400' : 'text-stone-500'}">${totalPlayers < round2GroupKeys.length * 8 ? 'Each Round 2 group needs at least 8 players so its top 8 can advance to semi-finals.' : "All Round 1 players are ranked by Win Points and tie-breakers, then assigned in consecutive rank blocks; the top 8 from each Round 2 group advance to that group's semi-finals."}</p>
@@ -3000,7 +2970,7 @@
               </div>
 
               <div class="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <p class="text-xs text-stone-500 dark:text-stone-400">Each group needs at least 3 players and a ★ leader.</p>
+                <p class="text-xs text-stone-500 dark:text-stone-400">Each group needs at least 4 players and a ★ leader.</p>
               </div>
             </section>
 
@@ -3045,7 +3015,7 @@
                 <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Group readiness</h3>
                 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
                   ${state.groups.map(group => {
-                    const ready = group.players.length >= 3 && group.leader && group.players.includes(group.leader);
+                    const ready = group.players.length >= 4 && group.leader && group.players.includes(group.leader);
                     return `<div class="flex items-center justify-between gap-2 rounded-lg border ${ready ? 'border-emerald-500/30' : 'border-red-500/40'} px-3 py-2 text-xs">
                       <span class="min-w-0 truncate font-semibold">${esc(group.name)}</span>
                       <span class="shrink-0 text-stone-500">${group.players.length} players · ${esc(group.leader || 'No leader')}</span>
@@ -3058,7 +3028,7 @@
                 <p class="rounded-lg bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">Your roster is ready to generate a schedule.</p>
               ` : `
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-3 py-2">
-                  <p class="text-xs text-amber-700 dark:text-amber-400">${scheduleError ? esc(scheduleError) : invalidGroup ? `${esc(invalidGroup.name)} needs at least 3 players and a group leader.` : 'Add at least two groups before starting.'}</p>
+                  <p class="text-xs text-amber-700 dark:text-amber-400">${scheduleError ? esc(scheduleError) : invalidGroup ? `${esc(invalidGroup.name)} needs at least 4 players and a group leader.` : 'Add at least two groups before starting.'}</p>
                   <button type="button" data-setup-step-nav="${scheduleError ? 2 : 3}" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">${scheduleError ? 'Review format &amp; scoring' : 'Review players &amp; groups'}</button>
                 </div>
               `}
@@ -3147,16 +3117,16 @@
             </div>
             <div class="flex items-center justify-between gap-2">
               <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold truncate ${p1Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p1 || m.t1)}</div>
+                <div class="text-sm font-semibold break-words ${p1Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p1 || m.t1)}</div>
                 <div class="text-xs text-stone-400 my-0.5">vs</div>
-                <div class="text-sm font-semibold truncate ${p2Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p2 || m.t2)}</div>
+                <div class="text-sm font-semibold break-words ${p2Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p2 || m.t2)}</div>
               </div>
               ${isAdmin ? `
                 <div class="flex items-center gap-1.5">
                   <div class="flex flex-col gap-1">
-                    <input data-score-input="${listKey}:${m.id}:1" type="number" min="0" max="${state.config.deuceCap}" value="${m.s1 !== null ? m.s1 : ''}" placeholder="0"
+                    <input data-score-input="${listKey}:${m.id}:1" aria-label="Score for ${esc(m.p1 || m.t1)}" type="number" min="0" max="${state.config.deuceCap}" value="${m.s1 !== null ? m.s1 : ''}" placeholder="0"
                       class="w-14 px-2 py-1 text-center rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm font-bold tabular-nums" />
-                    <input data-score-input="${listKey}:${m.id}:2" type="number" min="0" max="${state.config.deuceCap}" value="${m.s2 !== null ? m.s2 : ''}" placeholder="0"
+                    <input data-score-input="${listKey}:${m.id}:2" aria-label="Score for ${esc(m.p2 || m.t2)}" type="number" min="0" max="${state.config.deuceCap}" value="${m.s2 !== null ? m.s2 : ''}" placeholder="0"
                       class="w-14 px-2 py-1 text-center rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm font-bold tabular-nums" />
                   </div>
                   <button data-save-match="${listKey}:${m.id}" class="px-2.5 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold transition">Save</button>
@@ -3296,7 +3266,7 @@
                     ` : ''}
                   </div>
                   ${renderStandingsTable(`Round 2 Group ${k} Standings (Top 8 → Group ${k} Semi-Finals)`, players, matches, 8, getPoolAccent(k))}
-                  ${renderScheduledMatchCards(matches, `qr2_${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${k} (needs at least 2 players).</div>`)}
+                  ${renderScheduledMatchCards(matches, `qr2_${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${k} (needs at least 4 players).</div>`)}
                 </div>
               `;
             }).join('')}
@@ -3371,9 +3341,9 @@
                     <span class="font-medium text-stone-500">Game ${gi + 1}</span>
                     ${isAdmin ? `
                       <div class="flex items-center gap-2">
-                        <input data-final-input="${poolKey}:${gi}:1" type="number" min="0" max="${state.config.deuceCap}" value="${g.s1 !== null ? g.s1 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
+                        <input data-final-input="${poolKey}:${gi}:1" aria-label="Game ${gi + 1} score for ${esc(f.t1)}" type="number" min="0" max="${state.config.deuceCap}" value="${g.s1 !== null ? g.s1 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
                         <span>–</span>
-                        <input data-final-input="${poolKey}:${gi}:2" type="number" min="0" max="${state.config.deuceCap}" value="${g.s2 !== null ? g.s2 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
+                        <input data-final-input="${poolKey}:${gi}:2" aria-label="Game ${gi + 1} score for ${esc(f.t2)}" type="number" min="0" max="${state.config.deuceCap}" value="${g.s2 !== null ? g.s2 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
                       </div>
                     ` : `
                       <span class="font-bold tabular-nums">${g.s1 !== null ? `${g.s1} – ${g.s2}` : '—'}</span>
@@ -3643,6 +3613,7 @@
                 <h2 class="font-bold text-sm">Match scoring</h2>
                 <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
                   <li>Games are played to <b>${config.pointsToWin} points</b>.</li>
+                  <li>Matches are doubles. Both teammates receive the same win or loss, points for and against, and ranking points.</li>
                   <li>Players must win by two points until the configured cap of <b>${config.deuceCap}</b>.</li>
                   <li>Scores that do not meet the event scoring rules cannot be saved.</li>
                 </ul>
@@ -3650,7 +3621,7 @@
               <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
                 <h2 class="font-bold text-sm">Tournament progression</h2>
                 <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
-                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; ${esc(config.matchesPerPlayer)} matches per player when newly scheduled.</li>
+                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; ${esc(config.matchesPerPlayer)} doubles matches per player when newly scheduled, with partners rotated where possible.</li>
                   <li><b>Qualifier 2:</b> all players are ranked by WP and tie-breakers, then assigned to ${poolKeys.length} groups in consecutive rank blocks; ${esc(config.qr2MatchesPerPlayer ?? config.matchesPerPlayer)} matches per player when newly scheduled.</li>
                   <li><b>Semi-finals:</b> the top 8 players from each Round 2 group advance to that group's semi-finals.</li>
                   <li><b>Finals:</b> ${poolKeys.map(key => `Group ${key} ${getPoolFinalFormat(key) === 'bo3' ? 'best of three' : 'single game'}`).join('; ')}.</li>
@@ -6027,10 +5998,10 @@
         // Setup bindings
         document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5));
         document.getElementById('cfg-total-players')?.addEventListener('change', (e) => {
-          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 3);
+          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 4);
         });
         document.getElementById('cfg-players-per-group')?.addEventListener('change', (e) => {
-          const ppg = Math.max(3, Math.min(12, parseInt(e.target.value, 10) || 6));
+          const ppg = Math.max(4, Math.min(12, parseInt(e.target.value, 10) || 6));
           state.config.playersPerGroup = ppg;
           resizeTotalPlayers(ppg * state.groups.length);
         });
@@ -6221,7 +6192,7 @@
           document.getElementById('modal-add-pool-confirm').addEventListener('click', () => {
             if (modeSel.value === 'custom') {
               const names = document.getElementById('custom-pool-players').value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
-              if (names.length < 2) { showToast('Enter at least 2 players', 'error'); return; }
+              if (names.length < 4) { showToast('Enter at least 4 players', 'error'); return; }
               if (!addQR2Pool(nextLetter, names)) return;
               closeModal();
               showToast(`Added Group ${nextLetter} (${names.length} players)`, 'success');

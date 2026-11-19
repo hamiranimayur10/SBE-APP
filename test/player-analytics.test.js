@@ -2,7 +2,30 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { buildAnalytics, getBadges } = require('../public/player-analytics');
+const { accumulateStandings, buildAnalytics, getBadges } = require('../public/player-analytics');
+
+test('qualifying doubles credit both players on each side and preserve legacy singles', () => {
+  const players = ['Alex', 'Blair', 'Casey', 'Drew'];
+  const matches = [
+    { p1: 'Alex & Blair', p2: 'Casey & Drew', s1: 21, s2: 15, completed: true },
+    { p1: 'Casey', p2: 'Alex', s1: 21, s2: 19, completed: true },
+    { p1: 'Alex & Alex', p2: 'Casey & Drew', s1: 21, s2: 10, completed: true }
+  ];
+  const rows = Object.fromEntries(accumulateStandings(players, matches).map(row => [row.player, row]));
+  assert.deepEqual([rows.Alex.played, rows.Alex.wins, rows.Alex.losses, rows.Alex.pf, rows.Alex.pa, rows.Alex.winMargins, rows.Alex.lossMargins], [2, 1, 1, 40, 36, 6, 2]);
+  assert.deepEqual([rows.Blair.played, rows.Blair.wins, rows.Blair.pf, rows.Blair.pa], [1, 1, 21, 15]);
+  assert.deepEqual([rows.Casey.played, rows.Casey.wins, rows.Casey.losses, rows.Casey.pf, rows.Casey.pa], [2, 1, 1, 36, 40]);
+  assert.deepEqual([rows.Drew.played, rows.Drew.losses, rows.Drew.pf, rows.Drew.pa], [1, 1, 15, 21]);
+
+  const tournament = { tournamentId: 'doubles', config: { name: 'Doubles' }, groups: [{ players }], qr1Matches: [matches[0]], qr2Matches: {} };
+  const analytics = buildAnalytics([tournament], [], 'doubles');
+  for (const player of players) {
+    const result = analytics.getPlayer(player);
+    const won = player === 'Alex' || player === 'Blair';
+    assert.deepEqual([result.matchesPlayed, result.wins, result.losses, result.pointsFor, result.pointsAgainst, result.rankingPointsEarned],
+      won ? [1, 1, 0, 21, 15, 26] : [1, 0, 1, 15, 21, -6]);
+  }
+});
 
 function makeTournament() {
   const matches = [

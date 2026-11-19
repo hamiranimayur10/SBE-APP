@@ -20,6 +20,42 @@ const PlayerAnalytics = (() => {
       .filter(name => name && !/^(TBD|Seed\s+\d+)$/i.test(name));
   }
 
+  function accumulateStandings(players, matches) {
+    const stats = Object.create(null);
+    players.forEach(player => {
+      stats[player] = {
+        player, played: 0, wins: 0, losses: 0, pf: 0, pa: 0,
+        winMargins: 0, lossMargins: 0, wp: 0, tiedFlag: false
+      };
+    });
+    matches.forEach(match => {
+      if (!match.completed || !validScore(match.s1) || !validScore(match.s2) || Number(match.s1) === Number(match.s2)) return;
+      const sides = [getTeamPlayers(match.p1 || match.t1), getTeamPlayers(match.p2 || match.t2)];
+      const participants = sides.flat();
+      if (!sides[0].length || !sides[1].length ||
+          new Set(participants).size !== participants.length ||
+          participants.some(player => !stats[player])) return;
+      sides.forEach((side, index) => {
+        const own = Number(index === 0 ? match.s1 : match.s2);
+        const other = Number(index === 0 ? match.s2 : match.s1);
+        side.forEach(player => {
+          const row = stats[player];
+          row.played++;
+          row.pf += own;
+          row.pa += other;
+          if (own > other) {
+            row.wins++;
+            row.winMargins += own - other;
+          } else {
+            row.losses++;
+            row.lossMargins += other - own;
+          }
+        });
+      });
+    });
+    return Object.values(stats);
+  }
+
   function validScore(value) {
     return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
   }
@@ -499,7 +535,7 @@ const PlayerAnalytics = (() => {
     return badges;
   }
 
-  return { buildAnalytics, extractMatchRecords, getBadges, normalizeName };
+  return { accumulateStandings, buildAnalytics, extractMatchRecords, getBadges, normalizeName };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = PlayerAnalytics;

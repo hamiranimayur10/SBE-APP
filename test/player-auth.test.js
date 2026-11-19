@@ -492,6 +492,35 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       headers: { ...adminHeaders, cookie: aliceCookie }
     });
     assert.equal(playerDeleteOwnAccount.response.status, 403);
+    const deleteFixture = await api('/api/tournaments/delete-test', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        tournamentId: 'delete-test',
+        phase: 'completed',
+        config: { name: 'Delete Test' },
+        groups: [{ name: 'Group A', players: ['Roster Alice', 'Roster Bob'] }],
+        qr1Matches: [
+          { id: 'delete-test-match', p1: 'Roster Alice', p2: 'Roster Bob', s1: 21, s2: 12, completed: true }
+        ]
+      })
+    });
+    assert.equal(deleteFixture.response.status, 200);
+    const fixtureCheckIn = await api('/api/tournaments/delete-test/checkin', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ playerName: 'Roster Alice' })
+    });
+    assert.equal(fixtureCheckIn.response.status, 200);
+    const tournamentDeleteWithoutKey = await api('/api/tournaments/delete-test', {
+      method: 'DELETE'
+    });
+    assert.equal(tournamentDeleteWithoutKey.response.status, 401);
+    const playerTournamentDelete = await api('/api/tournaments/delete-test', {
+      method: 'DELETE',
+      headers: { ...adminHeaders, cookie: aliceCookie }
+    });
+    assert.equal(playerTournamentDelete.response.status, 403);
     const adminDeleteAccount = await api('/api/player-accounts/Roster%20Alice', {
       method: 'DELETE',
       headers: adminHeaders
@@ -503,6 +532,31 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(removedAdminDeletedPlayerSession.response.status, 401);
     const preservedAdminDeletedProfile = await api('/api/players');
     assert.ok(preservedAdminDeletedProfile.body.players.some(player => player.name === 'Roster Alice'));
+
+    const tournamentBeforeDelete = await api('/api/tournaments/delete-test');
+    assert.equal(tournamentBeforeDelete.body.data.qr1Matches[0].id, 'delete-test-match');
+    const historyBeforeTournamentDelete = await api('/api/tournament-history');
+    assert.ok(historyBeforeTournamentDelete.body.tournaments.some(tournament => tournament.id === 'delete-test'));
+    const adminTournamentDelete = await api('/api/tournaments/delete-test', {
+      method: 'DELETE',
+      headers: adminHeaders
+    });
+    assert.equal(adminTournamentDelete.response.status, 200);
+    assert.equal(adminTournamentDelete.body.deleted, true);
+    const removedTournament = await api('/api/tournaments/delete-test');
+    assert.deepEqual(removedTournament.body, { exists: false, data: null });
+    const historyAfterTournamentDelete = await api('/api/tournament-history');
+    assert.ok(!historyAfterTournamentDelete.body.tournaments.some(tournament => tournament.id === 'delete-test'));
+    const profilesAfterTournamentDelete = await api('/api/players');
+    assert.ok(profilesAfterTournamentDelete.body.players.some(player => player.name === 'Roster Alice'));
+
+    const verificationClient = createClient({ url: databaseUrl });
+    const remainingCheckIns = await verificationClient.execute({
+      sql: 'SELECT tournament_id FROM player_checkins WHERE tournament_id = ?',
+      args: ['delete-test']
+    });
+    assert.equal(remainingCheckIns.rows.length, 0);
+    await verificationClient.close();
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

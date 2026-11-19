@@ -1013,27 +1013,86 @@
       }
 
       async function deleteTournament(id) {
-        tournamentCatalog.loaded = false;
-        const keys = Object.keys(registry.items);
-        if (keys.length <= 1) {
-          showToast('Keep at least one tournament', 'error');
-          return;
+        const tournamentId = String(id || '');
+        const availableIds = new Set([
+          ...Object.keys(registry.items),
+          ...tournamentCatalog.items.map(tournament => String(tournament.id)),
+          String(state.tournamentId)
+        ]);
+        if (!tournamentId || !availableIds.has(tournamentId)) {
+          throw new Error('Tournament is no longer available');
         }
-        delete registry.items[id];
-        const nextId = Object.keys(registry.items)[0];
-        const keepAuth = state.auth;
-        const keepSync = state.sync;
-        state = normalizeTournamentState({ ...registry.items[nextId], auth: keepAuth, sync: keepSync }, nextId);
-        state.ui.activeTab = getRequestedPage();
-        saveRegistry();
-        render();
+        const remainingIds = [...availableIds].filter(candidate => candidate !== tournamentId);
+        if (!remainingIds.length) throw new Error('At least one tournament must remain');
+
+        const wasActive = tournamentId === String(state.tournamentId);
         const apiUrl = getSyncApiUrl();
         if (apiUrl) {
-          try {
-            await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`, { method: 'DELETE', headers: getSyncHeaders() });
-          } catch (e) {}
+          const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}`, {
+            method: 'DELETE',
+            headers: getSyncHeaders()
+          });
+          let result;
+          try { result = await response.json(); } catch (_err) {
+            throw new Error(`Unexpected response while deleting the tournament (HTTP ${response.status})`);
+          }
+          if (!response.ok) throw new Error(result.error || `Tournament deletion failed (HTTP ${response.status})`);
         }
+
+        const nextId = Object.keys(registry.items).find(candidate => candidate !== tournamentId) || remainingIds[0];
+        const nextTournament = tournamentCatalog.items.find(tournament => String(tournament.id) === nextId);
+        delete registry.items[tournamentId];
+        tournamentCatalog.items = tournamentCatalog.items.filter(tournament => String(tournament.id) !== tournamentId);
+        tournamentCatalog.loaded = true;
+        tournamentCatalog.error = '';
+        playerData.tournaments = playerData.tournaments.filter(tournament =>
+          String(tournament.id || tournament.tournamentId) !== tournamentId
+        );
+
+        if (wasActive) {
+          const nextState = registry.items[nextId] || nextTournament?.data || createDefaultState(nextId, nextTournament?.name);
+          const keepAuth = state.auth;
+          const keepSync = state.sync;
+          state = normalizeTournamentState({
+            ...nextState,
+            tournamentId: nextId,
+            auth: keepAuth,
+            sync: { ...keepSync, ...(nextState.sync || {}) },
+            ui: { ...(nextState.ui || {}), activeTab: getRequestedPage() }
+          }, nextId);
+          registry.items[nextId] = state;
+        }
+        saveRegistry();
+        render();
+        if (wasActive && apiUrl) await pullFromTurso(true);
         showToast('Tournament deleted', 'success');
+      }
+
+      function confirmTournamentDeletion(id, name) {
+        openModal(`
+          <div role="alertdialog" aria-modal="true" aria-labelledby="delete-tournament-title" class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+            <h3 id="delete-tournament-title" class="text-base font-bold">Delete tournament permanently?</h3>
+            <p class="text-sm text-stone-600 dark:text-stone-300">"${esc(name)}" and all of its matches, check-ins, and player match-history/stats will be permanently removed. Shared player profiles will remain.</p>
+            <div class="flex justify-end gap-2">
+              <button id="delete-tournament-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-sm font-medium">Cancel</button>
+              <button id="delete-tournament-confirm" type="button" class="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-bold">Permanently delete</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('delete-tournament-cancel').addEventListener('click', closeModal);
+        const confirmButton = document.getElementById('delete-tournament-confirm');
+        confirmButton.addEventListener('click', async () => {
+          confirmButton.disabled = true;
+          confirmButton.textContent = 'Deleting…';
+          try {
+            await deleteTournament(id);
+            closeModal();
+          } catch (err) {
+            confirmButton.disabled = false;
+            confirmButton.textContent = 'Permanently delete';
+            showToast(`Could not delete tournament: ${err.message}`, 'error');
+          }
+        });
       }
 
       function saveState() {
@@ -2892,18 +2951,24 @@
             ? new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
             : 'Date not set';
           const selected = String(tournament.id) === String(state.tournamentId);
+          const tournamentName = tournament.name || config.name || 'Tournament';
           return `
             <article class="rounded-xl bg-white dark:bg-[#191B1F] border ${selected ? 'border-gold-500/50 ring-1 ring-gold-500/20' : 'border-stone-200 dark:border-stone-800'} p-4 sm:p-5 space-y-4">
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
-                    <h3 class="font-bold text-base truncate">${esc(tournament.name || config.name || 'Tournament')}</h3>
+                    <h3 class="font-bold text-base truncate">${esc(tournamentName)}</h3>
                     <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phaseLabels[phase] || phase)}</span>
                     ${selected ? '<span class="text-[10px] font-semibold text-gold-700 dark:text-gold-300">Currently open</span>' : ''}
                   </div>
                   <p class="text-xs text-stone-500 mt-1">${esc(dateLabel)}${(tournament.venue || config.venue) ? ` · ${esc(tournament.venue || config.venue)}` : ''}</p>
                 </div>
-                <button data-open-tournament="${esc(tournament.id)}" class="shrink-0 px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">${selected ? 'Open tournament' : 'View tournament'}</button>
+                <div class="flex flex-wrap gap-2">
+                  <button type="button" data-open-tournament="${esc(tournament.id)}" class="shrink-0 px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">${selected ? 'Open tournament' : 'View tournament'}</button>
+                  ${state.auth.role === 'admin' && tournamentCatalog.items.length > 1
+                    ? `<button type="button" data-delete-tournament="${esc(tournament.id)}" data-tournament-name="${esc(tournamentName)}" aria-label="Delete ${esc(tournamentName)}" class="shrink-0 px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-xs font-semibold hover:bg-red-50 dark:hover:bg-red-950/30">Delete</button>`
+                    : ''}
+                </div>
               </div>
               <div class="grid grid-cols-3 gap-2 border-t border-stone-100 dark:border-stone-800 pt-3">
                 <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Players</div><div class="mt-1 text-sm font-bold tabular-nums">${players.size || groups.reduce((sum, group) => sum + (group.players?.length || 0), 0)}</div></div>
@@ -2934,11 +2999,13 @@
               <div class="flex flex-wrap gap-2">
                 <button id="tournament-history-refresh" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-stone-100 dark:hover:bg-stone-800">Refresh list</button>
                 ${state.auth.role === 'admin' ? '<button id="new-tournament-btn" class="px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">+ New Tournament</button>' : ''}
-                ${state.auth.role === 'admin' && Object.keys(registry.items).length > 1 ? '<button id="delete-tournament-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-xs font-semibold">Delete Current</button>' : ''}
               </div>
             </div>
             ${tournamentCatalog.error ? `<p role="status" class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">${esc(tournamentCatalog.error)} Showing tournaments saved in this browser.</p>` : ''}
             ${tournamentCatalog.loading ? '<p class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">Loading tournament history…</p>' : ''}
+            ${state.auth.role === 'admin' && tournamentCatalog.loaded && tournamentCatalog.items.length === 1
+              ? '<p role="status" class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">At least one tournament must remain. Create another tournament to enable deleting this one.</p>'
+              : ''}
             ${tournamentCatalog.loaded && !tournamentCatalog.items.length ? renderEmptyState('No tournaments yet', 'Create a tournament or connect to a database to see saved events here.') : ''}
             ${section('Current & Upcoming', currentTournaments, 'No current or upcoming tournaments. Completed events are listed below.')}
             ${section('Past Tournaments', pastTournaments, 'Completed and previous events will appear here.')}
@@ -4061,6 +4128,12 @@
         document.querySelectorAll('[data-open-tournament]').forEach(button => {
           button.addEventListener('click', () => openTournamentFromCatalog(button.getAttribute('data-open-tournament')));
         });
+        document.querySelectorAll('[data-delete-tournament]').forEach(button => {
+          button.addEventListener('click', () => confirmTournamentDeletion(
+            button.getAttribute('data-delete-tournament'),
+            button.getAttribute('data-tournament-name') || 'Tournament'
+          ));
+        });
         document.getElementById('tournament-history-refresh')?.addEventListener('click', async event => {
           event.currentTarget.disabled = true;
           await loadTournamentCatalog(true);
@@ -5001,23 +5074,6 @@
             closeModal();
             createNewTournament(name, date, venue);
             showToast(`Created "${name}"`, 'success');
-          });
-        });
-        document.getElementById('delete-tournament-btn')?.addEventListener('click', () => {
-          openModal(`
-            <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
-              <h3 class="text-base font-bold">Delete Tournament?</h3>
-              <p class="text-xs text-stone-500">Remove "${esc(state.config.name)}" from local storage and Turso DB?</p>
-              <div class="flex justify-end gap-2">
-                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
-                <button id="del-t-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Delete</button>
-              </div>
-            </div>
-          `);
-          document.getElementById('modal-cancel').addEventListener('click', closeModal);
-          document.getElementById('del-t-confirm').addEventListener('click', () => {
-            closeModal();
-            deleteTournament(state.tournamentId);
           });
         });
         document.getElementById('open-sync-modal-btn')?.addEventListener('click', () => {

@@ -1571,13 +1571,26 @@ app.put('/api/tournaments/:id', denyPlayerWrite, checkAdminKey, async (req, res)
 });
 
 // Delete one tournament
-app.delete('/api/tournaments/:id', denyPlayerWrite, checkAdminKey, async (req, res) => {
+app.delete('/api/tournaments/:id', requireAdminKey, async (req, res) => {
+  let transaction;
   try {
-    await getDb().execute({ sql: 'DELETE FROM player_checkins WHERE tournament_id = ?', args: [req.params.id] });
-    await getDb().execute({ sql: 'DELETE FROM tournaments WHERE id = ?', args: [req.params.id] });
-    res.json({ ok: true });
+    transaction = await getDb().transaction('write');
+    await transaction.execute({
+      sql: 'DELETE FROM player_checkins WHERE tournament_id = ?',
+      args: [req.params.id]
+    });
+    const result = await transaction.execute({
+      sql: 'DELETE FROM tournaments WHERE id = ?',
+      args: [req.params.id]
+    });
+    await transaction.commit();
+    res.json({ ok: true, deleted: Number(result.rowsAffected) > 0 });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (transaction) await transaction.rollback();
+    console.error('Tournament deletion failed:', err);
+    res.status(500).json({ error: 'Tournament could not be deleted' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 

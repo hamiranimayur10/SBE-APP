@@ -6,6 +6,7 @@
       const REGISTRY_KEY = 'badminton_tournaments_registry_v1';
       const THEME_KEY = 'badminton_tournament_theme_v1';
       const PLAYER_PROFILES_KEY = 'badminton_player_profiles_v1';
+      const ANONYMIZED_PLAYER_PATTERN = /^Anonymous Player [a-f0-9]{16}$/i;
       const DEFAULT_PIN = '2025';
       const playerInviteToken = new URLSearchParams(window.location.search).get('playerInvite') || '';
       let spreadsheetParserPromise = null;
@@ -50,6 +51,10 @@
         });
         if (page === 'players' && params.has('player')) url.searchParams.set('player', params.get('player'));
         return `${url.pathname}${url.search}`;
+      }
+
+      function isAnonymizedPlayerName(name) {
+        return ANONYMIZED_PLAYER_PATTERN.test(String(name || '').trim());
       }
 
       function getRequestedPage() {
@@ -554,7 +559,7 @@
           const addRosterProfile = name => {
             const cleanName = String(name || '').trim();
             const key = normalizeImportName(cleanName);
-            if (!key || /^(TBD|Seed\s+\d+)$/i.test(cleanName) || knownNames.has(key)) return;
+            if (!key || /^(TBD|Seed\s+\d+)$/i.test(cleanName) || isAnonymizedPlayerName(cleanName) || knownNames.has(key)) return;
             let playerId = createPlayerId();
             while (usedIds.has(playerId)) playerId = createPlayerId();
             usedIds.add(playerId);
@@ -1882,6 +1887,173 @@
         }
         if (!response.ok) throw new Error(result.error || `Player account API request failed (HTTP ${response.status})`);
         return result;
+      }
+
+      function anonymizeLocalTournamentState(tournament, deletedPlayer, anonymizedName) {
+        const identityNames = new Set([
+          deletedPlayer.name,
+          deletedPlayer.nickname,
+          ...(Array.isArray(deletedPlayer.aliases) ? deletedPlayer.aliases : [])
+        ].map(normalizeImportName).filter(Boolean));
+        const playerId = String(deletedPlayer.playerId || '').toLowerCase();
+        const anonymizeName = value => {
+          const parts = String(value).split(/\s*&\s*/);
+          let changed = false;
+          const anonymizedParts = parts.map(part => {
+            if (!identityNames.has(normalizeImportName(part))) return part;
+            changed = true;
+            return anonymizedName;
+          });
+          return changed ? anonymizedParts.join(' & ') : value;
+        };
+        const redact = value => {
+          if (Array.isArray(value)) return value.map(redact);
+          if (value && typeof value === 'object') {
+            const result = {};
+            Object.entries(value).forEach(([key, item]) => {
+              if (key === 'playerProfileIds') {
+                result[key] = Object.fromEntries(
+                  Object.entries(item && typeof item === 'object' && !Array.isArray(item) ? item : {})
+                    .filter(([name, id]) =>
+                      !identityNames.has(normalizeImportName(name)) &&
+                      (!playerId || String(id || '').toLowerCase() !== playerId)
+                    )
+                );
+                return;
+              }
+              if (['checkIns', 'playerSkills'].includes(key) && item && typeof item === 'object' && !Array.isArray(item)) {
+                result[key] = Object.fromEntries(
+                  Object.entries(item)
+                    .filter(([name]) => !identityNames.has(normalizeImportName(name)))
+                    .map(([name, entry]) => [name, redact(entry)])
+                );
+                return;
+              }
+              const anonymizedKey = identityNames.has(normalizeImportName(key)) ? anonymizedName : key;
+              if (playerId && typeof item === 'string' && item.toLowerCase() === playerId) {
+                result[anonymizedKey] = '';
+                return;
+              }
+              result[anonymizedKey] = redact(item);
+            });
+            return result;
+          }
+          if (typeof value !== 'string') return value;
+          if (playerId && value.toLowerCase() === playerId) return '';
+          return anonymizeName(value);
+        };
+        return redact(tournament);
+      }
+
+      function removeCachedPlayerProfile(profile) {
+        const matchesDeletedPlayer = item =>
+          (profile.playerId && item.playerId === profile.playerId) || samePlayerIdentity(item, profile);
+        playerData.profiles = playerData.profiles.filter(item => !matchesDeletedPlayer(item));
+        try {
+          const cached = JSON.parse(localStorage.getItem(PLAYER_PROFILES_KEY) || '[]');
+          if (Array.isArray(cached)) {
+            localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(cached.filter(item => !matchesDeletedPlayer(item))));
+          }
+          return true;
+        } catch (err) {
+          console.error('Could not remove the deleted player from the local profile cache:', err);
+          return false;
+        }
+      }
+
+      function refreshLocalTournamentStates(updatedTournamentIds, deletedPlayer, anonymizedName) {
+        const updatedIds = new Set((updatedTournamentIds || []).map(String));
+        Object.entries(registry.items || {}).forEach(([id, tournament]) => {
+          const anonymized = anonymizeLocalTournamentState(tournament, deletedPlayer, anonymizedName);
+          if (updatedIds.has(String(id))) {
+            anonymized.sync = {
+              ...(anonymized.sync || {}),
+              status: 'synced',
+              lastSynced: new Date().toISOString()
+            };
+          }
+          registry.items[id] = anonymized;
+          if (String(state.tournamentId) === String(id)) state = anonymized;
+        });
+        saveRegistry();
+      }
+
+      async function refreshAnonymizedTournaments(tournamentIds) {
+        for (const id of tournamentIds || []) {
+          const tournament = await requestAdminApi(`/api/tournaments/${encodeURIComponent(id)}`);
+          if (!tournament.exists || !tournament.data) {
+            throw new Error(`Updated tournament ${id} could not be reloaded`);
+          }
+          const previous = registry.items[String(id)] || createDefaultState(id, tournament.data.config?.name || 'Tournament');
+          const refreshed = normalizeTournamentState({
+            ...tournament.data,
+            tournamentId: String(id),
+            auth: state.auth,
+            ui: previous.ui || {},
+            sync: {
+              ...(previous.sync || {}),
+              status: 'synced',
+              lastSynced: tournament.updatedAt || new Date().toISOString()
+            }
+          }, String(id));
+          registry.items[String(id)] = refreshed;
+          if (String(state.tournamentId) === String(id)) state = refreshed;
+        }
+        saveRegistry();
+      }
+
+      function confirmAdminDeletePlayerProfile(playerName) {
+        openModal(`
+          <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold text-red-600 dark:text-red-400">Delete ${esc(playerName)}'s profile and history?</h3>
+              <p class="mt-2 text-xs text-stone-500">This permanently deletes the profile, login, sessions, invitations, and check-ins. Scores stay in tournament records, but this player's name is replaced with an anonymous label so opponents' stats remain intact.</p>
+            </div>
+            <div class="flex justify-end gap-2">
+              <button id="admin-delete-profile-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="admin-delete-profile-confirm" type="button" class="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-bold">Delete profile</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('admin-delete-profile-cancel').addEventListener('click', closeModal);
+        document.getElementById('admin-delete-profile-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          button.textContent = 'Deleting…';
+          try {
+            const result = await requestAdminApi(`/api/players/${encodeURIComponent(playerName)}`, {
+              method: 'DELETE'
+            });
+            closeModal();
+            const cacheRemoved = removeCachedPlayerProfile(result.deletedPlayer);
+            refreshLocalTournamentStates(result.updatedTournamentIds, result.deletedPlayer, result.anonymizedName);
+            let refreshError = '';
+            try {
+              await refreshAnonymizedTournaments(result.updatedTournamentIds);
+            } catch (err) {
+              refreshError = err.message;
+              console.error('Player was deleted, but anonymized tournaments could not be reloaded:', err);
+            }
+            playerData.loaded = false;
+            await loadPlayerData(true);
+            state.ui.selectedPlayerName = '';
+            state.ui.headToHeadOpponent = '';
+            const currentUrl = new URL(window.location.href);
+            currentUrl.searchParams.delete('player');
+            history.replaceState(null, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+            saveRegistry();
+            render();
+            if (refreshError || !cacheRemoved || playerData.error) {
+              showToast(`Player deleted; local history refresh needs attention${refreshError ? `: ${refreshError}` : ''}`, 'error');
+            } else {
+              showToast(result.message || 'Player profile deleted and history anonymized', 'success');
+            }
+          } catch (err) {
+            button.disabled = false;
+            button.textContent = 'Delete profile';
+            showToast(`Could not delete player profile: ${err.message}`, 'error');
+          }
+        });
       }
 
       function confirmPlayerAccountDeletion() {
@@ -3382,7 +3554,9 @@
 
       function renderPlayerProfilesView() {
         const analytics = window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId);
-        const directory = [...analytics.players].sort((a, b) => a.name.localeCompare(b.name));
+        const directory = [...analytics.players]
+          .filter(player => !isAnonymizedPlayerName(player.name))
+          .sort((a, b) => a.name.localeCompare(b.name));
         const playerSearch = (state.ui.playerSearch || '').toLocaleLowerCase().trim();
         const selected = analytics.getPlayer(state.ui.selectedPlayerName) || directory[0] || null;
         const opponent = directory.find(player =>
@@ -3491,6 +3665,7 @@
                         <button id="player-share-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Share Card</button>
                         ${state.auth.role === 'admin' ? `<button id="player-edit-profile-btn" data-player-edit-name="${esc(selected.name)}" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit Profile</button>` : ''}
                         ${state.auth.role === 'admin' ? `<button id="player-reset-password-btn" data-player-account-name="${esc(profile.name || selected.name)}" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Reset Password</button><button id="player-delete-account-btn" data-player-account-name="${esc(profile.name || selected.name)}" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete Player Login</button>` : ''}
+                        ${state.auth.role === 'admin' ? `<button id="player-delete-profile-btn" data-player-delete-name="${esc(selected.name)}" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete Profile &amp; History</button>` : ''}
                         ${isOwnProfile ? '<button id="player-edit-own-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit My Profile</button>' : ''}
                         ${isOwnProfile ? '<button id="player-change-password-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Change Password</button><button id="player-delete-own-account-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete My Account</button>' : ''}
                         ${isOwnProfile && ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold ${ownCheckIn?.checkedIn ? 'opacity-70 cursor-not-allowed' : 'hover:bg-emerald-500'}">${ownCheckIn?.checkedIn ? `Checked In${ownCheckIn.time ? ` · ${esc(ownCheckIn.time)}` : ''}` : 'Check In'}</button>` : ''}
@@ -5324,6 +5499,9 @@
         });
         document.getElementById('player-delete-account-btn')?.addEventListener('click', event => {
           confirmAdminDeletePlayerLogin(event.currentTarget.getAttribute('data-player-account-name'));
+        });
+        document.getElementById('player-delete-profile-btn')?.addEventListener('click', event => {
+          confirmAdminDeletePlayerProfile(event.currentTarget.getAttribute('data-player-delete-name'));
         });
         document.getElementById('player-share-btn')?.addEventListener('click', () => {
           const shareUrl = new URL(window.location.href);

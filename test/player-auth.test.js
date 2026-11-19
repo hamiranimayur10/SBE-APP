@@ -6,6 +6,7 @@ const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const test = require('node:test');
 const { createClient } = require('@libsql/client');
+const { buildAnalytics } = require('../public/player-analytics');
 
 const root = path.join(__dirname, '..');
 
@@ -552,12 +553,158 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const profilesAfterTournamentDelete = await api('/api/players');
     assert.ok(profilesAfterTournamentDelete.body.players.some(player => player.name === 'Roster Alice'));
 
+    const profileDeleteFixture = await api('/api/tournaments/profile-delete-test', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        tournamentId: 'profile-delete-test',
+        phase: 'completed',
+        config: { name: 'Profile Delete Test' },
+        groups: [{ name: 'A', players: ['History Target', 'History Partner', 'History Opponent'] }],
+        qr1Matches: [
+          { id: 'target-singles', p1: 'History Target', p2: 'History Opponent', s1: 21, s2: 14, completed: true, winner: 'History Target' }
+        ],
+        finals: {
+          championship: {
+            id: 'target-final',
+            p1: 'History Target',
+            p2: 'History Opponent',
+            games: [{ s1: 21, s2: 15 }, { s1: 16, s2: 21 }, { s1: 21, s2: 18 }],
+            completed: true,
+            winner: 'History Target'
+          }
+        }
+      })
+    });
+    assert.equal(profileDeleteFixture.response.status, 200);
+    const renamedTarget = await api('/api/players/History%20Target', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify({ name: 'History Target Renamed' })
+    });
+    assert.equal(renamedTarget.response.status, 200);
+    const tournamentWithAlias = await api('/api/tournaments/profile-delete-test');
+    tournamentWithAlias.body.data.qr1Matches.push({
+      id: 'target-doubles',
+      p1: 'History Target Renamed & History Partner',
+      p2: 'History Opponent & Another Partner',
+      s1: 17,
+      s2: 21,
+      completed: true,
+      winner: 'History Opponent & Another Partner'
+    });
+    const savedAliasMatch = await api('/api/tournaments/profile-delete-test', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify(tournamentWithAlias.body.data)
+    });
+    assert.equal(savedAliasMatch.response.status, 200);
+
+    const deleteTargetInvite = await api('/api/player-invites', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        kind: 'player',
+        targetName: 'History Target Renamed',
+        contactType: 'email',
+        contactValue: 'history-target@example.com'
+      })
+    });
+    assert.equal(deleteTargetInvite.response.status, 201);
+    const deleteTargetRegistration = await api('/api/player-auth/register', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        inviteToken: deleteTargetInvite.body.invite.token,
+        email: 'history-target@example.com',
+        password: 'history-target-test-password'
+      })
+    });
+    assert.equal(deleteTargetRegistration.response.status, 201);
+    const deleteTargetCookie = deleteTargetRegistration.response.headers.get('set-cookie').split(';')[0];
+    const targetCheckIn = await api('/api/tournaments/profile-delete-test/checkin', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ playerName: 'History Target', groupName: 'A', skill: 7 })
+    });
+    assert.equal(targetCheckIn.response.status, 200);
+
+    const deleteProfileWithoutKey = await api('/api/players/History%20Target%20Renamed', { method: 'DELETE' });
+    assert.equal(deleteProfileWithoutKey.response.status, 401);
+    const deleteProfileAsPlayer = await api('/api/players/History%20Target%20Renamed', {
+      method: 'DELETE',
+      headers: { ...adminHeaders, cookie: deleteTargetCookie }
+    });
+    assert.equal(deleteProfileAsPlayer.response.status, 403);
+    const deletedProfile = await api('/api/players/History%20Target%20Renamed', {
+      method: 'DELETE',
+      headers: adminHeaders
+    });
+    assert.equal(deletedProfile.response.status, 200);
+    assert.match(deletedProfile.body.anonymizedName, /^Anonymous Player [a-f0-9]{16}$/);
+    assert.ok(deletedProfile.body.updatedTournamentIds.includes('profile-delete-test'));
+
+    const invalidatedDeletedPlayerSession = await api('/api/player-auth/me', {
+      headers: { cookie: deleteTargetCookie }
+    });
+    assert.equal(invalidatedDeletedPlayerSession.response.status, 401);
+    const profilesAfterProfileDelete = await api('/api/players');
+    assert.ok(!profilesAfterProfileDelete.body.players.some(player =>
+      ['History Target', 'History Target Renamed'].includes(player.name)
+    ));
+    assert.ok(!profilesAfterProfileDelete.body.players.some(player => player.name === deletedProfile.body.anonymizedName));
+
+    const anonymizedTournament = await api('/api/tournaments/profile-delete-test');
+    const anonymizedData = anonymizedTournament.body.data;
+    assert.ok(anonymizedData.groups[0].players.includes(deletedProfile.body.anonymizedName));
+    assert.ok(!anonymizedData.groups[0].players.includes('History Target'));
+    assert.ok(!anonymizedData.groups[0].players.includes('History Target Renamed'));
+    assert.equal(anonymizedData.qr1Matches[0].p1, deletedProfile.body.anonymizedName);
+    assert.equal(anonymizedData.qr1Matches[0].winner, deletedProfile.body.anonymizedName);
+    assert.equal(anonymizedData.qr1Matches[0].s1, 21);
+    assert.equal(anonymizedData.qr1Matches[0].s2, 14);
+    assert.equal(anonymizedData.qr1Matches[0].completed, true);
+    assert.equal(anonymizedData.qr1Matches[1].p1, `${deletedProfile.body.anonymizedName} & History Partner`);
+    assert.equal(anonymizedData.qr1Matches[1].s1, 17);
+    assert.equal(anonymizedData.qr1Matches[1].s2, 21);
+    assert.equal(anonymizedData.finals.championship.winner, deletedProfile.body.anonymizedName);
+    assert.deepEqual(anonymizedData.finals.championship.games, [
+      { s1: 21, s2: 15 }, { s1: 16, s2: 21 }, { s1: 21, s2: 18 }
+    ]);
+    assert.ok(!Object.values(anonymizedData.playerProfileIds).includes(renamedTarget.body.player.playerId));
+    assert.ok(!Object.keys(anonymizedData.playerProfileIds).includes('history target'));
+    assert.ok(!Object.keys(anonymizedData.playerProfileIds).includes('history target renamed'));
+    assert.equal(Object.keys(anonymizedData.checkIns || {}).length, 0);
+    const anonymizedAnalytics = buildAnalytics(
+      [{ id: 'profile-delete-test', data: anonymizedData }],
+      profilesAfterProfileDelete.body.players,
+      'profile-delete-test'
+    );
+    assert.equal(anonymizedAnalytics.getPlayer('History Opponent').matchesPlayed, 3);
+
     const verificationClient = createClient({ url: databaseUrl });
     const remainingCheckIns = await verificationClient.execute({
       sql: 'SELECT tournament_id FROM player_checkins WHERE tournament_id = ?',
       args: ['delete-test']
     });
     assert.equal(remainingCheckIns.rows.length, 0);
+    const deletedPlayerRows = await verificationClient.execute({
+      sql: `SELECT
+              (SELECT COUNT(*) FROM player_profiles WHERE player_name IN (?, ?)) AS profiles,
+              (SELECT COUNT(*) FROM player_accounts WHERE email = ?) AS accounts,
+              (SELECT COUNT(*) FROM player_invites WHERE target_email = ? OR contact_value = ?) AS invites,
+              (SELECT COUNT(*) FROM player_checkins WHERE player_name IN (?, ?)) AS checkins`,
+      args: [
+        'History Target', 'History Target Renamed',
+        'history-target@example.com',
+        'history-target@example.com', 'history-target@example.com',
+        'History Target', 'History Target Renamed'
+      ]
+    });
+    assert.equal(Number(deletedPlayerRows.rows[0].profiles), 0);
+    assert.equal(Number(deletedPlayerRows.rows[0].accounts), 0);
+    assert.equal(Number(deletedPlayerRows.rows[0].invites), 0);
+    assert.equal(Number(deletedPlayerRows.rows[0].checkins), 0);
     await verificationClient.close();
   } finally {
     if (child.exitCode === null) {

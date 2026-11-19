@@ -253,6 +253,10 @@ function normalizeImportName(name) {
     .toLocaleLowerCase();
 }
 
+function isAnonymizedPlayerName(name) {
+  return /^anonymous player [a-f0-9]{16}$/i.test(String(name || '').trim());
+}
+
 function isPlayerId(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
 }
@@ -513,7 +517,7 @@ function getTournamentRosterNames(tournament) {
   const addPlayer = value => {
     String(value || '').split(/\s*&\s*/).forEach(name => {
       const cleanName = name.trim();
-      if (cleanName && !/^(TBD|Seed\s+\d+)$/i.test(cleanName)) names.push(cleanName);
+      if (cleanName && !/^(TBD|Seed\s+\d+)$/i.test(cleanName) && !isAnonymizedPlayerName(cleanName)) names.push(cleanName);
     });
   };
   (Array.isArray(tournament.groups) ? tournament.groups : [])
@@ -540,6 +544,60 @@ function getTournamentRosterNames(tournament) {
   return names;
 }
 
+function anonymizeTournamentPlayer(tournament, identityNames, playerId, anonymizedName) {
+  const anonymizeName = value => {
+    const parts = String(value).split(/\s*&\s*/);
+    let changed = false;
+    const anonymizedParts = parts.map(part => {
+      if (!identityNames.has(normalizeImportName(part))) return part;
+      changed = true;
+      return anonymizedName;
+    });
+    return changed ? anonymizedParts.join(' & ') : value;
+  };
+  const redact = value => {
+    if (Array.isArray(value)) return value.map(item => redact(item));
+    if (value && typeof value === 'object') {
+      const result = {};
+      Object.entries(value).forEach(([entryKey, entryValue]) => {
+        if (entryKey === 'config') {
+          result[entryKey] = entryValue;
+          return;
+        }
+        if (entryKey === 'playerProfileIds') {
+          result[entryKey] = Object.fromEntries(
+            Object.entries(entryValue && typeof entryValue === 'object' && !Array.isArray(entryValue) ? entryValue : {})
+              .filter(([name, id]) =>
+                !identityNames.has(normalizeImportName(name)) &&
+                (!playerId || String(id || '').toLowerCase() !== playerId)
+              )
+          );
+          return;
+        }
+        if (['checkIns', 'playerSkills'].includes(entryKey) && entryValue && typeof entryValue === 'object' && !Array.isArray(entryValue)) {
+          result[entryKey] = Object.fromEntries(
+            Object.entries(entryValue)
+              .filter(([name]) => !identityNames.has(normalizeImportName(name)))
+              .map(([name, item]) => [name, redact(item)])
+          );
+          return;
+        }
+        const anonymizedKey = identityNames.has(normalizeImportName(entryKey)) ? anonymizedName : entryKey;
+        if (playerId && typeof entryValue === 'string' && entryValue.toLowerCase() === playerId) {
+          result[anonymizedKey] = '';
+          return;
+        }
+        result[anonymizedKey] = redact(entryValue, entryKey);
+      });
+      return result;
+    }
+    if (typeof value !== 'string') return value;
+    if (playerId && value.toLowerCase() === playerId) return '';
+    return anonymizeName(value);
+  };
+  return redact(tournament);
+}
+
 async function ensurePlayerProfiles(names, executor) {
   const database = executor || getDb();
   const existing = await database.execute('SELECT player_name, aliases FROM player_profiles');
@@ -551,7 +609,7 @@ async function ensurePlayerProfiles(names, executor) {
   for (const value of names) {
     const playerName = String(value || '').trim();
     const key = normalizeImportName(playerName);
-    if (!key || /^(TBD|Seed\s+\d+)$/i.test(playerName) || known.has(key)) continue;
+    if (!key || /^(TBD|Seed\s+\d+)$/i.test(playerName) || isAnonymizedPlayerName(playerName) || known.has(key)) continue;
     const playerCode = await allocatePlayerCode(database);
     await database.execute({
       sql: 'INSERT INTO player_profiles (player_id, player_code, player_name, updated_at) VALUES (?, ?, ?, ?)',
@@ -1370,6 +1428,113 @@ app.put('/api/players/:name', requireAdminKey, async (req, res) => {
   }
 });
 
+app.delete('/api/players/:name', requireAdminKey, async (req, res) => {
+  let transaction;
+  try {
+    const requestedName = String(req.params.name || '').trim();
+    if (!requestedName) throw new ValidationError('Player name is required');
+
+    transaction = await getDb().transaction('write');
+    const profileResult = await transaction.execute({
+      sql: 'SELECT * FROM player_profiles WHERE player_name = ? COLLATE NOCASE LIMIT 1',
+      args: [requestedName]
+    });
+    const profile = profileResult.rows[0];
+    if (!profile) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'Player profile not found' });
+    }
+
+    const accountResult = await transaction.execute({
+      sql: 'SELECT id, player_name, email FROM player_accounts WHERE player_name = ? COLLATE NOCASE',
+      args: [profile.player_name]
+    });
+    const account = accountResult.rows[0] || null;
+    const identityNames = new Set([
+      profile.player_name,
+      profile.nickname,
+      ...parseJsonField(profile.aliases, []),
+      account?.player_name
+    ].map(normalizeImportName).filter(Boolean));
+    const profileId = String(profile.player_id || '').toLowerCase();
+    const anonymizedName = `Anonymous Player ${crypto.randomBytes(8).toString('hex')}`;
+    const now = new Date().toISOString();
+    const tournamentResult = await transaction.execute('SELECT id, data FROM tournaments');
+    const updatedTournamentIds = [];
+
+    for (const row of tournamentResult.rows) {
+      const originalData = JSON.parse(row.data);
+      const anonymizedData = anonymizeTournamentPlayer(originalData, identityNames, profileId, anonymizedName);
+      if (JSON.stringify(anonymizedData) === JSON.stringify(originalData)) continue;
+      await transaction.execute({
+        sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
+        args: [JSON.stringify(anonymizedData), now, row.id]
+      });
+      updatedTournamentIds.push(String(row.id));
+    }
+
+    const emailIdentities = new Set([profile.email, account?.email]
+      .map(value => normalizePlayerName(value))
+      .filter(Boolean));
+    const inviteResult = await transaction.execute('SELECT id, target_name, target_email, contact_value FROM player_invites');
+    for (const invite of inviteResult.rows) {
+      const hasPlayerIdentity = identityNames.has(normalizeImportName(invite.target_name)) ||
+        identityNames.has(normalizeImportName(invite.contact_value));
+      const hasPlayerEmail = emailIdentities.has(normalizePlayerName(invite.target_email)) ||
+        emailIdentities.has(normalizePlayerName(invite.contact_value));
+      if (hasPlayerIdentity || hasPlayerEmail) {
+        await transaction.execute({ sql: 'DELETE FROM player_invites WHERE id = ?', args: [invite.id] });
+      }
+    }
+
+    const checkInResult = await transaction.execute('SELECT tournament_id, player_name FROM player_checkins');
+    for (const checkIn of checkInResult.rows) {
+      if (!identityNames.has(normalizeImportName(checkIn.player_name))) continue;
+      await transaction.execute({
+        sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+        args: [checkIn.tournament_id, checkIn.player_name]
+      });
+    }
+
+    if (account) {
+      await transaction.execute({
+        sql: 'DELETE FROM player_sessions WHERE account_id = ?',
+        args: [account.id]
+      });
+      await transaction.execute({
+        sql: 'DELETE FROM player_accounts WHERE id = ?',
+        args: [account.id]
+      });
+    }
+    await transaction.execute({
+      sql: 'DELETE FROM player_profiles WHERE player_name = ? COLLATE NOCASE',
+      args: [profile.player_name]
+    });
+    await transaction.commit();
+
+    res.json({
+      ok: true,
+      playerName: profile.player_name,
+      anonymizedName,
+      updatedTournamentIds,
+      deletedPlayer: {
+        name: profile.player_name,
+        nickname: profile.nickname || '',
+        playerId: profile.player_id || '',
+        aliases: parseJsonField(profile.aliases, [])
+      },
+      message: 'Player profile and login deleted; tournament scores were kept with the player anonymized'
+    });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Admin player profile deletion failed:', err);
+    res.status(500).json({ error: 'Player profile could not be deleted' });
+  } finally {
+    if (transaction) transaction.close();
+  }
+});
+
 app.post('/api/player-accounts/:name/reset-password', requireAdminKey, async (req, res) => {
   let transaction;
   try {
@@ -1737,8 +1902,9 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
   }
 });
 
+app.use(express.static(require('path').join(__dirname, '..', 'public')));
+
 if (require.main === module) {
-  app.use(express.static(require('path').join(__dirname, '..', 'public')));
   const port = process.env.PORT || 3001;
   initSchema()
     .then(() => {

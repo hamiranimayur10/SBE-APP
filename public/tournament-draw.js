@@ -37,6 +37,44 @@ const TournamentDraw = (() => {
       .filter(Boolean);
   }
 
+  function validateGroupMatchCount(playerCount, matchesPerPlayer) {
+    if (!Number.isInteger(matchesPerPlayer) || matchesPerPlayer < 1) {
+      throw new RangeError('Matches per player must be a positive whole number');
+    }
+    if (!Number.isInteger(playerCount) || playerCount < 2 || matchesPerPlayer >= playerCount) {
+      throw new RangeError('Matches per player must be less than the number of players in the group');
+    }
+    if ((playerCount * matchesPerPlayer) % 2 !== 0) {
+      throw new RangeError('An odd-sized group needs an even number of matches per player');
+    }
+  }
+
+  function generateGroupPairings(players, matchesPerPlayer, random = Math.random) {
+    if (!Array.isArray(players)) throw new TypeError('Players must be a list');
+    validateGroupMatchCount(players.length, matchesPerPlayer);
+    const names = players.map(normalizePlayerName);
+    if (names.some(name => !name) || new Set(names).size !== names.length) {
+      throw new RangeError('Each player in the group must have a distinct name');
+    }
+    const shuffled = [...players];
+    for (let index = shuffled.length - 1; index > 0; index--) {
+      const swap = Math.floor(random() * (index + 1));
+      [shuffled[index], shuffled[swap]] = [shuffled[swap], shuffled[index]];
+    }
+    const pairs = [];
+    for (let distance = 1; distance <= Math.floor(matchesPerPlayer / 2); distance++) {
+      for (let index = 0; index < shuffled.length; index++) {
+        pairs.push([shuffled[index], shuffled[(index + distance) % shuffled.length]]);
+      }
+    }
+    if (matchesPerPlayer % 2) {
+      for (let index = 0; index < shuffled.length / 2; index++) {
+        pairs.push([shuffled[index], shuffled[index + shuffled.length / 2]]);
+      }
+    }
+    return pairs;
+  }
+
   function scheduleMatchesForCourts(matches, courtCount = 2) {
     if (!Array.isArray(matches)) throw new TypeError('Matches must be a list');
     if (!Number.isInteger(courtCount) || courtCount < 1) throw new RangeError('Court count must be a positive integer');
@@ -99,7 +137,7 @@ const TournamentDraw = (() => {
     return topFour.map((player, index) => [player, bottomFour[index]]);
   }
 
-  return { drawSemiFinalPartners, groupRankedPlayers, scheduleMatchesForCourts };
+  return { drawSemiFinalPartners, generateGroupPairings, groupRankedPlayers, scheduleMatchesForCourts, validateGroupMatchCount };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = TournamentDraw;

@@ -2,7 +2,35 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { drawSemiFinalPartners, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
+const { drawSemiFinalPartners, generateGroupPairings, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
+
+test('creates the requested number of distinct opponents for every player', () => {
+  for (let size = 2; size <= 30; size++) {
+    const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
+    for (let count = 1; count < size; count++) {
+      if (size * count % 2) continue;
+      const pairs = generateGroupPairings(players, count, () => 0);
+      const opponents = new Map(players.map(player => [player, new Set()]));
+      assert.equal(pairs.length, size * count / 2);
+      pairs.forEach(([a, b]) => {
+        assert.notEqual(a, b);
+        assert.ok(!opponents.get(a).has(b));
+        opponents.get(a).add(b);
+        opponents.get(b).add(a);
+      });
+      players.forEach(player => assert.equal(opponents.get(player).size, count));
+    }
+  }
+});
+
+test('rejects impossible or invalid per-player match counts', () => {
+  const players = Array.from({ length: 9 }, (_, index) => `Player ${index}`);
+  assert.throws(() => generateGroupPairings(players, 3), /odd-sized group/);
+  assert.throws(() => generateGroupPairings(players, 9), /less than/);
+  assert.throws(() => generateGroupPairings(players, 0), /positive whole number/);
+  assert.throws(() => generateGroupPairings(players, 2.5), /positive whole number/);
+  assert.throws(() => generateGroupPairings(['Alice', ' alice '], 1), /distinct name/);
+});
 
 test('splits ranked players into consecutive, balanced groups', () => {
   const groups = groupRankedPlayers(Array.from({ length: 11 }, (_, index) => index + 1), 3);

@@ -250,6 +250,47 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(validLogin.response.status, 200);
     assert.ok(validLogin.response.headers.get('set-cookie'));
+    const playerCookieAfterPassword = validLogin.response.headers.get('set-cookie').split(';')[0];
+
+    const passwordChange = await api('/api/player-auth/me/password', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: playerCookieAfterPassword },
+      body: JSON.stringify({
+        currentPassword: 'a-secure-test-password',
+        newPassword: 'changed-secure-password'
+      })
+    });
+    assert.equal(passwordChange.response.status, 200);
+    const oldPasswordLogin = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: 'a-secure-test-password' })
+    });
+    assert.equal(oldPasswordLogin.response.status, 401);
+    const changedPasswordLogin = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: 'changed-secure-password' })
+    });
+    assert.equal(changedPasswordLogin.response.status, 200);
+    const changedPasswordCookie = changedPasswordLogin.response.headers.get('set-cookie').split(';')[0];
+
+    const adminRename = await api('/api/players/Renamed%20Player', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: 'Admin Renamed Player',
+        playerId: update.body.player.playerId,
+        playerCode: update.body.player.playerCode
+      })
+    });
+    assert.equal(adminRename.response.status, 200);
+    assert.equal(adminRename.body.player.name, 'Admin Renamed Player');
+    const renamedAccount = await api('/api/player-auth/me', {
+      headers: { cookie: changedPasswordCookie }
+    });
+    assert.equal(renamedAccount.response.status, 200);
+    assert.equal(renamedAccount.body.player.name, 'Admin Renamed Player');
 
     const genericInvite = await api('/api/player-invites', {
       method: 'POST',
@@ -310,14 +351,14 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const tournamentWrite = await api('/api/tournaments/auth-test', {
       method: 'PUT',
-      headers: { ...adminHeaders, cookie: playerCookie },
+      headers: { ...adminHeaders, cookie: changedPasswordCookie },
       body: JSON.stringify({ config: { name: 'Player changed this' }, groups: [] })
     });
     assert.equal(tournamentWrite.response.status, 403);
 
     const checkinWrite = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', cookie: playerCookie },
+      headers: { 'content-type': 'application/json', cookie: changedPasswordCookie },
       body: JSON.stringify({ playerName: 'Roster Alice' })
     });
     assert.equal(checkinWrite.response.status, 403);
@@ -331,7 +372,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const nonRosterCheckIn = await api('/api/player-auth/tournaments/auth-test/checkin', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', cookie: playerCookie },
+      headers: { 'content-type': 'application/json', cookie: changedPasswordCookie },
       body: JSON.stringify({})
     });
     assert.equal(nonRosterCheckIn.response.status, 403);
@@ -357,18 +398,111 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const adminInviteWrite = await api('/api/player-invites', {
       method: 'POST',
-      headers: { ...adminHeaders, cookie: playerCookie },
+      headers: { ...adminHeaders, cookie: changedPasswordCookie },
       body: JSON.stringify({ kind: 'generic', contactType: 'link' })
     });
     assert.equal(adminInviteWrite.response.status, 403);
 
     const logout = await api('/api/player-auth/logout', {
       method: 'POST',
-      headers: { cookie: playerCookie }
+      headers: { cookie: changedPasswordCookie }
     });
     assert.equal(logout.response.status, 200);
     const missingSession = await api('/api/player-auth/me');
     assert.equal(missingSession.response.status, 401);
+
+    const resetWithoutKey = await api('/api/player-accounts/Admin%20Renamed%20Player/reset-password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' }
+    });
+    assert.equal(resetWithoutKey.response.status, 401);
+    const resetPassword = await api('/api/player-accounts/Admin%20Renamed%20Player/reset-password', {
+      method: 'POST',
+      headers: adminHeaders
+    });
+    assert.equal(resetPassword.response.status, 200);
+    assert.equal(resetPassword.body.mustChangePassword, true);
+    assert.ok(resetPassword.body.temporaryPassword.length >= 12);
+    const temporaryPassword = resetPassword.body.temporaryPassword;
+
+    const temporaryLogin = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: temporaryPassword })
+    });
+    assert.equal(temporaryLogin.response.status, 200);
+    assert.equal(temporaryLogin.body.mustChangePassword, true);
+    const temporaryCookie = temporaryLogin.response.headers.get('set-cookie').split(';')[0];
+    const blockedUntilPasswordChange = await api('/api/player-auth/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: temporaryCookie },
+      body: JSON.stringify({ playerName: 'Roster Alice' })
+    });
+    assert.equal(blockedUntilPasswordChange.response.status, 403);
+    assert.equal(blockedUntilPasswordChange.body.code, 'PASSWORD_CHANGE_REQUIRED');
+
+    const forcedPasswordChange = await api('/api/player-auth/me/password', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: temporaryCookie },
+      body: JSON.stringify({
+        currentPassword: temporaryPassword,
+        newPassword: 'new-after-reset-password'
+      })
+    });
+    assert.equal(forcedPasswordChange.response.status, 200);
+    const oldTemporaryLogin = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: temporaryPassword })
+    });
+    assert.equal(oldTemporaryLogin.response.status, 401);
+    const afterResetMe = await api('/api/player-auth/me', {
+      headers: { cookie: temporaryCookie }
+    });
+    assert.equal(afterResetMe.response.status, 200);
+    assert.equal(afterResetMe.body.mustChangePassword, false);
+
+    const playerAfterReset = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: 'new-after-reset-password' })
+    });
+    assert.equal(playerAfterReset.response.status, 200);
+    const playerAfterResetCookie = playerAfterReset.response.headers.get('set-cookie').split(';')[0];
+    const selfDelete = await api('/api/player-auth/me', {
+      method: 'DELETE',
+      headers: { cookie: playerAfterResetCookie }
+    });
+    assert.equal(selfDelete.response.status, 200);
+    const deletedPlayerSession = await api('/api/player-auth/me', {
+      headers: { cookie: playerAfterResetCookie }
+    });
+    assert.equal(deletedPlayerSession.response.status, 401);
+    const preservedPlayerProfile = await api('/api/players');
+    assert.ok(preservedPlayerProfile.body.players.some(player => player.name === 'Admin Renamed Player'));
+    const deletedAccountLogin = await api('/api/player-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'renamed@example.com', password: 'new-after-reset-password' })
+    });
+    assert.equal(deletedAccountLogin.response.status, 401);
+
+    const playerDeleteOwnAccount = await api('/api/player-accounts/Roster%20Alice', {
+      method: 'DELETE',
+      headers: { ...adminHeaders, cookie: aliceCookie }
+    });
+    assert.equal(playerDeleteOwnAccount.response.status, 403);
+    const adminDeleteAccount = await api('/api/player-accounts/Roster%20Alice', {
+      method: 'DELETE',
+      headers: adminHeaders
+    });
+    assert.equal(adminDeleteAccount.response.status, 200);
+    const removedAdminDeletedPlayerSession = await api('/api/player-auth/me', {
+      headers: { cookie: aliceCookie }
+    });
+    assert.equal(removedAdminDeletedPlayerSession.response.status, 401);
+    const preservedAdminDeletedProfile = await api('/api/players');
+    assert.ok(preservedAdminDeletedProfile.body.players.some(player => player.name === 'Roster Alice'));
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

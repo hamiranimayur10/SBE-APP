@@ -147,10 +147,15 @@ async function initSchema() {
           email TEXT NOT NULL COLLATE NOCASE UNIQUE,
           password_salt TEXT NOT NULL,
           password_hash TEXT NOT NULL,
+          must_change_password INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )
       `);
+      const accountInfo = await getDb().execute('PRAGMA table_info(player_accounts)');
+      if (!accountInfo.rows.some(column => String(column.name) === 'must_change_password')) {
+        await getDb().execute('ALTER TABLE player_accounts ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0');
+      }
       await getDb().execute(`
         CREATE TABLE IF NOT EXISTS player_sessions (
           token_hash TEXT PRIMARY KEY,
@@ -286,7 +291,8 @@ async function findPlayerSession(req) {
   if (!token) return null;
   const now = new Date().toISOString();
   const result = await getDb().execute({
-    sql: `SELECT s.account_id AS accountId, a.player_name AS playerName, a.email
+    sql: `SELECT s.account_id AS accountId, a.player_name AS playerName, a.email,
+                 a.must_change_password AS mustChangePassword
           FROM player_sessions s
           JOIN player_accounts a ON a.id = s.account_id
           WHERE s.token_hash = ? AND s.expires_at > ?`,
@@ -307,6 +313,17 @@ async function requirePlayer(req, res, next) {
     const session = await findPlayerSession(req);
     if (!session) return res.status(401).json({ error: 'Player login required' });
     req.playerSession = session;
+    const allowedDuringPasswordChange =
+      (req.method === 'GET' && req.path === '/api/player-auth/me') ||
+      (req.method === 'PUT' && req.path === '/api/player-auth/me/password') ||
+      (req.method === 'DELETE' && req.path === '/api/player-auth/me') ||
+      (req.method === 'POST' && req.path === '/api/player-auth/logout');
+    if (Number(session.mustChangePassword) && !allowedDuringPasswordChange) {
+      return res.status(403).json({
+        error: 'Change your temporary password before continuing',
+        code: 'PASSWORD_CHANGE_REQUIRED'
+      });
+    }
     next();
   } catch (err) {
     console.error('Failed to validate player session:', err);
@@ -901,7 +918,10 @@ app.post('/api/player-auth/login', async (req, res) => {
       args: [hashToken(token), account.id, expiresAt, now]
     });
     setPlayerCookie(req, res, token, PLAYER_SESSION_SECONDS);
-    res.json({ player: serializePlayerProfile(profile, false) });
+    res.json({
+      player: serializePlayerProfile(profile, false),
+      mustChangePassword: Boolean(Number(account.must_change_password))
+    });
   } catch (err) {
     console.error('Player login failed:', err);
     res.status(500).json({ error: 'Player login is unavailable' });
@@ -912,10 +932,90 @@ app.get('/api/player-auth/me', requirePlayer, async (req, res) => {
   try {
     const profile = await getPlayerProfile(req.playerSession.playerName);
     if (!profile) return res.status(404).json({ error: 'Player profile is unavailable' });
-    res.json({ player: serializePlayerProfile(profile, false) });
+    res.json({
+      player: serializePlayerProfile(profile, false),
+      mustChangePassword: Boolean(Number(req.playerSession.mustChangePassword))
+    });
   } catch (err) {
     console.error('Failed to load player account:', err);
     res.status(500).json({ error: 'Player profile is unavailable' });
+  }
+});
+
+app.put('/api/player-auth/me/password', requirePlayer, async (req, res) => {
+  let transaction;
+  try {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+    const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+    if (newPassword.length < 12 || newPassword.length > 128) {
+      throw new ValidationError('New password must be between 12 and 128 characters');
+    }
+    const accountResult = await getDb().execute({
+      sql: 'SELECT password_salt, password_hash FROM player_accounts WHERE id = ?',
+      args: [req.playerSession.accountId]
+    });
+    const account = accountResult.rows[0];
+    if (!account || !await verifyPlayerPassword(currentPassword, account.password_salt, account.password_hash)) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    if (currentPassword === newPassword) {
+      throw new ValidationError('Choose a new password different from your current password');
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = (await hashPassword(newPassword, salt)).toString('hex');
+    const now = new Date().toISOString();
+    const currentTokenHash = hashToken(getCookie(req, PLAYER_SESSION_COOKIE));
+    transaction = await getDb().transaction('write');
+    const update = await transaction.execute({
+      sql: `UPDATE player_accounts
+            SET password_salt = ?, password_hash = ?, must_change_password = 0, updated_at = ?
+            WHERE id = ?`,
+      args: [salt, passwordHash, now, req.playerSession.accountId]
+    });
+    if (!Number(update.rowsAffected)) throw new Error('Player account no longer exists');
+    await transaction.execute({
+      sql: 'DELETE FROM player_sessions WHERE account_id = ? AND token_hash != ?',
+      args: [req.playerSession.accountId, currentTokenHash]
+    });
+    await transaction.commit();
+    res.json({ ok: true, mustChangePassword: false });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Player password change failed:', err);
+    res.status(500).json({ error: 'Player password could not be changed' });
+  } finally {
+    if (transaction) transaction.close();
+  }
+});
+
+app.delete('/api/player-auth/me', requirePlayer, async (req, res) => {
+  let transaction;
+  try {
+    transaction = await getDb().transaction('write');
+    await transaction.execute({
+      sql: 'DELETE FROM player_sessions WHERE account_id = ?',
+      args: [req.playerSession.accountId]
+    });
+    const result = await transaction.execute({
+      sql: 'DELETE FROM player_accounts WHERE id = ?',
+      args: [req.playerSession.accountId]
+    });
+    if (!Number(result.rowsAffected)) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'Player login account was not found' });
+    }
+    await transaction.commit();
+    clearPlayerCookie(req, res);
+    res.json({ ok: true, message: 'Player login was deleted; profile and tournament history were preserved' });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    console.error('Player account deletion failed:', err);
+    res.status(500).json({ error: 'Player login could not be deleted' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 
@@ -1261,6 +1361,92 @@ app.put('/api/players/:name', requireAdminKey, async (req, res) => {
     }
     console.error('Admin player profile update failed:', err);
     res.status(500).json({ error: 'Player profile could not be updated' });
+  }
+});
+
+app.post('/api/player-accounts/:name/reset-password', requireAdminKey, async (req, res) => {
+  let transaction;
+  try {
+    const playerName = String(req.params.name || '').trim();
+    if (!playerName) throw new ValidationError('Player name is required');
+    transaction = await getDb().transaction('write');
+    const accountResult = await transaction.execute({
+      sql: 'SELECT id, player_name FROM player_accounts WHERE player_name = ? COLLATE NOCASE',
+      args: [playerName]
+    });
+    const account = accountResult.rows[0];
+    if (!account) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'This player does not have a login account' });
+    }
+
+    const temporaryPassword = crypto.randomBytes(18).toString('base64url');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passwordHash = (await hashPassword(temporaryPassword, salt)).toString('hex');
+    const now = new Date().toISOString();
+    await transaction.execute({
+      sql: `UPDATE player_accounts
+            SET password_salt = ?, password_hash = ?, must_change_password = 1, updated_at = ?
+            WHERE id = ?`,
+      args: [salt, passwordHash, now, account.id]
+    });
+    await transaction.execute({
+      sql: 'DELETE FROM player_sessions WHERE account_id = ?',
+      args: [account.id]
+    });
+    await transaction.commit();
+    res.json({
+      ok: true,
+      playerName: account.player_name,
+      temporaryPassword,
+      mustChangePassword: true
+    });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Admin player password reset failed:', err);
+    res.status(500).json({ error: 'Player password could not be reset' });
+  } finally {
+    if (transaction) transaction.close();
+  }
+});
+
+app.delete('/api/player-accounts/:name', requireAdminKey, async (req, res) => {
+  let transaction;
+  try {
+    const playerName = String(req.params.name || '').trim();
+    if (!playerName) throw new ValidationError('Player name is required');
+    transaction = await getDb().transaction('write');
+    const accountResult = await transaction.execute({
+      sql: 'SELECT id, player_name FROM player_accounts WHERE player_name = ? COLLATE NOCASE',
+      args: [playerName]
+    });
+    const account = accountResult.rows[0];
+    if (!account) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'This player does not have a login account' });
+    }
+    await transaction.execute({
+      sql: 'DELETE FROM player_sessions WHERE account_id = ?',
+      args: [account.id]
+    });
+    await transaction.execute({
+      sql: 'DELETE FROM player_accounts WHERE id = ?',
+      args: [account.id]
+    });
+    await transaction.commit();
+    res.json({
+      ok: true,
+      playerName: account.player_name,
+      message: 'Player login was deleted; profile and tournament history were preserved'
+    });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Admin player account deletion failed:', err);
+    res.status(500).json({ error: 'Player login could not be deleted' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 

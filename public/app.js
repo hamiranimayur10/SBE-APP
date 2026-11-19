@@ -371,6 +371,7 @@
       let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
       let tournamentCatalogPromise = null;
       let playerAccountProfile = null;
+      let playerMustChangePassword = false;
       let playerInviteContext = null;
       let playerInviteError = '';
       let playerAuthError = '';
@@ -415,12 +416,17 @@
         } catch (_err) {
           throw new Error(`Unexpected response from player API (HTTP ${response.status})`);
         }
-        if (!response.ok) throw new Error(result.error || `Player API request failed (HTTP ${response.status})`);
+        if (!response.ok) {
+          const error = new Error(result.error || `Player API request failed (HTTP ${response.status})`);
+          error.status = response.status;
+          throw error;
+        }
         return result;
       }
 
-      function applyPlayerAccount(profile) {
+      function applyPlayerAccount(profile, mustChangePassword) {
         playerAccountProfile = profile;
+        playerMustChangePassword = Boolean(mustChangePassword);
         playerAuthError = '';
         playerInviteError = '';
         state.auth.loggedIn = true;
@@ -448,16 +454,22 @@
           }
         }
         playerAccountProfile = null;
+        playerMustChangePassword = false;
         playerData.loaded = false;
       }
 
       async function restorePlayerSession() {
         try {
           const result = await requestPlayerApi('/api/player-auth/me');
-          applyPlayerAccount(result.player);
+          applyPlayerAccount(result.player, result.mustChangePassword);
           return true;
         } catch (err) {
-          if (!/HTTP 401/.test(err.message)) {
+          if (err.status === 401 || /HTTP 401/.test(err.message)) {
+            clearPlayerAccountProfile();
+            state.auth.loggedIn = false;
+            state.auth.role = 'guest';
+            saveRegistry();
+          } else {
             console.error('Could not restore player session:', err);
             playerAuthError = `Player session could not be restored: ${err.message}`;
           }
@@ -1464,9 +1476,11 @@
           const slots = Math.min(state.config.semiFinalSlots, standings.length);
           const top = standings.slice(0, slots).map(r => r.player);
           if (top.length >= 8) {
+            const teams = TournamentDraw.drawSemiFinalPartners(top.slice(0, 8))
+              .map(team => team.join(' & '));
             return [
-              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: `${top[0]} & ${top[7]}`, t2: `${top[3]} & ${top[4]}`, s1: null, s2: null, completed: false },
-              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: `${top[1]} & ${top[6]}`, t2: `${top[2]} & ${top[5]}`, s1: null, s2: null, completed: false }
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: teams[0], t2: teams[3], s1: null, s2: null, completed: false },
+              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: teams[1], t2: teams[2], s1: null, s2: null, completed: false }
             ];
           } else if (top.length >= 4) {
             return [
@@ -1644,6 +1658,11 @@
       // Renderers
       function render() {
         const app = document.getElementById('app');
+        if (state.auth.role === 'player' && playerMustChangePassword) {
+          app.innerHTML = renderRequiredPasswordChange();
+          bindRequiredPasswordChange();
+          return;
+        }
         if (state.ui.playerCheckInMode) {
           app.innerHTML = renderPlayerCheckInScreen();
           if (state.auth.role === 'player') bindReadOnlyPlayerCheckInEvents();
@@ -1669,6 +1688,256 @@
         } else {
           bindAppEvents();
         }
+      }
+
+      function renderRequiredPasswordChange() {
+        return `
+          <main class="min-h-screen flex items-center justify-center p-4">
+            <section class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 space-y-4">
+              <div>
+                <h1 class="text-lg font-bold">Choose a new password</h1>
+                <p class="mt-1 text-xs text-stone-500">Your administrator reset your password. Change the temporary password before continuing.</p>
+              </div>
+              <form id="required-password-change-form" class="space-y-3">
+                <label class="block text-xs font-semibold text-stone-500">Temporary password
+                  <input id="required-current-password" type="password" required autocomplete="current-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                </label>
+                <label class="block text-xs font-semibold text-stone-500">New password (12–128 characters)
+                  <input id="required-new-password" type="password" minlength="12" maxlength="128" required autocomplete="new-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                </label>
+                <label class="block text-xs font-semibold text-stone-500">Confirm new password
+                  <input id="required-confirm-password" type="password" minlength="12" maxlength="128" required autocomplete="new-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                </label>
+                <p id="required-password-error" role="alert" class="hidden text-xs text-red-600 dark:text-red-400"></p>
+                <div class="flex justify-between gap-2">
+                  <button id="required-password-logout" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Log out</button>
+                  <button type="submit" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Change password</button>
+                </div>
+              </form>
+            </section>
+          </main>
+        `;
+      }
+
+      function bindRequiredPasswordChange() {
+        bindPlayerPasswordChangeForm({
+          formId: 'required-password-change-form',
+          currentId: 'required-current-password',
+          newId: 'required-new-password',
+          confirmId: 'required-confirm-password',
+          errorId: 'required-password-error',
+          forced: true
+        });
+        document.getElementById('required-password-logout').addEventListener('click', async () => {
+          try {
+            await requestPlayerApi('/api/player-auth/logout', { method: 'POST' });
+          } catch (err) {
+            showToast(`Could not end the player session: ${err.message}`, 'error');
+          }
+          clearPlayerAccountProfile();
+          state.auth.loggedIn = false;
+          state.auth.role = 'guest';
+          saveRegistry();
+          render();
+        });
+      }
+
+      function openPlayerPasswordChangeModal() {
+        openModal(`
+          <form id="player-password-change-form" class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold">Change password</h3>
+              <p class="mt-1 text-xs text-stone-500">Use a password between 12 and 128 characters.</p>
+            </div>
+            <label class="block text-xs font-semibold text-stone-500">Current password
+              <input id="player-current-password" type="password" required autocomplete="current-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+            </label>
+            <label class="block text-xs font-semibold text-stone-500">New password
+              <input id="player-new-password" type="password" minlength="12" maxlength="128" required autocomplete="new-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+            </label>
+            <label class="block text-xs font-semibold text-stone-500">Confirm new password
+              <input id="player-confirm-password" type="password" minlength="12" maxlength="128" required autocomplete="new-password" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+            </label>
+            <p id="player-password-error" role="alert" class="hidden text-xs text-red-600 dark:text-red-400"></p>
+            <div class="flex justify-end gap-2">
+              <button id="player-password-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button type="submit" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Update password</button>
+            </div>
+          </form>
+        `);
+        document.getElementById('player-password-cancel').addEventListener('click', closeModal);
+        bindPlayerPasswordChangeForm({
+          formId: 'player-password-change-form',
+          currentId: 'player-current-password',
+          newId: 'player-new-password',
+          confirmId: 'player-confirm-password',
+          errorId: 'player-password-error',
+          forced: false
+        });
+      }
+
+      function bindPlayerPasswordChangeForm(fields) {
+        document.getElementById(fields.formId).addEventListener('submit', async event => {
+          event.preventDefault();
+          const currentPassword = document.getElementById(fields.currentId).value;
+          const newPassword = document.getElementById(fields.newId).value;
+          const error = document.getElementById(fields.errorId);
+          if (newPassword !== document.getElementById(fields.confirmId).value) {
+            error.textContent = 'Passwords do not match';
+            error.classList.remove('hidden');
+            return;
+          }
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          submit.disabled = true;
+          error.classList.add('hidden');
+          try {
+            await requestPlayerApi('/api/player-auth/me/password', {
+              method: 'PUT',
+              body: JSON.stringify({ currentPassword, newPassword })
+            });
+            playerMustChangePassword = false;
+            if (!fields.forced) closeModal();
+            render();
+            showToast('Password changed successfully', 'success');
+          } catch (err) {
+            error.textContent = err.message;
+            error.classList.remove('hidden');
+            submit.disabled = false;
+          }
+        });
+      }
+
+      async function requestAdminApi(path, options) {
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) throw new Error('Configure the backend API URL before managing player accounts');
+        const response = await fetch(`${apiUrl}${path}`, {
+          credentials: 'same-origin',
+          ...options,
+          headers: { ...getSyncHeaders(), ...(options?.headers || {}) }
+        });
+        let result;
+        try {
+          result = await response.json();
+        } catch (_err) {
+          throw new Error(`Unexpected response from player account API (HTTP ${response.status})`);
+        }
+        if (!response.ok) throw new Error(result.error || `Player account API request failed (HTTP ${response.status})`);
+        return result;
+      }
+
+      function confirmPlayerAccountDeletion() {
+        openModal(`
+          <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold text-red-600 dark:text-red-400">Delete your login account?</h3>
+              <p class="mt-2 text-xs text-stone-500">This removes your ability to sign in. Your player profile, email, tournament rosters, scores, and history will remain.</p>
+            </div>
+            <div class="flex justify-end gap-2">
+              <button id="player-delete-account-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="player-delete-account-confirm" type="button" class="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-bold">Delete my login</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('player-delete-account-cancel').addEventListener('click', closeModal);
+        document.getElementById('player-delete-account-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            await requestPlayerApi('/api/player-auth/me', { method: 'DELETE' });
+            closeModal();
+            clearPlayerAccountProfile();
+            state.auth.loggedIn = false;
+            state.auth.role = 'guest';
+            saveRegistry();
+            render();
+            showToast('Your login was deleted; your player history was kept', 'success');
+          } catch (err) {
+            button.disabled = false;
+            showToast(`Could not delete your login: ${err.message}`, 'error');
+          }
+        });
+      }
+
+      function resetPlayerPassword(playerName) {
+        openModal(`
+          <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold">Reset ${esc(playerName)}'s password?</h3>
+              <p class="mt-2 text-xs text-stone-500">Existing player sessions will end. A one-time temporary password will be shown once and must be changed after sign-in.</p>
+            </div>
+            <div class="flex justify-end gap-2">
+              <button id="admin-reset-password-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="admin-reset-password-confirm" type="button" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Reset password</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('admin-reset-password-cancel').addEventListener('click', closeModal);
+        document.getElementById('admin-reset-password-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            const result = await requestAdminApi(
+              `/api/player-accounts/${encodeURIComponent(playerName)}/reset-password`,
+              { method: 'POST' }
+            );
+            openModal(`
+              <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-emerald-500/30 p-6 space-y-4">
+                <div>
+                  <h3 class="text-base font-bold">Temporary password for ${esc(result.playerName)}</h3>
+                  <p class="mt-1 text-xs text-stone-500">Share this privately. It is shown only once and the player must change it when they sign in.</p>
+                </div>
+                <input id="admin-temporary-password" type="text" readonly value="${esc(result.temporaryPassword)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-mono text-sm" />
+                <div class="flex justify-end gap-2">
+                  <button id="admin-copy-temporary-password" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Copy password</button>
+                  <button id="admin-temporary-password-done" type="button" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Done</button>
+                </div>
+              </div>
+            `);
+            document.getElementById('admin-copy-temporary-password').addEventListener('click', async () => {
+              try {
+                await navigator.clipboard.writeText(result.temporaryPassword);
+                showToast('Temporary password copied', 'success');
+              } catch (_err) {
+                document.getElementById('admin-temporary-password').select();
+                showToast('Clipboard unavailable; select and copy the password', 'error');
+              }
+            });
+            document.getElementById('admin-temporary-password-done').addEventListener('click', closeModal);
+          } catch (err) {
+            closeModal();
+            showToast(`Could not reset player password: ${err.message}`, 'error');
+          }
+        });
+      }
+
+      function confirmAdminDeletePlayerLogin(playerName) {
+        openModal(`
+          <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold text-red-600 dark:text-red-400">Delete ${esc(playerName)}'s login?</h3>
+              <p class="mt-2 text-xs text-stone-500">This removes the player's login and ends active sessions. Their player profile, rosters, scores, and tournament history will remain.</p>
+            </div>
+            <div class="flex justify-end gap-2">
+              <button id="admin-delete-account-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="admin-delete-account-confirm" type="button" class="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-bold">Delete login</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('admin-delete-account-cancel').addEventListener('click', closeModal);
+        document.getElementById('admin-delete-account-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try {
+            const result = await requestAdminApi(`/api/player-accounts/${encodeURIComponent(playerName)}`, {
+              method: 'DELETE'
+            });
+            closeModal();
+            showToast(result.message || `Deleted ${playerName}'s login`, 'success');
+          } catch (err) {
+            button.disabled = false;
+            showToast(`Could not delete player login: ${err.message}`, 'error');
+          }
+        });
       }
 
       function renderThemeSwitcher() {
@@ -2857,7 +3126,7 @@
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
               <div class="sm:col-span-2">
                 <label for="profile-player-name" class="block font-semibold text-stone-500 mb-1">Player name</label>
-                <input id="profile-player-name" type="text" maxlength="120" required value="${esc(current.name)}" ${editing ? 'readonly' : ''} class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                <input id="profile-player-name" type="text" maxlength="120" required value="${esc(current.name)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
               </div>
               <div class="sm:col-span-2">
                 <label for="profile-photo-url" class="block font-semibold text-stone-500 mb-1">Profile photo</label>
@@ -3151,10 +3420,12 @@
                           ${profileDetail('email', 'Email', profile.email)}
                         </div>
                       </div>
-                      <div class="flex gap-2">
+                      <div class="flex flex-wrap gap-2">
                         <button id="player-share-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Share Card</button>
                         ${state.auth.role === 'admin' ? `<button id="player-edit-profile-btn" data-player-edit-name="${esc(selected.name)}" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit Profile</button>` : ''}
+                        ${state.auth.role === 'admin' ? `<button id="player-reset-password-btn" data-player-account-name="${esc(profile.name || selected.name)}" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Reset Password</button><button id="player-delete-account-btn" data-player-account-name="${esc(profile.name || selected.name)}" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete Player Login</button>` : ''}
                         ${isOwnProfile ? '<button id="player-edit-own-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit My Profile</button>' : ''}
+                        ${isOwnProfile ? '<button id="player-change-password-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Change Password</button><button id="player-delete-own-account-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete My Account</button>' : ''}
                         ${isOwnProfile && ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold ${ownCheckIn?.checkedIn ? 'opacity-70 cursor-not-allowed' : 'hover:bg-emerald-500'}">${ownCheckIn?.checkedIn ? `Checked In${ownCheckIn.time ? ` · ${esc(ownCheckIn.time)}` : ''}` : 'Check In'}</button>` : ''}
                       </div>
                       ${isOwnProfile && !ownRosterPlayer ? '<p class="w-full text-xs text-stone-500">You are not on this tournament roster, so check-in is unavailable.</p>' : ''}
@@ -3672,7 +3943,7 @@
                 password: document.getElementById('player-login-password').value
               })
             });
-            applyPlayerAccount(result.player);
+            applyPlayerAccount(result.player, result.mustChangePassword);
             render();
             showToast('Signed in as Player', 'success');
           } catch (err) {
@@ -3759,7 +4030,8 @@
         const safeSelectors = [
           '[data-tab]', '[data-player-select]', '#open-bracket-btn', '#player-refresh-btn',
           '#player-directory-search', '#head-to-head-opponent', '#player-share-btn',
-          '#player-edit-own-profile-btn', '#player-self-checkin-btn', '[data-open-tournament]', '#tournament-history-refresh',
+          '#player-edit-own-profile-btn', '#player-change-password-btn', '#player-delete-own-account-btn',
+          '#player-self-checkin-btn', '[data-open-tournament]', '#tournament-history-refresh',
           '[data-setup-step-nav]'
         ].join(',');
         document.querySelectorAll('main input, main select, main textarea, main button').forEach(control => {
@@ -3836,6 +4108,8 @@
           renderOwnPlayerProfileEditor(playerAccountProfile);
           bindOwnPlayerProfileEditor();
         });
+        document.getElementById('player-change-password-btn')?.addEventListener('click', openPlayerPasswordChangeModal);
+        document.getElementById('player-delete-own-account-btn')?.addEventListener('click', confirmPlayerAccountDeletion);
         document.getElementById('player-self-checkin-btn')?.addEventListener('click', async event => {
           const button = event.currentTarget;
           const rosterEntry = getOwnPlayerRosterEntry();
@@ -3909,29 +4183,14 @@
 
       async function openPlayerInvitesModal() {
         await loadPlayerData();
-        const apiUrl = getSyncApiUrl();
         const playerNames = [...new Set([
           ...playerData.profiles.map(profile => profile.name),
           ...window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId).players.map(player => player.name)
         ])].sort((a, b) => a.localeCompare(b));
-        const adminRequest = async (path, options) => {
-          if (!apiUrl) throw new Error('Configure the backend API URL before managing player invitations');
-          const response = await fetch(`${apiUrl}${path}`, {
-            credentials: 'same-origin',
-            ...options,
-            headers: { ...getSyncHeaders(), ...(options?.headers || {}) }
-          });
-          let result;
-          try { result = await response.json(); } catch (_err) {
-            throw new Error(`Unexpected response from invite API (HTTP ${response.status})`);
-          }
-          if (!response.ok) throw new Error(result.error || `Invite API request failed (HTTP ${response.status})`);
-          return result;
-        };
         let inviteList = [];
         let listError = '';
         try {
-          inviteList = (await adminRequest('/api/player-invites')).invites || [];
+          inviteList = (await requestAdminApi('/api/player-invites')).invites || [];
         } catch (err) {
           listError = err.message;
         }
@@ -4032,7 +4291,7 @@
           submit.disabled = true;
           error.classList.add('hidden');
           try {
-            const result = await adminRequest('/api/player-invites', {
+            const result = await requestAdminApi('/api/player-invites', {
               method: 'POST',
               body: JSON.stringify(body)
             });
@@ -4070,7 +4329,7 @@
           button.addEventListener('click', async () => {
             button.disabled = true;
             try {
-              await adminRequest(`/api/player-invites/${encodeURIComponent(button.getAttribute('data-revoke-player-invite'))}/revoke`, { method: 'POST' });
+              await requestAdminApi(`/api/player-invites/${encodeURIComponent(button.getAttribute('data-revoke-player-invite'))}/revoke`, { method: 'POST' });
               closeModal();
               await openPlayerInvitesModal();
               showToast('Player invitation revoked', 'success');
@@ -5003,6 +5262,12 @@
             window.PlayerAnalytics.normalizeName(item.name) === window.PlayerAnalytics.normalizeName(selectedName)
           );
           renderPlayerProfileEditor(profile || { name: selectedName });
+        });
+        document.getElementById('player-reset-password-btn')?.addEventListener('click', event => {
+          resetPlayerPassword(event.currentTarget.getAttribute('data-player-account-name'));
+        });
+        document.getElementById('player-delete-account-btn')?.addEventListener('click', event => {
+          confirmAdminDeletePlayerLogin(event.currentTarget.getAttribute('data-player-account-name'));
         });
         document.getElementById('player-share-btn')?.addEventListener('click', () => {
           const shareUrl = new URL(window.location.href);

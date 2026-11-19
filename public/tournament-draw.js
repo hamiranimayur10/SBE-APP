@@ -49,13 +49,17 @@ const TournamentDraw = (() => {
     }
   }
 
-  function generateGroupPairings(players, matchesPerPlayer, random = Math.random) {
+  function validateGroupPlayers(players, matchesPerPlayer) {
     if (!Array.isArray(players)) throw new TypeError('Players must be a list');
     validateGroupMatchCount(players.length, matchesPerPlayer);
     const names = players.map(normalizePlayerName);
     if (names.some(name => !name) || new Set(names).size !== names.length) {
       throw new RangeError('Each player in the group must have a distinct name');
     }
+  }
+
+  function generateGroupPairings(players, matchesPerPlayer, random = Math.random) {
+    validateGroupPlayers(players, matchesPerPlayer);
     const shuffled = [...players];
     for (let index = shuffled.length - 1; index > 0; index--) {
       const swap = Math.floor(random() * (index + 1));
@@ -122,6 +126,19 @@ const TournamentDraw = (() => {
     return scheduled;
   }
 
+  function generateGroupSchedule(players, matchesPerPlayer, groupId, roundPrefix) {
+    const matches = generateGroupPairings(players, matchesPerPlayer).map((pair, index) => ({
+      id: `${roundPrefix}-${groupId}-${index + 1}`,
+      groupId,
+      p1: pair[0],
+      p2: pair[1],
+      s1: null,
+      s2: null,
+      completed: false
+    }));
+    return scheduleMatchesForCourts(matches, 2);
+  }
+
   function drawSemiFinalPartners(players, random = Math.random) {
     if (!Array.isArray(players) || players.length !== 8) {
       throw new RangeError('Semi-final partner draws require exactly eight players');
@@ -137,7 +154,7 @@ const TournamentDraw = (() => {
     return topFour.map((player, index) => [player, bottomFour[index]]);
   }
 
-  return { drawSemiFinalPartners, generateGroupPairings, groupRankedPlayers, scheduleMatchesForCourts, validateGroupMatchCount };
+  return { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, scheduleMatchesForCourts, validateGroupMatchCount, validateGroupPlayers };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = TournamentDraw;

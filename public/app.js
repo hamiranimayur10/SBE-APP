@@ -1354,66 +1354,18 @@
         if (rerender !== false) render();
       }
 
-      // Generate balanced schedule for a list of players with target matchesPerPlayer
-      function generateGroupSchedule(players, matchesPerPlayer, groupId, roundPrefix) {
-        const n = players.length;
-        const allPairs = [];
-        for (let i = 0; i < n; i++) {
-          for (let j = i + 1; j < n; j++) {
-            allPairs.push([players[i], players[j]]);
-          }
-        }
-        // Shuffle deterministically-ish for variety
-        for (let i = allPairs.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [allPairs[i], allPairs[j]] = [allPairs[j], allPairs[i]];
-        }
-
-        const targetTotal = Math.min(allPairs.length, Math.floor((n * matchesPerPlayer) / 2));
-        const counts = Object.fromEntries(players.map(p => [p, 0]));
-        const selected = [];
-
-        // Greedy selection balancing match counts per player
-        const remaining = [...allPairs];
-        while (selected.length < targetTotal && remaining.length > 0) {
-          remaining.sort((a, b) => (counts[a[0]] + counts[a[1]]) - (counts[b[0]] + counts[b[1]]));
-          const pair = remaining.shift();
-          selected.push(pair);
-          counts[pair[0]]++;
-          counts[pair[1]]++;
-        }
-
-        return scheduleGroupPairs(selected, groupId, roundPrefix);
-      }
-
-      function scheduleGroupPairs(pairs, groupId, roundPrefix) {
-        const matches = pairs.map((pair, idx) => ({
-          id: `${roundPrefix}-${groupId}-${idx + 1}`,
-          groupId,
-          p1: pair[0],
-          p2: pair[1],
-          s1: null,
-          s2: null,
-          completed: false
-        }));
-        return TournamentDraw.scheduleMatchesForCourts(matches, 2);
-      }
-
       function buildQR2Schedules(pools) {
         const schedules = {};
+        const duplicate = getDuplicateGroupPlayer(pools);
+        if (duplicate !== null) {
+          showToast(`Round 2: each player must appear in only one group (${duplicate})`, 'error');
+          return null;
+        }
         for (const [key, players] of Object.entries(pools)) {
-          if (players.length < 2 && state.config.qr2MatchesPerPlayer === undefined) {
-            schedules[key] = [];
-            continue;
-          }
           try {
-            schedules[key] = state.config.qr2MatchesPerPlayer === undefined
-              ? generateGroupSchedule(players, state.config.matchesPerPlayer, `Pool${key}`, `QR2${key}`)
-              : scheduleGroupPairs(
-                TournamentDraw.generateGroupPairings(players, state.config.qr2MatchesPerPlayer),
-                `Pool${key}`,
-                `QR2${key}`
-              );
+            schedules[key] = TournamentDraw.generateGroupSchedule(
+              players, state.config.qr2MatchesPerPlayer ?? state.config.matchesPerPlayer, `Pool${key}`, `QR2${key}`
+            );
           } catch (err) {
             if (!(err instanceof RangeError)) throw err;
             showToast(`Round 2 Group ${key}: ${err.message}`, 'error');
@@ -1423,8 +1375,34 @@
         return schedules;
       }
 
+      function getDuplicateGroupPlayer(groups) {
+        const seen = new Set();
+        for (const players of Object.values(groups)) {
+          for (const player of players) {
+            const name = normalizeImportName(player);
+            if (!name || seen.has(name)) return player;
+            seen.add(name);
+          }
+        }
+        return null;
+      }
+
+      function getRound1SetupError() {
+        for (const group of state.groups) {
+          if (group.players.length < 3) continue;
+          try {
+            TournamentDraw.validateGroupPlayers(group.players, state.config.matchesPerPlayer);
+          } catch (err) {
+            if (!(err instanceof RangeError)) throw err;
+            return `Round 1 ${group.name} (${group.players.length} players): ${err.message}.`;
+          }
+        }
+        const duplicate = getDuplicateGroupPlayer(Object.fromEntries(state.groups.map(group => [group.id, group.players])));
+        if (duplicate !== null) return `Round 1: each player must appear in only one group (${duplicate}).`;
+        return '';
+      }
+
       function getRound2SetupError() {
-        if (state.config.qr2MatchesPerPlayer === undefined) return '';
         const total = state.groups.reduce((sum, group) => sum + group.players.length, 0);
         const keys = getConfiguredPoolKeys();
         const baseSize = Math.floor(total / keys.length);
@@ -1432,7 +1410,7 @@
         for (let index = 0; index < keys.length; index++) {
           const size = baseSize + (index < total % keys.length ? 1 : 0);
           try {
-            TournamentDraw.validateGroupMatchCount(size, state.config.qr2MatchesPerPlayer);
+            TournamentDraw.validateGroupMatchCount(size, state.config.qr2MatchesPerPlayer ?? state.config.matchesPerPlayer);
           } catch (err) {
             if (!(err instanceof RangeError)) throw err;
             return `Round 2 Group ${keys[index]} (${size} players): ${err.message}.`;
@@ -1608,6 +1586,11 @@
 
       function startTournament() {
         if (state.auth.role !== 'admin') return;
+        const round1Error = getRound1SetupError();
+        if (round1Error) {
+          showToast(round1Error, 'error');
+          return;
+        }
         const round2Error = getRound2SetupError();
         if (round2Error) {
           showToast(round2Error, 'error');
@@ -1625,7 +1608,7 @@
         }
         const qr1 = [];
         state.groups.forEach(g => {
-          const sched = generateGroupSchedule(g.players, state.config.matchesPerPlayer, g.id, 'QR1');
+          const sched = TournamentDraw.generateGroupSchedule(g.players, state.config.matchesPerPlayer, g.id, 'QR1');
           qr1.push(...sched);
         });
         state.qr1Matches = qr1;
@@ -1673,6 +1656,11 @@
 
       function addQR2Pool(poolKey, playerNames, sourcePools) {
         const pools = { ...(sourcePools || {}), [poolKey]: playerNames };
+        const duplicate = getDuplicateGroupPlayer({ ...state.qr2Pools, ...pools });
+        if (duplicate !== null) {
+          showToast(`Round 2: each player must appear in only one group (${duplicate})`, 'error');
+          return false;
+        }
         const schedules = buildQR2Schedules(pools);
         if (!schedules) return false;
         Object.assign(state.qr2Pools, pools);
@@ -2800,8 +2788,10 @@
         const round2GroupRemainder = totalPlayers % round2GroupKeys.length;
         const maxRound2GroupCount = Math.min(6, Math.floor(totalPlayers / 8));
         const invalidGroup = state.groups.find(g => g.players.length < 3 || !g.leader || !g.players.includes(g.leader));
+        const round1Error = getRound1SetupError();
         const round2Error = getRound2SetupError();
-        const setupReady = state.groups.length >= 2 && !invalidGroup && !round2Error;
+        const scheduleError = round1Error || round2Error;
+        const setupReady = state.groups.length >= 2 && !invalidGroup && !scheduleError;
 
         return `
           <div class="space-y-6">
@@ -2871,8 +2861,8 @@
                     <input id="cfg-players-per-group" type="number" min="3" max="12" value="${c.playersPerGroup}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 1 Matches / Player</label>
-                    <input data-cfg-num="matchesPerPlayer" type="number" min="1" max="9" value="${c.matchesPerPlayer}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <label for="cfg-qr1-matches" class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 1 Matches / Player</label>
+                    <input id="cfg-qr1-matches" type="number" min="1" max="9" step="1" value="${esc(c.matchesPerPlayer)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Points to Win</label>
@@ -2902,7 +2892,8 @@
                     </div>
                   `).join('')}
                 </div>
-                <p class="text-xs text-stone-500">Each player faces different opponents in their Round 2 group. The count must be less than the group size; odd-sized groups require an even count. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 target until this setting is changed.' : ''}</p>
+                <p class="text-xs text-stone-500">In each qualifying round, every player faces the selected number of different opponents in their group. The count must be less than the group size; odd-sized groups require an even count. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 count for Round 2 until this setting is changed.' : ''}</p>
+                ${round1Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round1Error)}</p>` : ''}
                 ${round2Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round2Error)}</p>` : ''}
                 <p class="text-xs ${totalPlayers < round2GroupKeys.length * 8 ? 'text-amber-600 dark:text-amber-400' : 'text-stone-500'}">${totalPlayers < round2GroupKeys.length * 8 ? 'Each Round 2 group needs at least 8 players so its top 8 can advance to semi-finals.' : "All Round 1 players are ranked by Win Points and tie-breakers, then assigned in consecutive rank blocks; the top 8 from each Round 2 group advance to that group's semi-finals."}</p>
               </section>
@@ -3037,10 +3028,10 @@
                 </article>
                 <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2">
                   <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Format &amp; scoring</h3>
-                  <p class="text-xs">${state.groups.length} groups · ${totalPlayers} players · Round 1 target: ${c.matchesPerPlayer} matches per player</p>
+                  <p class="text-xs">${state.groups.length} groups · ${totalPlayers} players · Round 1: ${esc(c.matchesPerPlayer)} matches per player</p>
                   <p class="text-xs">Games to ${c.pointsToWin}, win by two until ${c.deuceCap}</p>
                   <p class="text-xs">${round2GroupKeys.length} Round 2 groups · all players seeded by global WP rank</p>
-                  <p class="text-xs">Round 2 ${c.qr2MatchesPerPlayer === undefined ? 'target' : 'matches'} per player: ${esc(c.qr2MatchesPerPlayer ?? c.matchesPerPlayer)}</p>
+                  <p class="text-xs">Round 2 matches per player: ${esc(c.qr2MatchesPerPlayer ?? c.matchesPerPlayer)}</p>
                   <p class="text-xs">Top 8 from each Round 2 group advance to its semi-finals</p>
                   <p class="text-xs">${round2GroupKeys.map(key => `Group ${key}: ${getPoolFinalFormat(key) === 'bo3' ? '3 sets' : '1 set'}`).join(' · ')}</p>
                 </article>
@@ -3067,8 +3058,8 @@
                 <p class="rounded-lg bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">Your roster is ready to generate a schedule.</p>
               ` : `
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-3 py-2">
-                  <p class="text-xs text-amber-700 dark:text-amber-400">${round2Error ? esc(round2Error) : invalidGroup ? `${esc(invalidGroup.name)} needs at least 3 players and a group leader.` : 'Add at least two groups before starting.'}</p>
-                  <button type="button" data-setup-step-nav="${round2Error ? 2 : 3}" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">${round2Error ? 'Review format &amp; scoring' : 'Review players &amp; groups'}</button>
+                  <p class="text-xs text-amber-700 dark:text-amber-400">${scheduleError ? esc(scheduleError) : invalidGroup ? `${esc(invalidGroup.name)} needs at least 3 players and a group leader.` : 'Add at least two groups before starting.'}</p>
+                  <button type="button" data-setup-step-nav="${scheduleError ? 2 : 3}" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">${scheduleError ? 'Review format &amp; scoring' : 'Review players &amp; groups'}</button>
                 </div>
               `}
             </section>
@@ -3659,8 +3650,8 @@
               <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
                 <h2 class="font-bold text-sm">Tournament progression</h2>
                 <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
-                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; target ${config.matchesPerPlayer} matches per player.</li>
-                  <li><b>Qualifier 2:</b> all players are ranked by WP and tie-breakers, then assigned to ${poolKeys.length} groups in consecutive rank blocks; ${config.qr2MatchesPerPlayer === undefined ? 'target' : 'scheduled'} ${esc(config.qr2MatchesPerPlayer ?? config.matchesPerPlayer)} matches per player.</li>
+                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; ${esc(config.matchesPerPlayer)} matches per player when newly scheduled.</li>
+                  <li><b>Qualifier 2:</b> all players are ranked by WP and tie-breakers, then assigned to ${poolKeys.length} groups in consecutive rank blocks; ${esc(config.qr2MatchesPerPlayer ?? config.matchesPerPlayer)} matches per player when newly scheduled.</li>
                   <li><b>Semi-finals:</b> the top 8 players from each Round 2 group advance to that group's semi-finals.</li>
                   <li><b>Finals:</b> ${poolKeys.map(key => `Group ${key} ${getPoolFinalFormat(key) === 'bo3' ? 'best of three' : 'single game'}`).join('; ')}.</li>
                 </ul>
@@ -6034,14 +6025,14 @@
         });
 
         // Setup bindings
-        document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5, false));
+        document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5));
         document.getElementById('cfg-total-players')?.addEventListener('change', (e) => {
-          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 3, false);
+          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 3);
         });
         document.getElementById('cfg-players-per-group')?.addEventListener('change', (e) => {
           const ppg = Math.max(3, Math.min(12, parseInt(e.target.value, 10) || 6));
           state.config.playersPerGroup = ppg;
-          resizeTotalPlayers(ppg * state.groups.length, false);
+          resizeTotalPlayers(ppg * state.groups.length);
         });
         document.querySelectorAll('[data-rk-num]').forEach(el => {
           el.addEventListener('change', () => {
@@ -6113,17 +6104,22 @@
             if (field === 'qr2PoolsCount') render();
           });
         });
-        document.getElementById('cfg-qr2-matches')?.addEventListener('change', event => {
-          const input = event.currentTarget;
-          const count = input.valueAsNumber;
-          if (!Number.isInteger(count) || count < 1 || count > 79) {
-            showToast('Round 2 matches per player must be a whole number between 1 and 79', 'error');
-            input.value = state.config.qr2MatchesPerPlayer ?? state.config.matchesPerPlayer;
-            return;
-          }
-          state.config.qr2MatchesPerPlayer = count;
-          saveState();
-          render();
+        [
+          { id: 'cfg-qr1-matches', field: 'matchesPerPlayer', label: 'Round 1', max: 9 },
+          { id: 'cfg-qr2-matches', field: 'qr2MatchesPerPlayer', label: 'Round 2', max: 79 }
+        ].forEach(({ id, field, label, max }) => {
+          document.getElementById(id)?.addEventListener('change', event => {
+            const input = event.currentTarget;
+            const count = input.valueAsNumber;
+            if (!Number.isInteger(count) || count < 1 || count > max) {
+              showToast(`${label} matches per player must be a whole number between 1 and ${max}`, 'error');
+              input.value = state.config[field] ?? state.config.matchesPerPlayer;
+              return;
+            }
+            state.config[field] = count;
+            saveState();
+            render();
+          });
         });
         document.querySelectorAll('[data-pool-final-format]').forEach(el => {
           el.addEventListener('change', () => {
@@ -6252,6 +6248,11 @@
           btn.addEventListener('click', () => {
             const k = btn.getAttribute('data-regen-pool');
             const players = state.qr2Pools[k] || [];
+            const duplicate = getDuplicateGroupPlayer(state.qr2Pools);
+            if (duplicate !== null) {
+              showToast(`Round 2: each player must appear in only one group (${duplicate})`, 'error');
+              return;
+            }
             const schedules = buildQR2Schedules({ [k]: players });
             if (!schedules) return;
             state.qr2Matches[k] = schedules[k];

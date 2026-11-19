@@ -2,7 +2,31 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { drawSemiFinalPartners, generateGroupPairings, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
+const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
+
+test('generated qualifying schedules give every player exactly the requested matches', () => {
+  for (const size of [5, 6, 9, 10]) {
+    const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const schedule = generateGroupSchedule(players, 2, 'A', 'QR1');
+      const counts = Object.fromEntries(players.map(player => [player, 0]));
+      const rounds = new Map();
+      for (const match of schedule) {
+        counts[match.p1]++;
+        counts[match.p2]++;
+        const participants = rounds.get(match.round) || [];
+        participants.push(match.p1, match.p2);
+        rounds.set(match.round, participants);
+      }
+      assert.deepEqual(Object.values(counts), players.map(() => 2));
+      for (const participants of rounds.values()) {
+        assert.ok(participants.length <= 4);
+        assert.equal(new Set(participants).size, participants.length);
+      }
+    }
+  }
+  assert.throws(() => generateGroupSchedule(['A', 'B', 'C'], 1, 'A', 'QR1'), /odd-sized group/);
+});
 
 test('creates the requested number of distinct opponents for every player', () => {
   for (let size = 2; size <= 30; size++) {

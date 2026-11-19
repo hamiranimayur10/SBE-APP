@@ -1062,12 +1062,17 @@
         if (!apiUrl) return;
         try {
           const tid = encodeURIComponent(state.tournamentId || 'default');
-          await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
+          const response = await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getSyncHeaders(),
             body: JSON.stringify({ playerName, groupName, skill, checkedIn, time, source, walkIn })
           });
-        } catch (e) {}
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `Check-in sync failed (HTTP ${response.status})`);
+        } catch (err) {
+          console.error('Check-in saved locally but server sync failed:', err);
+          showToast(`Check-in saved locally, but server sync failed: ${err.message}`, 'error');
+        }
       }
 
       function switchTournament(id) {
@@ -1809,6 +1814,7 @@
       }
 
       function markPlayerCheckedIn(name, source, walkIn, checkedInAt) {
+        if (state.auth.role !== 'admin' && state.auth.role !== 'player') return;
         if (!state.checkIns) state.checkIns = {};
         const time = checkedInAt || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         state.checkIns[name] = { checkedIn: true, time, source: source || 'qr' };
@@ -1838,8 +1844,8 @@
         }
         if (state.ui.playerCheckInMode) {
           app.innerHTML = renderPlayerCheckInScreen();
-          if (state.auth.role === 'player') bindReadOnlyPlayerCheckInEvents();
-          else bindPlayerCheckInEvents();
+          if (state.auth.role === 'admin') bindPlayerCheckInEvents();
+          else bindReadOnlyPlayerCheckInEvents();
           return;
         }
         if (!state.auth.loggedIn) {
@@ -3754,7 +3760,9 @@
         );
         const partnerships = selected ? analytics.getPartnerships(selected.name) : [];
         const isOwnProfile = state.auth.role === 'player' && playerAccountProfile && samePlayerIdentity(profile, playerAccountProfile);
-        const ownRosterPlayer = isOwnProfile ? getOwnPlayerRosterEntry() : null;
+        const ownCheckInClosed = state.phase === 'completed';
+        const ownRosterParticipant = isOwnProfile ? getOwnPlayerRosterEntry() : null;
+        const ownRosterPlayer = ownCheckInClosed ? null : ownRosterParticipant;
         const ownCheckIn = ownRosterPlayer ? state.checkIns?.[ownRosterPlayer.name] : null;
         const publicName = profile.displayName || selected?.name || '';
         const profileDetail = (field, label, value) => {
@@ -3844,7 +3852,8 @@
                         ${isOwnProfile ? '<button id="player-change-password-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Change Password</button><button id="player-delete-own-account-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete My Account</button>' : ''}
                         ${isOwnProfile && ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold ${ownCheckIn?.checkedIn ? 'opacity-70 cursor-not-allowed' : 'hover:bg-emerald-500'}">${ownCheckIn?.checkedIn ? `Checked In${ownCheckIn.time ? ` · ${esc(ownCheckIn.time)}` : ''}` : 'Check In'}</button>` : ''}
                       </div>
-                      ${isOwnProfile && !ownRosterPlayer ? '<p class="w-full text-xs text-stone-500">You are not on this tournament roster, so check-in is unavailable.</p>' : ''}
+                      ${isOwnProfile && !ownRosterParticipant && !ownCheckInClosed ? '<p class="w-full text-xs text-stone-500">You are not on this tournament roster, so check-in is unavailable.</p>' : ''}
+                      ${isOwnProfile && ownRosterParticipant && ownCheckInClosed ? '<p class="w-full text-xs text-stone-500">Check-in is closed for this completed tournament.</p>' : ''}
                     </article>
 
                     <section class="grid grid-cols-2 xl:grid-cols-4 gap-3">
@@ -3992,9 +4001,12 @@
       }
 
       function renderPlayerCheckInScreen() {
-        if (state.auth.role === 'player') {
+        if (state.auth.role !== 'admin') {
           const players = getAllImportedPlayers();
           const checkedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
+          const message = state.auth.role === 'player'
+            ? 'Use My Player Card to check in yourself if you are on this tournament roster.'
+            : 'Guest access is view-only. A player must sign in to check in themselves.';
           return `
             <div class="min-h-screen flex flex-col items-center justify-center p-4">
               <div class="absolute top-4 right-4">${renderThemeSwitcher()}</div>
@@ -4002,7 +4014,7 @@
                 <div class="flex items-center justify-between gap-2">
                   <div>
                     <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
-                    <p class="text-xs text-stone-500">Check-in is view-only for player accounts.</p>
+                    <p class="text-xs text-stone-500">${message}</p>
                   </div>
                   <button id="exit-player-checkin-btn" class="px-2.5 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Back</button>
                 </div>
@@ -4560,6 +4572,12 @@
             showToast('You are checked in', 'success');
           } catch (err) {
             button.disabled = false;
+            if (err.status === 409 && /already checked in/i.test(err.message)) {
+              markPlayerCheckedIn(rosterEntry.name, 'player');
+              render();
+              showToast('You are already checked in', 'success');
+              return;
+            }
             showToast(`Could not check in: ${err.message}`, 'error');
           }
         });

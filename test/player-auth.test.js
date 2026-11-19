@@ -379,6 +379,20 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(tournamentWrite.response.status, 403);
 
+    const guestCheckIn = await api('/api/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ playerName: 'Roster Bob' })
+    });
+    assert.equal(guestCheckIn.response.status, 401);
+
+    const adminCheckIn = await api('/api/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ playerName: 'Roster Bob' })
+    });
+    assert.equal(adminCheckIn.response.status, 200);
+
     const checkinWrite = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: changedPasswordCookie },
@@ -418,6 +432,28 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const savedCheckIn = await api('/api/tournaments/auth-test');
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].checkedIn, true);
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].source, 'player');
+
+    const duplicateSelfCheckIn = await api('/api/player-auth/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: aliceCookie },
+      body: JSON.stringify({ playerName: 'Roster Alice' })
+    });
+    assert.equal(duplicateSelfCheckIn.response.status, 409);
+
+    const completedTournamentState = await api('/api/tournaments/auth-test');
+    completedTournamentState.body.data.phase = 'completed';
+    const saveCompletedTournament = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify(completedTournamentState.body.data)
+    });
+    assert.equal(saveCompletedTournament.response.status, 200);
+    const completedTournamentCheckIn = await api('/api/player-auth/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: aliceCookie },
+      body: JSON.stringify({ playerName: 'Roster Alice' })
+    });
+    assert.equal(completedTournamentCheckIn.response.status, 403);
 
     const adminInviteWrite = await api('/api/player-invites', {
       method: 'POST',

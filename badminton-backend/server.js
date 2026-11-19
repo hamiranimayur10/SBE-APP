@@ -1830,7 +1830,7 @@ async function persistTournamentCheckIn(tournamentId, playerName, groupName, ski
 }
 
 // Check in a player for a specific tournament
-app.post('/api/tournaments/:id/checkin', denyPlayerWrite, async (req, res) => {
+app.post('/api/tournaments/:id/checkin', denyPlayerWrite, requireAdminKey, async (req, res) => {
   try {
     const { playerName, groupName, skill, checkedIn, time, source, walkIn } = req.body || {};
     if (!playerName) return res.status(400).json({ error: 'playerName is required' });
@@ -1867,6 +1867,9 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
     if (!tournamentResult.rows.length) return res.status(404).json({ error: 'Tournament not found' });
 
     const tournament = JSON.parse(tournamentResult.rows[0].data);
+    if (tournament.phase === 'completed') {
+      return res.status(403).json({ error: 'Check-in is closed for this completed tournament' });
+    }
     const profileId = String(profile.player_id || '').toLowerCase();
     const profileNames = new Set([
       profile.player_name,
@@ -1892,6 +1895,13 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
     const { playerName, groupName } = uniqueEntries[0];
     if (body.playerName && normalizeImportName(body.playerName) !== normalizeImportName(playerName)) {
       return res.status(403).json({ error: 'Player accounts can only check in their own roster entry' });
+    }
+    const existingCheckIn = await getDb().execute({
+      sql: 'SELECT checked_in FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+      args: [req.params.id, playerName]
+    });
+    if (tournament.checkIns?.[playerName]?.checkedIn || Number(existingCheckIn.rows[0]?.checked_in) === 1) {
+      return res.status(409).json({ error: 'You are already checked in' });
     }
     const skill = Math.max(1, Math.min(10, Math.round(Number(tournament.playerSkills?.[playerName]) || 5)));
     const result = await persistTournamentCheckIn(

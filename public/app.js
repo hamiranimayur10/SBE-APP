@@ -257,8 +257,6 @@
             matchesPerPlayer: 4,
             pointsToWin: 21,
             deuceCap: 25,
-            advanceTopN: 3,
-            semiFinalSlots: 8,
             qr2PoolsCount: 2,
             poolAFinalFormat: 'bo3', // bo3 | single
             poolBFinalFormat: 'single',
@@ -955,6 +953,7 @@
             const keepUi = state.ui;
             const keepSync = state.sync;
             state = normalizeTournamentState({ ...json.data, tournamentId: state.tournamentId, auth: keepAuth, ui: keepUi, sync: { ...keepSync, status: 'synced', lastSynced: json.updatedAt || new Date().toISOString() } }, state.tournamentId);
+            upsertPlayerDataTournament(state.tournamentId, state, json.updatedAt);
             saveRegistry();
             render();
             if (!silent) showToast('Loaded tournament from Turso DB', 'success');
@@ -967,6 +966,85 @@
           state.sync.status = 'error';
           console.error('Could not pull tournament from backend:', err);
           if (!silent) showToast(`Could not load from backend (${err.message})`, 'error');
+        }
+      }
+
+      let liveScoreRefreshInProgress = false;
+      let liveScoreRefreshErrorLogged = false;
+      function isEditingFormField() {
+        return Boolean(document.activeElement && /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName));
+      }
+
+      function hasUnsavedScoreEntry() {
+        const scoreIsChanged = input => {
+          const [listKey, id, side] = input.getAttribute('data-score-input').split(':');
+          let matches = [];
+          if (listKey === 'qr1') matches = state.qr1Matches;
+          else if (listKey.startsWith('qr2_')) matches = state.qr2Matches[listKey.slice(4)] || [];
+          else if (listKey.startsWith('semi_')) matches = state.semis[listKey.slice(5)] || [];
+          const match = matches.find(item => item.id === id);
+          const expected = match?.[`s${side}`];
+          return input.value !== (expected === null || expected === undefined ? '' : String(expected));
+        };
+        const finalIsChanged = input => {
+          const [groupKey, gameIndex, side] = input.getAttribute('data-final-input').split(':');
+          const expected = state.finals[groupKey]?.games?.[Number(gameIndex)]?.[`s${side}`];
+          return input.value !== (expected === null || expected === undefined ? '' : String(expected));
+        };
+        return [...document.querySelectorAll('[data-score-input]')].some(scoreIsChanged) ||
+          [...document.querySelectorAll('[data-final-input]')].some(finalIsChanged);
+      }
+
+      async function refreshLiveScores() {
+        if (liveScoreRefreshInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
+          state.sync?.status !== 'synced' || !state.sync.lastSynced) return;
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
+
+        liveScoreRefreshInProgress = true;
+        try {
+          const tournamentId = String(state.tournamentId || 'default');
+          const since = state.sync.lastSynced || '';
+          const query = since ? `?since=${encodeURIComponent(since)}` : '';
+          const response = await fetch(
+            `${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}${query}`,
+            { cache: 'no-store' }
+          );
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `Tournament refresh failed (HTTP ${response.status})`);
+          liveScoreRefreshErrorLogged = false;
+          const badge = document.getElementById('sync-status-pill');
+          if (badge) badge.textContent = 'Cloud Synced';
+          if (!result.exists || result.unchanged || !result.data || (since && result.updatedAt === since)) return;
+
+          const keepAuth = state.auth;
+          const keepUi = state.ui;
+          const keepSync = state.sync;
+          state = normalizeTournamentState({
+            ...result.data,
+            tournamentId,
+            auth: keepAuth,
+            ui: keepUi,
+            sync: {
+              ...keepSync,
+              status: 'synced',
+              lastSynced: result.updatedAt || new Date().toISOString()
+            }
+          }, tournamentId);
+          registry.items[tournamentId] = state;
+          upsertPlayerDataTournament(tournamentId, state, result.updatedAt);
+          tournamentCatalog.loaded = false;
+          saveRegistry();
+          render();
+        } catch (err) {
+          if (!liveScoreRefreshErrorLogged) {
+            console.error('Live score refresh failed:', err);
+            const badge = document.getElementById('sync-status-pill');
+            if (badge) badge.textContent = 'Live Update Error';
+            liveScoreRefreshErrorLogged = true;
+          }
+        } finally {
+          liveScoreRefreshInProgress = false;
         }
       }
 
@@ -1114,6 +1192,23 @@
           clearTimeout(syncTimer);
           syncTimer = setTimeout(() => { pushToTurso(true); }, 600);
         }
+      }
+
+      function upsertPlayerDataTournament(id, data, updatedAt) {
+        if (!playerData.loaded) return;
+        const key = String(id);
+        const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
+        const current = tournaments.get(key) || {};
+        tournaments.set(key, {
+          ...current,
+          id: key,
+          name: data.config?.name || current.name || 'Tournament',
+          date: data.config?.date || current.date || '',
+          phase: data.phase || current.phase || 'setup',
+          data,
+          updatedAt: updatedAt || current.updatedAt || ''
+        });
+        playerData.tournaments = [...tournaments.values()];
       }
 
       function loadTheme() {
@@ -1267,7 +1362,7 @@
           counts[pair[1]]++;
         }
 
-        return selected.map((pair, idx) => ({
+        const matches = selected.map((pair, idx) => ({
           id: `${roundPrefix}-${groupId}-${idx + 1}`,
           groupId,
           p1: pair[0],
@@ -1276,6 +1371,7 @@
           s2: null,
           completed: false
         }));
+        return TournamentDraw.scheduleMatchesForCourts(matches, 2);
       }
 
       function isValidSingleScore(s1, s2, pointsToWin, deuceCap) {
@@ -1478,26 +1574,16 @@
           return;
         }
         const poolKeys = getConfiguredPoolKeys();
-        const pools = {};
-        poolKeys.forEach(k => { pools[k] = []; });
-
-        state.groups.forEach(g => {
-          const gMatches = state.qr1Matches.filter(m => m.groupId === g.id);
-          const standings = computeStandings(g.players, gMatches);
-          const topN = Math.min(state.config.advanceTopN, standings.length);
-          standings.slice(0, topN).forEach(r => pools.A.push(r.player));
-          const rest = standings.slice(topN).map(r => r.player);
-          const otherKeys = poolKeys.slice(1);
-          if (otherKeys.length === 1) {
-            pools[otherKeys[0]].push(...rest);
-          } else if (otherKeys.length > 1) {
-            const perTier = Math.max(1, Math.ceil(rest.length / otherKeys.length));
-            rest.forEach((p, idx) => {
-              const targetIdx = Math.min(otherKeys.length - 1, Math.floor(idx / perTier));
-              pools[otherKeys[targetIdx]].push(p);
-            });
-          }
-        });
+        const allPlayers = state.groups.flatMap(group => group.players);
+        const rankings = computeStandings(allPlayers, state.qr1Matches);
+        if (rankings.length < poolKeys.length * 8) {
+          showToast('Each Round 2 group needs at least 8 players for its semi-final bracket', 'error');
+          return;
+        }
+        const pools = TournamentDraw.groupRankedPlayers(
+          rankings.map(row => row.player),
+          poolKeys.length
+        );
 
         const matches = {};
         poolKeys.forEach(k => {
@@ -1529,7 +1615,15 @@
       }
 
       function advanceToSemis() {
-        const poolKeys = getActiveQR2PoolKeys().filter(k => (state.qr2Pools[k] || []).length >= 2);
+        const poolKeys = getActiveQR2PoolKeys().filter(k => (state.qr2Pools[k] || []).length > 0);
+        if (!poolKeys.length) {
+          showToast('Create Round 2 groups before advancing', 'error');
+          return;
+        }
+        if (poolKeys.some(key => (state.qr2Pools[key] || []).length < 8)) {
+          showToast('Each Round 2 group needs at least 8 players to advance its top 8 to semi-finals', 'error');
+          return;
+        }
         const allDone = poolKeys.every(k => (state.qr2Matches[k] || []).every(m => m.completed));
         if (!allDone) {
           showToast('Complete all QR2 matches across all pools first', 'error');
@@ -1537,23 +1631,23 @@
         }
         const buildPoolSemis = (poolKey) => {
           const standings = computeStandings(state.qr2Pools[poolKey] || [], state.qr2Matches[poolKey] || []);
-          const slots = Math.min(state.config.semiFinalSlots, standings.length);
+          const slots = Math.min(8, standings.length);
           const top = standings.slice(0, slots).map(r => r.player);
           if (top.length >= 8) {
             const teams = TournamentDraw.drawSemiFinalPartners(top.slice(0, 8))
               .map(team => team.join(' & '));
             return [
-              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: teams[0], t2: teams[3], s1: null, s2: null, completed: false },
-              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: teams[1], t2: teams[2], s1: null, s2: null, completed: false }
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: teams[0], t2: teams[3], s1: null, s2: null, completed: false, round: 1, court: 1 },
+              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: teams[1], t2: teams[2], s1: null, s2: null, completed: false, round: 1, court: 2 }
             ];
           } else if (top.length >= 4) {
             return [
-              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0], t2: top[3], s1: null, s2: null, completed: false },
-              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: top[1], t2: top[2], s1: null, s2: null, completed: false }
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0], t2: top[3], s1: null, s2: null, completed: false, round: 1, court: 1 },
+              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: top[1], t2: top[2], s1: null, s2: null, completed: false, round: 1, court: 2 }
             ];
           } else {
             return [
-              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0] || 'Seed 1', t2: top[1] || 'Seed 2', s1: null, s2: null, completed: false }
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0] || 'Seed 1', t2: top[1] || 'Seed 2', s1: null, s2: null, completed: false, round: 1, court: 1 }
             ];
           }
         };
@@ -2431,8 +2525,10 @@
         ];
         const setupStep = Math.max(1, Math.min(setupSteps.length, Number(state.ui.setupStep) || 1));
         const totalPlayers = state.groups.reduce((s, g) => s + g.players.length, 0);
-        const poolACount = state.groups.length * Math.min(c.advanceTopN, c.playersPerGroup);
-        const poolBCount = Math.max(0, totalPlayers - poolACount);
+        const round2GroupKeys = getConfiguredPoolKeys();
+        const round2GroupBaseSize = Math.floor(totalPlayers / round2GroupKeys.length);
+        const round2GroupRemainder = totalPlayers % round2GroupKeys.length;
+        const maxRound2GroupCount = Math.min(6, Math.floor(totalPlayers / 8));
         const invalidGroup = state.groups.find(g => g.players.length < 3 || !g.leader || !g.players.includes(g.leader));
         const setupReady = state.groups.length >= 2 && !invalidGroup;
 
@@ -2515,35 +2611,28 @@
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Deuce Cap</label>
                     <input data-cfg-num="deuceCap" type="number" min="15" max="35" value="${c.deuceCap}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
-                  <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Advance Top N</label>
-                    <input data-cfg-num="advanceTopN" type="number" min="1" max="6" value="${c.advanceTopN}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
-                  </div>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 2 Pools</label>
-                    <input data-cfg-num="qr2PoolsCount" type="number" min="2" max="6" value="${c.qr2PoolsCount || 2}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 2 Groups</label>
+                    <input data-cfg-num="qr2PoolsCount" type="number" min="2" max="${Math.max(2, maxRound2GroupCount)}" value="${c.qr2PoolsCount || 2}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Semi-Final Slots</label>
-                    <input data-cfg-num="semiFinalSlots" type="number" min="4" max="8" step="4" value="${c.semiFinalSlots}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
-                  </div>
-                  <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Pool A Final</label>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Group A Final</label>
                     <select data-cfg="poolAFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
                       <option value="bo3" ${c.poolAFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
                       <option value="single" ${c.poolAFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
                     </select>
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Pool B Final</label>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Group B Final</label>
                     <select data-cfg="poolBFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
                       <option value="single" ${c.poolBFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
                       <option value="bo3" ${c.poolBFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
                     </select>
                   </div>
                 </div>
+                <p class="text-xs ${totalPlayers < round2GroupKeys.length * 8 ? 'text-amber-600 dark:text-amber-400' : 'text-stone-500'}">${totalPlayers < round2GroupKeys.length * 8 ? 'Each Round 2 group needs at least 8 players so its top 8 can advance to semi-finals.' : "All Round 1 players are ranked by Win Points and tie-breakers, then assigned in consecutive rank blocks; the top 8 from each Round 2 group advance to that group's semi-finals."}</p>
               </section>
             </div>
 
@@ -2660,13 +2749,10 @@
               <div class="rounded-xl bg-gold-500/10 border border-gold-500/30 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm">
                 <div class="flex flex-wrap items-center gap-4">
                   <span><strong class="text-gold-600 dark:text-gold-400">Players:</strong> <span class="tabular-nums font-semibold">${totalPlayers}</span></span>
-                  <span><strong class="text-gold-600 dark:text-gold-400">Pool A:</strong> <span class="tabular-nums font-semibold">${poolACount}</span></span>
-                  ${(() => {
-                    const keys = getConfiguredPoolKeys().slice(1);
-                    const base = Math.floor(poolBCount / keys.length);
-                    const rem = poolBCount % keys.length;
-                    return keys.map((k, idx) => `<span><strong class="${getPoolAccent(k)}">Pool ${k}:</strong> <span class="tabular-nums font-semibold">${base + (idx < rem ? 1 : 0)}</span></span>`).join('');
-                  })()}
+                  ${round2GroupKeys.map((key, index) => {
+                    const count = round2GroupBaseSize + (index < round2GroupRemainder ? 1 : 0);
+                    return `<span><strong class="${getPoolAccent(key)}">Round 2 Group ${key}:</strong> <span class="tabular-nums font-semibold">${count}</span></span>`;
+                  }).join('')}
                 </div>
                 <span class="text-stone-600 dark:text-stone-300"><strong>Ranking:</strong> ${esc(getTiebreakerText())}</span>
               </div>
@@ -2681,7 +2767,8 @@
                   <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Format &amp; scoring</h3>
                   <p class="text-xs">${state.groups.length} groups · ${totalPlayers} players · ${c.matchesPerPlayer} matches per player</p>
                   <p class="text-xs">Games to ${c.pointsToWin}, win by two until ${c.deuceCap}</p>
-                  <p class="text-xs">Top ${c.advanceTopN} from each group advance</p>
+                  <p class="text-xs">${round2GroupKeys.length} Round 2 groups · all players seeded by global WP rank</p>
+                  <p class="text-xs">Top 8 from each Round 2 group advance to its semi-finals</p>
                 </article>
                 <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2 sm:col-span-2">
                   <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Ranking &amp; tiebreakers</h3>
@@ -2737,7 +2824,7 @@
           <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
             <div class="px-4 py-3 border-b border-stone-200 dark:border-stone-800 flex items-center justify-between">
               <h3 class="font-bold text-sm ${accentClass || ''}">${esc(title)}</h3>
-              ${highlightTopN ? `<span class="text-[11px] text-stone-500 dark:text-stone-400">Top ${highlightTopN} → Pool A</span>` : ''}
+              ${highlightTopN ? `<span class="text-[11px] text-stone-500 dark:text-stone-400">Top ${highlightTopN} advance</span>` : ''}
             </div>
             <div class="overflow-x-auto">
               <table class="w-full text-xs sm:text-sm text-left">
@@ -2788,7 +2875,10 @@
           <div class="rounded-xl bg-white dark:bg-[#191B1F] border ${m.completed ? 'border-emerald-500/30' : 'border-stone-200 dark:border-stone-800'} p-3.5 flex flex-col gap-2.5">
             <div class="flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400">
               <span class="font-mono">${esc(m.id)}</span>
-              <span class="px-2 py-0.5 rounded-full font-medium ${m.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-stone-100 dark:bg-stone-800 text-stone-500'}">${m.completed ? 'Completed' : 'Pending'}</span>
+              <div class="flex items-center gap-1">
+                ${Number.isInteger(m.round) && Number.isInteger(m.court) ? `<span class="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-700 dark:text-sky-300 font-medium">Round ${m.round} · Court ${m.court}</span>` : ''}
+                <span class="px-2 py-0.5 rounded-full font-medium ${m.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-stone-100 dark:bg-stone-800 text-stone-500'}">${m.completed ? 'Completed' : 'Pending'}</span>
+              </div>
             </div>
             <div class="flex items-center justify-between gap-2">
               <div class="flex-1 min-w-0">
@@ -2815,6 +2905,44 @@
             </div>
           </div>
         `;
+      }
+
+      function renderScheduledMatchCards(matches, listKey, emptyMessage) {
+        if (!matches.length) return emptyMessage || '';
+        const rounds = new Map();
+        const unassigned = [];
+        matches.forEach(match => {
+          if (!Number.isInteger(match.round) || !Number.isInteger(match.court)) {
+            unassigned.push(match);
+            return;
+          }
+          const roundMatches = rounds.get(match.round) || [];
+          roundMatches.push(match);
+          rounds.set(match.round, roundMatches);
+        });
+
+        const scheduled = [...rounds.entries()]
+          .sort((left, right) => left[0] - right[0])
+          .map(([round, roundMatches]) => `
+            <section class="space-y-2">
+              <div class="flex items-center justify-between text-[11px] font-semibold text-stone-500">
+                <span>Round ${round}</span>
+                <span>Parallel courts · no player overlap</span>
+              </div>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                ${[1, 2].map(court => {
+                  const match = roundMatches.find(item => item.court === court);
+                  return match
+                    ? renderMatchCard(match, listKey)
+                    : `<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 p-3.5 text-xs text-stone-400">Court ${court} · no compatible match this round</div>`;
+                }).join('')}
+              </div>
+            </section>
+          `).join('');
+        const legacy = unassigned.length
+          ? `<section class="space-y-2"><p class="text-[11px] text-stone-500">Saved matches without court assignments; regenerate this schedule to create parallel court rounds.</p><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${unassigned.map(match => renderMatchCard(match, listKey)).join('')}</div></section>`
+          : '';
+        return scheduled + legacy;
       }
 
       function renderQR1View() {
@@ -2849,10 +2977,8 @@
               const gMatches = state.qr1Matches.filter(m => m.groupId === g.id);
               return `
                 <div class="space-y-3">
-                  ${renderStandingsTable(g.name + ' Standings', g.players, gMatches, state.config.advanceTopN, 'text-gold-600 dark:text-gold-400')}
-                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${gMatches.map(m => renderMatchCard(m, 'qr1')).join('')}
-                  </div>
+                ${renderStandingsTable(`${g.name} Standings`, g.players, gMatches, 0, 'text-gold-600 dark:text-gold-400')}
+                  ${renderScheduledMatchCards(gMatches, 'qr1')}
                 </div>
               `;
             }).join('')}
@@ -2864,7 +2990,7 @@
         const poolKeys = Object.keys(state.qr2Pools || {});
         const hasAnyMatches = poolKeys.some(k => (state.qr2Matches[k] || []).length > 0 || (state.qr2Pools[k] || []).length > 0);
         if (!hasAnyMatches) {
-          return renderEmptyState('Waiting on Qualifier Round 1', 'Pools are formed once every QR1 match is recorded and the round is advanced.');
+          return renderEmptyState('Waiting on Qualifier Round 1', 'Round 2 groups are formed once every QR1 match is recorded and the round is advanced.');
         }
         const isAdmin = state.auth.role === 'admin';
         const allMatches = poolKeys.flatMap(k => state.qr2Matches[k] || []);
@@ -2875,7 +3001,7 @@
             ${isAdmin ? `
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <button id="add-qr2-pool-btn" class="px-3.5 py-1.5 rounded-lg bg-gold-500/15 hover:bg-gold-500/25 text-gold-600 dark:text-gold-400 border border-gold-500/30 text-xs font-semibold transition">
-                  + Add Pool
+                  + Add Group
                 </button>
                 <div class="flex items-center gap-2">
                   ${!allDone && allMatches.length > 0 ? `<button id="sim-qr2-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>` : ''}
@@ -2896,14 +3022,12 @@
                     ${isAdmin ? `
                       <div class="flex items-center gap-2">
                         <button data-regen-pool="${k}" class="px-2.5 py-1 rounded-lg border border-stone-300 dark:border-stone-700 text-[11px] font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Regenerate Schedule</button>
-                        ${poolKeys.length > 2 ? `<button data-remove-pool="${k}" class="px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-[11px] font-medium hover:bg-red-50 dark:hover:bg-red-950/40">Remove Pool ${k}</button>` : ''}
+                        ${poolKeys.length > 2 ? `<button data-remove-pool="${k}" class="px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-[11px] font-medium hover:bg-red-50 dark:hover:bg-red-950/40">Remove Group ${k}</button>` : ''}
                       </div>
                     ` : ''}
                   </div>
-                  ${renderStandingsTable(`Pool ${k} Standings (Top ${state.config.semiFinalSlots} → Semi-Finals)`, players, matches, state.config.semiFinalSlots, getPoolAccent(k))}
-                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                    ${matches.length > 0 ? matches.map(m => renderMatchCard(m, `qr2_${k}`)).join('') : `<div class="col-span-full text-xs text-stone-500 italic">No matches generated yet for Pool ${k} (needs at least 2 players).</div>`}
-                  </div>
+                  ${renderStandingsTable(`Round 2 Group ${k} Standings (Top 8 → Group ${k} Semi-Finals)`, players, matches, 8, getPoolAccent(k))}
+                  ${renderScheduledMatchCards(matches, `qr2_${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${k} (needs at least 2 players).</div>`)}
                 </div>
               `;
             }).join('')}
@@ -2914,7 +3038,7 @@
       function renderSemisView() {
         const poolKeys = Object.keys(state.semis || {}).filter(k => (state.semis[k] || []).length > 0);
         if (poolKeys.length === 0) {
-          return renderEmptyState('Semi-Finals not set', 'Finish Qualifier Round 2 and advance to seed the semi-final matches.');
+          return renderEmptyState('Semi-Finals not set', 'Finish Qualifier Round 2 and advance the top 8 from each group to its semi-final matches.');
         }
         const isAdmin = state.auth.role === 'admin';
         const allMatches = poolKeys.flatMap(k => state.semis[k] || []);
@@ -2934,8 +3058,8 @@
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
               ${poolKeys.map(k => `
                 <div class="space-y-3">
-                  <h2 class="text-sm font-bold ${getPoolAccent(k)} uppercase tracking-wider">Pool ${k} Semi-Finals</h2>
-                  ${state.semis[k].map(m => renderMatchCard(m, `semi_${k}`)).join('')}
+                  <h2 class="text-sm font-bold ${getPoolAccent(k)} uppercase tracking-wider">Group ${k} Semi-Finals</h2>
+                  ${renderScheduledMatchCards(state.semis[k], `semi_${k}`)}
                 </div>
               `).join('')}
             </div>
@@ -2946,7 +3070,7 @@
       function renderFinalsView() {
         const finalKeys = Object.keys(state.finals || {}).filter(k => Boolean(state.finals[k]));
         if (finalKeys.length === 0) {
-          return renderEmptyState('Finals not set', 'Complete both semi-final matches in each pool to unlock the finals.');
+          return renderEmptyState('Finals not set', 'Complete both semi-final matches in each Round 2 group to unlock its final.');
         }
         const isAdmin = state.auth.role === 'admin';
 
@@ -2956,7 +3080,7 @@
             <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
               <div class="flex items-center justify-between">
                 <div>
-                  <h3 class="font-bold text-base ${accent}">Pool ${poolKey} Final</h3>
+                  <h3 class="font-bold text-base ${accent}">Group ${poolKey} Final</h3>
                   <p class="text-xs text-stone-500 dark:text-stone-400">${f.format === 'bo3' ? 'Best of 3 Games' : 'Single Game'}</p>
                 </div>
                 ${f.completed ? `<span class="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-bold">Champion: ${esc(f.winner)}</span>` : ''}
@@ -2985,7 +3109,7 @@
                 `).join('')}
               </div>
 
-              ${isAdmin ? `<button data-save-final="${poolKey}" class="w-full py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 font-bold text-xs transition">Save Pool ${poolKey} Final</button>` : ''}
+              ${isAdmin ? `<button data-save-final="${poolKey}" class="w-full py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 font-bold text-xs transition">Save Group ${poolKey} Final</button>` : ''}
             </div>
           `;
         };
@@ -3039,15 +3163,15 @@
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr1Done}/${s.qr1Total}</span>${roundStatus(s.qr1Done, s.qr1Total, 'qr1')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => 'Pool ' + k).join(' + ')}</div></div>
+                    <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => 'Group ' + k).join(' + ')}</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr2Done}/${s.qr2Total}</span>${roundStatus(s.qr2Done, s.qr2Total, 'qr2')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">4 matches (2 per pool)</div></div>
+                    <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">2 matches per Round 2 group</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.semiDone}/${s.semiTotal}</span>${roundStatus(s.semiDone, s.semiTotal, 'semis')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">Pool A (${c.poolAFinalFormat === 'bo3' ? 'Bo3' : 'Single'}) · Pool B (${c.poolBFinalFormat === 'bo3' ? 'Bo3' : 'Single'})</div></div>
+                    <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => `Group ${k} (${getPoolFinalFormat(k) === 'bo3' ? 'Bo3' : 'Single'})`).join(' · ')}</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.finalDone}/${s.finalTotal}</span>${roundStatus(s.finalDone, s.finalTotal, 'finals')}</div>
                   </div>
                 </div>
@@ -3069,12 +3193,12 @@
                     <div class="font-bold text-sm mt-0.5">${c.deuceCap}</div>
                   </div>
                   <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
-                    <div class="text-[11px] text-stone-500 uppercase">Pool A</div>
-                    <div class="font-bold text-sm mt-0.5">Top ${c.advanceTopN} / grp</div>
+                    <div class="text-[11px] text-stone-500 uppercase">Round 2 Groups</div>
+                    <div class="font-bold text-sm mt-0.5">${c.qr2PoolsCount || 2} groups</div>
                   </div>
                   <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
                     <div class="text-[11px] text-stone-500 uppercase">Semi-Finals</div>
-                    <div class="font-bold text-sm mt-0.5">Top ${c.semiFinalSlots} / pool</div>
+                    <div class="font-bold text-sm mt-0.5">Top 8 per group</div>
                   </div>
                 </div>
               </div>
@@ -3215,9 +3339,9 @@
                 <h2 class="font-bold text-sm">Tournament progression</h2>
                 <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
                   <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; target ${config.matchesPerPlayer} matches per player.</li>
-                  <li><b>Qualifier 2:</b> ${poolKeys.length} pools; the top ${config.advanceTopN} from each group advance to Pool A.</li>
-                  <li><b>Semi-finals:</b> up to ${config.semiFinalSlots} players or seeds per pool qualify.</li>
-                  <li><b>Finals:</b> Pool A ${getPoolFinalFormat('A') === 'bo3' ? 'best of three' : 'single game'}; Pool B ${getPoolFinalFormat('B') === 'bo3' ? 'best of three' : 'single game'}.</li>
+                  <li><b>Qualifier 2:</b> all players are ranked by WP and tie-breakers, then assigned to ${poolKeys.length} groups in consecutive rank blocks.</li>
+                  <li><b>Semi-finals:</b> the top 8 players from each Round 2 group advance to that group's semi-finals.</li>
+                  <li><b>Finals:</b> ${poolKeys.map(key => `Group ${key} ${getPoolFinalFormat(key) === 'bo3' ? 'best of three' : 'single game'}`).join('; ')}.</li>
                 </ul>
               </section>
               <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3 md:col-span-2">
@@ -4056,7 +4180,7 @@
           const fn = state.finals[poolKey];
           return `
             <div class="rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
-              <h3 class="font-bold text-base ${accent}">Pool ${poolKey} Bracket</h3>
+              <h3 class="font-bold text-base ${accent}">Group ${poolKey} Bracket</h3>
               <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
                 <div class="space-y-3">
                   <div class="text-xs font-semibold uppercase text-stone-500">Semi-Finals</div>
@@ -4073,7 +4197,7 @@
                 <div class="space-y-2">
                   <div class="text-xs font-semibold uppercase text-stone-500">Final</div>
                   <div class="p-3 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 text-xs space-y-1">
-                    <div class="text-stone-400 font-medium">Pool ${poolKey} Final</div>
+                    <div class="text-stone-400 font-medium">Group ${poolKey} Final</div>
                     ${fn ? `<div class="font-semibold">${esc(fn.t1)}</div><div class="font-semibold">${esc(fn.t2)}</div>` : `<div class="italic text-stone-400">Awaiting Semis</div>`}
                   </div>
                 </div>
@@ -5694,15 +5818,15 @@
         document.getElementById('add-qr2-pool-btn')?.addEventListener('click', () => {
           const existing = Object.keys(state.qr2Pools || {});
           const nextLetter = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').find(l => !existing.includes(l));
-          if (!nextLetter) { showToast('Maximum pool limit reached', 'error'); return; }
+          if (!nextLetter) { showToast('Maximum group limit reached', 'error'); return; }
           openModal(`
             <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
-              <h3 class="text-base font-bold">Add Round 2 Pool ${nextLetter}</h3>
+              <h3 class="text-base font-bold">Add Round 2 Group ${nextLetter}</h3>
               <div class="space-y-3 text-xs">
                 <div>
-                  <label class="block font-semibold text-stone-500 mb-1">How to populate Pool ${nextLetter}</label>
+                  <label class="block font-semibold text-stone-500 mb-1">How to populate Group ${nextLetter}</label>
                   <select id="add-pool-mode" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
-                    <option value="rebalance">Rebalance bottom players from existing pools</option>
+                    <option value="rebalance">Rebalance lower-ranked players from existing groups</option>
                     <option value="custom">Enter custom player names</option>
                   </select>
                 </div>
@@ -5713,7 +5837,7 @@
               </div>
               <div class="flex justify-end gap-2">
                 <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
-                <button id="modal-add-pool-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create Pool ${nextLetter}</button>
+                <button id="modal-add-pool-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create Group ${nextLetter}</button>
               </div>
             </div>
           `);
@@ -5729,11 +5853,11 @@
               if (names.length < 2) { showToast('Enter at least 2 players', 'error'); return; }
               closeModal();
               addQR2Pool(nextLetter, names, []);
-              showToast(`Added Pool ${nextLetter} (${names.length} players)`, 'success');
+              showToast(`Added Group ${nextLetter} (${names.length} players)`, 'success');
             } else {
               const nonA = existing.filter(k => k !== 'A');
               const poolPlayers = nonA.flatMap(k => state.qr2Pools[k] || []);
-              if (poolPlayers.length < 4) { showToast('Not enough players outside Pool A to split', 'error'); return; }
+              if (poolPlayers.length < 4) { showToast('Not enough players outside Group A to split', 'error'); return; }
               const newKeys = [...nonA, nextLetter];
               const chunk = Math.ceil(poolPlayers.length / newKeys.length);
               newKeys.forEach((k, idx) => {
@@ -5741,7 +5865,7 @@
               });
               closeModal();
               addQR2Pool(nextLetter, state.qr2Pools[nextLetter], nonA);
-              showToast(`Added Pool ${nextLetter} and rebalanced ${newKeys.join(', ')}`, 'success');
+              showToast(`Added Group ${nextLetter} and rebalanced ${newKeys.join(', ')}`, 'success');
             }
           });
         });
@@ -5755,7 +5879,7 @@
               : [];
             saveState();
             render();
-            showToast(`Regenerated Pool ${k} schedule`, 'success');
+            showToast(`Regenerated Group ${k} schedule`, 'success');
           });
         });
 
@@ -5766,7 +5890,7 @@
             delete state.qr2Matches[k];
             saveState();
             render();
-            showToast(`Removed Pool ${k}`, 'success');
+            showToast(`Removed Group ${k}`, 'success');
           });
         });
 
@@ -5817,7 +5941,7 @@
               f.winner = t1Wins > t2Wins ? f.t1 : f.t2;
               f.completedAt = new Date().toISOString();
               if (Object.values(state.finals || {}).filter(Boolean).every(x => x.completed)) state.phase = 'completed';
-              showToast(`Pool ${poolKey} Champion: ${f.winner}!`, 'success');
+              showToast(`Group ${poolKey} Champion: ${f.winner}!`, 'success');
             } else {
               f.completed = false;
               f.winner = null;
@@ -5836,7 +5960,9 @@
             const latestRegistry = JSON.parse(event.newValue);
             registry = latestRegistry;
             const latestTournament = latestRegistry.items?.[state.tournamentId];
-            if (latestTournament && state.ui.activeTab === 'players') {
+            const localEditsPending = ['pending', 'syncing'].includes(state.sync?.status) ||
+              ['pending', 'syncing'].includes(latestTournament?.sync?.status);
+            if (latestTournament && !localEditsPending && !isEditingFormField()) {
               const currentUi = state.ui;
               state = normalizeTournamentState({
                 ...latestTournament,
@@ -5844,11 +5970,7 @@
                 sync: { ...state.sync, ...(latestTournament.sync || {}) },
                 ui: { ...(latestTournament.ui || {}), ...currentUi }
               }, state.tournamentId);
-              if (playerData.loaded) {
-                const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
-                tournaments.set(String(state.tournamentId), { id: String(state.tournamentId), data: latestTournament });
-                playerData.tournaments = [...tournaments.values()];
-              }
+              upsertPlayerDataTournament(state.tournamentId, state, state.sync.lastSynced);
               render();
             }
           } catch (err) {
@@ -5869,10 +5991,19 @@
       });
 
       window.addEventListener('focus', () => {
+        refreshLiveScores();
         if (!playerData.loaded || playerData.loading || state.ui.activeTab !== 'players' || !getSyncApiUrl()) return;
         loadPlayerData(true).then(() => {
           if (state.ui.activeTab === 'players') render();
         });
+      });
+
+      window.addEventListener('focusout', () => {
+        refreshLiveScores();
+      });
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') refreshLiveScores();
       });
 
       (async () => {
@@ -5886,6 +6017,9 @@
           return;
         }
         render();
-        if (getSyncApiUrl()) await pullFromTurso(true);
+        if (getSyncApiUrl()) {
+          await pullFromTurso(true);
+          window.setInterval(refreshLiveScores, 2000);
+        }
       })();
     })();

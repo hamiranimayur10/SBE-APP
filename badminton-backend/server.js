@@ -1696,15 +1696,24 @@ app.post('/api/player-invites/:id/revoke', requireAdminKey, async (req, res) => 
 // Get one tournament
 app.get('/api/tournaments/:id', async (req, res) => {
   try {
+    const since = String(req.query.since || '');
+    res.set('Cache-Control', 'no-store');
     const result = await getDb().execute({
-      sql: 'SELECT data, updated_at FROM tournaments WHERE id = ?',
+      sql: 'SELECT updated_at FROM tournaments WHERE id = ?',
       args: [req.params.id]
     });
     if (result.rows.length === 0) {
       return res.json({ exists: false, data: null });
     }
     const row = result.rows[0];
-    res.json({ exists: true, data: JSON.parse(row.data), updatedAt: row.updated_at });
+    if (since && since === row.updated_at) {
+      return res.json({ exists: true, unchanged: true, updatedAt: row.updated_at });
+    }
+    const dataResult = await getDb().execute({
+      sql: 'SELECT data FROM tournaments WHERE id = ?',
+      args: [req.params.id]
+    });
+    res.json({ exists: true, data: JSON.parse(dataResult.rows[0].data), updatedAt: row.updated_at });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

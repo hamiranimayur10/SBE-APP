@@ -104,6 +104,22 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(savedTournament.response.status, 200);
     assert.match(savedTournament.body.playerProfileIds['roster alice'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(savedTournament.body.playerProfileIds['roster bob'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    const unchangedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
+    assert.equal(unchangedTournament.response.status, 200);
+    assert.equal(unchangedTournament.body.unchanged, true);
+    assert.equal(unchangedTournament.body.data, undefined);
+    await delay(2);
+    const updatedTournamentData = await api('/api/tournaments/auth-test');
+    updatedTournamentData.body.data.config.name = 'Auth Test Updated';
+    const updatedTournament = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: adminHeaders,
+      body: JSON.stringify(updatedTournamentData.body.data)
+    });
+    const changedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
+    assert.equal(updatedTournament.response.status, 200);
+    assert.equal(changedTournament.body.unchanged, undefined);
+    assert.equal(changedTournament.body.data.config.name, 'Auth Test Updated');
 
     const rosterProfiles = await api('/api/players');
     assert.equal(rosterProfiles.response.status, 200);

@@ -1,0 +1,5392 @@
+
+    (function () {
+      'use strict';
+
+      const STORAGE_KEY = 'badminton_tournament_state_v1';
+      const REGISTRY_KEY = 'badminton_tournaments_registry_v1';
+      const THEME_KEY = 'badminton_tournament_theme_v1';
+      const PLAYER_PROFILES_KEY = 'badminton_player_profiles_v1';
+      const DEFAULT_PIN = '2025';
+      const playerInviteToken = new URLSearchParams(window.location.search).get('playerInvite') || '';
+      let spreadsheetParserPromise = null;
+      const PAGE_FILES = Object.freeze({
+        dashboard: 'index.html',
+        tournaments: 'tournaments.html',
+        setup: 'setup.html',
+        qr1: 'qualifier-round-1.html',
+        qr2: 'qualifier-round-2.html',
+        semis: 'semifinals.html',
+        finals: 'finals.html',
+        bracket: 'bracket.html',
+        players: 'players.html',
+        checkin: 'check-in.html',
+        rules: 'rules.html'
+      });
+      const PLAYER_IMPORT_FIELDS = [
+        { key: 'name', label: 'Player name', required: true, headers: ['player name', 'full name', 'name', 'player'] },
+        { key: 'playerCode', label: 'Six-digit player code', headers: ['player code', 'six digit code', 'unique code'] },
+        { key: 'playerId', label: 'Internal player UUID', headers: ['player id', 'unique player id', 'unique id', 'uuid'] },
+        { key: 'nickname', label: 'Nickname', headers: ['nickname', 'nick name'] },
+        { key: 'email', label: 'Email', headers: ['email', 'email address'] },
+        { key: 'club', label: 'Club / Academy', headers: ['club', 'academy', 'club academy'] },
+        { key: 'gender', label: 'Gender', headers: ['gender', 'sex'] },
+        { key: 'country', label: 'Country', headers: ['country'] },
+        { key: 'state', label: 'State', headers: ['state', 'province'] },
+        { key: 'city', label: 'City', headers: ['city'] },
+        { key: 'emergencyContact', label: 'Emergency contact', headers: ['emergency contact', 'emergency phone'] },
+        { key: 'playingHand', label: 'Playing hand', headers: ['playing hand', 'hand'] },
+        { key: 'preferredEvents', label: 'Preferred events', headers: ['preferred events', 'events'] },
+        { key: 'photoUrl', label: 'Profile photo URL', headers: ['photo url', 'photo', 'profile photo'] },
+        { key: 'age', label: 'Age', headers: ['age'] },
+        { key: 'ranking', label: 'National / Club ranking', headers: ['ranking', 'rank'] },
+        { key: 'aliases', label: 'Other names / aliases', headers: ['aliases', 'other names', 'former names'] }
+      ];
+
+      function getPageUrl(page) {
+        const url = new URL(PAGE_FILES[page] || PAGE_FILES.dashboard, window.location.href);
+        const params = new URLSearchParams(window.location.search);
+        ['t', 'api', 'playerInvite'].forEach(key => {
+          if (params.has(key)) url.searchParams.set(key, params.get(key));
+        });
+        if (page === 'players' && params.has('player')) url.searchParams.set('player', params.get('player'));
+        return `${url.pathname}${url.search}`;
+      }
+
+      function getRequestedPage() {
+        const page = document.body.dataset.page || 'dashboard';
+        return PAGE_FILES[page] ? page : 'dashboard';
+      }
+
+      function createPlayerId() {
+        if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      }
+
+      function createPlayerCode(usedCodes) {
+        const range = 900000;
+        const random = new Uint32Array(1);
+        window.crypto.getRandomValues(random);
+        const start = random[0] % range;
+        for (let offset = 0; offset < range; offset++) {
+          const code = String(100000 + ((start + offset) % range));
+          if (!usedCodes.has(code)) return code;
+        }
+        throw new Error('All six-digit player codes are in use');
+      }
+
+      function compressProfilePhoto(file) {
+        return new Promise((resolve, reject) => {
+          if (!file || !['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+            reject(new Error('Choose a JPEG, PNG, or WebP image'));
+            return;
+          }
+          if (file.size > 10 * 1024 * 1024) {
+            reject(new Error('Choose an image smaller than 10 MB'));
+            return;
+          }
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error('Could not read the selected image'));
+          reader.onload = () => {
+            const image = new Image();
+            image.onerror = () => reject(new Error('The selected file is not a valid image'));
+            image.onload = () => {
+              const scale = Math.min(1, 512 / Math.max(image.naturalWidth, image.naturalHeight));
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+              canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+              const context = canvas.getContext('2d');
+              if (!context) {
+                reject(new Error('Photo compression is not supported by this browser'));
+                return;
+              }
+              context.drawImage(image, 0, 0, canvas.width, canvas.height);
+              for (const quality of [0.82, 0.72, 0.62, 0.5]) {
+                const photo = canvas.toDataURL('image/jpeg', quality);
+                if (photo.length <= 900000) {
+                  resolve(photo);
+                  return;
+                }
+              }
+              reject(new Error('Could not compress the photo below the 675 KB limit'));
+            };
+            image.src = String(reader.result || '');
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+
+      function bindProfilePhotoControls(prefix) {
+        const urlInput = document.getElementById(`${prefix}-photo-url`);
+        const dataInput = document.getElementById(`${prefix}-photo-data`);
+        const fileInput = document.getElementById(`${prefix}-photo-file`);
+        const preview = document.getElementById(`${prefix}-photo-preview`);
+        const clearButton = document.getElementById(`${prefix}-photo-clear`);
+        const updatePreview = () => {
+          const value = dataInput.value || urlInput.value.trim();
+          let valid = /^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value) && value.length <= 900000;
+          if (!valid && value) {
+            try {
+              const parsed = new URL(value);
+              valid = parsed.protocol === 'https:' || parsed.protocol === 'http:';
+            } catch (_err) {}
+          }
+          preview.hidden = !valid;
+          if (valid) preview.src = value;
+        };
+        urlInput.addEventListener('input', () => {
+          dataInput.value = '';
+          updatePreview();
+        });
+        fileInput.addEventListener('change', async () => {
+          const file = fileInput.files?.[0];
+          if (!file) return;
+          try {
+            dataInput.value = await compressProfilePhoto(file);
+            urlInput.value = '';
+            updatePreview();
+          } catch (err) {
+            showToast(err.message, 'error');
+          } finally {
+            fileInput.value = '';
+          }
+        });
+        clearButton.addEventListener('click', () => {
+          dataInput.value = '';
+          urlInput.value = '';
+          fileInput.value = '';
+          updatePreview();
+        });
+        updatePreview();
+      }
+
+      function getProfilePhotoValue(prefix) {
+        return document.getElementById(`${prefix}-photo-data`).value
+          || document.getElementById(`${prefix}-photo-url`).value.trim();
+      }
+
+      function normalizeImportName(name) {
+        return String(name || '')
+          .normalize('NFKD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^\p{L}\p{N}]+/gu, ' ')
+          .trim()
+          .replace(/\s+/g, ' ')
+          .toLocaleLowerCase();
+      }
+
+      function normalizeImportHeader(header) {
+        return String(header || '').normalize('NFKC').toLocaleLowerCase().replace(/[^a-z0-9]/g, '');
+      }
+
+      function isValidPlayerId(value) {
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+      }
+
+      async function navigateToPage(page) {
+        if (!PAGE_FILES[page] || page === getRequestedPage()) return;
+        if (state.auth.role === 'guest' && page === 'setup') return;
+        state.ui.activeTab = page;
+        saveRegistry();
+        if (state.auth.role === 'admin' && syncTimer && getSyncApiUrl()) {
+          clearTimeout(syncTimer);
+          syncTimer = null;
+          await pushToTurso(true);
+        }
+        window.location.assign(getPageUrl(page));
+      }
+
+      function bindPageLinks() {
+        document.querySelectorAll('a[data-tab]').forEach(link => {
+          link.addEventListener('click', event => {
+            if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            navigateToPage(link.getAttribute('data-tab'));
+          });
+        });
+      }
+
+      const DEFAULT_GROUPS = [
+        {
+          id: 'A', name: 'Group A', leader: 'Nishant',
+          players: ['Makarand', 'Syed', 'Madhu', 'Nishant', 'Nikhil', 'Sabbir']
+        },
+        {
+          id: 'B', name: 'Group B', leader: 'Prakaash',
+          players: ['Puneet', 'Srini', 'Arjun', 'Saurav', 'Prakaash', 'Siri']
+        },
+        {
+          id: 'C', name: 'Group C', leader: 'Mayur',
+          players: ['Rijo', 'Mayur', 'Ajay', 'John', 'Amit S', 'Arun']
+        },
+        {
+          id: 'D', name: 'Group D', leader: 'Pankaj',
+          players: ['Sunil', 'Harsha', 'Vikram', 'Pankaj', 'Chakresh', 'Vijay']
+        },
+        {
+          id: 'E', name: 'Group E', leader: 'Abhijat',
+          players: ['Siddarth', 'Tensingh', 'Abhijat', 'Nishtha', 'Amit J', 'Kishor']
+        }
+      ];
+
+      function createDefaultState(id, customName) {
+        const def = {
+          tournamentId: id || 'default',
+          auth: { loggedIn: false, role: 'guest', pin: DEFAULT_PIN },
+          ui: { activeTab: 'setup', setupStep: 1, qr1GroupFilter: 'ALL', qr2PoolFilter: 'ALL', bracketOpen: false, checkInFilter: 'ALL', checkInSearch: '', checkInGroupFilter: 'ALL', checkInSkillMin: '', checkInSkillMax: '', playerCheckInMode: window.location.hash === '#checkin', selectedPlayerName: '', headToHeadOpponent: '', playerSearch: '' },
+          checkIns: {},
+          playerSkills: {},
+          playerProfileIds: {},
+          phase: 'setup', // setup | qr1 | qr2 | semis | finals | completed
+          config: {
+            name: customName || 'SBE Light Vs Dark Side Tournament',
+            date: '2026-03-15',
+            venue: 'Orange County Badminton Club',
+            rules: '',
+            numGroups: 5,
+            playersPerGroup: 6,
+            matchesPerPlayer: 4,
+            pointsToWin: 21,
+            deuceCap: 25,
+            advanceTopN: 3,
+            semiFinalSlots: 8,
+            qr2PoolsCount: 2,
+            poolAFinalFormat: 'bo3', // bo3 | single
+            poolBFinalFormat: 'single',
+            poolFinalFormats: { A: 'bo3', B: 'single' },
+            ranking: {
+              winPointsWeight: 20,
+              winMarginWeight: 1,
+              lossMarginWeight: 1,
+              tiebreakers: ['wp', 'wins', 'pf', 'pa']
+            }
+          },
+          groups: JSON.parse(JSON.stringify(DEFAULT_GROUPS)),
+          qr1Matches: [],
+          qr2Pools: { A: [], B: [] },
+          qr2Matches: { A: [], B: [] },
+          semis: { A: [], B: [] },
+          finals: { A: null, B: null },
+          sync: { apiUrl: '', syncKey: '', status: 'local', lastSynced: null }
+        };
+        return def;
+      }
+
+      function loadRegistry() {
+        try {
+          const raw = localStorage.getItem(REGISTRY_KEY);
+          if (raw) {
+            const reg = JSON.parse(raw);
+            if (reg && reg.items && typeof reg.items === 'object') return reg;
+          }
+        } catch (e) {}
+        // Migrate single-tournament storage if present
+        let initial = createDefaultState('default');
+        try {
+          const oldRaw = localStorage.getItem(STORAGE_KEY);
+          if (oldRaw) {
+            const parsed = JSON.parse(oldRaw);
+            if (parsed && parsed.config && Array.isArray(parsed.groups)) {
+              initial = parsed;
+              if (!initial.tournamentId) initial.tournamentId = 'default';
+            }
+          }
+        } catch (e) {}
+        return { activeId: initial.tournamentId || 'default', items: { [initial.tournamentId || 'default']: initial } };
+      }
+
+      function saveRegistry() {
+        try {
+          registry.items[state.tournamentId] = state;
+          registry.activeId = state.tournamentId;
+          localStorage.setItem(REGISTRY_KEY, JSON.stringify(registry));
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        } catch (e) {}
+      }
+
+      function normalizeTournamentState(parsed, idFallback) {
+        if (!parsed.tournamentId) parsed.tournamentId = idFallback || 'default';
+        if (!parsed.ui) parsed.ui = {};
+        if (!Number.isInteger(parsed.ui.setupStep) || parsed.ui.setupStep < 1 || parsed.ui.setupStep > 5) parsed.ui.setupStep = 1;
+        if (parsed.ui.selectedPlayerName === undefined) parsed.ui.selectedPlayerName = '';
+        if (parsed.ui.headToHeadOpponent === undefined) parsed.ui.headToHeadOpponent = '';
+        if (parsed.ui.playerSearch === undefined) parsed.ui.playerSearch = '';
+        if (!parsed.checkIns) parsed.checkIns = {};
+        if (!parsed.playerSkills) parsed.playerSkills = {};
+        if (!parsed.playerProfileIds || typeof parsed.playerProfileIds !== 'object' || Array.isArray(parsed.playerProfileIds)) parsed.playerProfileIds = {};
+        if (parsed.config.name === 'SoCal Badminton Club Tournament' || parsed.config.name === 'SoCal Badminton Club') {
+          parsed.config.name = 'SBE Light Vs Dark Side Tournament';
+        }
+        if (!parsed.config.ranking) {
+          parsed.config.ranking = { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
+        }
+        if (typeof parsed.config.rules !== 'string') parsed.config.rules = '';
+        if (!parsed.sync) parsed.sync = { apiUrl: '', syncKey: '', status: 'local', lastSynced: null };
+        if (window.location.hash === '#checkin') parsed.ui.playerCheckInMode = true;
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const apiParam = params.get('api');
+          if (apiParam) parsed.sync.apiUrl = apiParam.replace(/\/+$/, '');
+        } catch (e) {}
+        return parsed;
+      }
+
+      let registry = loadRegistry();
+      let state = loadState();
+      let themeMode = loadTheme();
+
+      function loadState() {
+        let playerParam = '';
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const tParam = params.get('t');
+          playerParam = params.get('player') || '';
+          if (tParam && registry.items[tParam]) {
+            registry.activeId = tParam;
+          } else if (tParam && !registry.items[tParam]) {
+            const created = createDefaultState(tParam, 'Tournament ' + tParam);
+            registry.items[tParam] = created;
+            registry.activeId = tParam;
+          }
+        } catch (e) {}
+        const active = registry.items[registry.activeId] || Object.values(registry.items)[0] || createDefaultState('default');
+        const normalized = normalizeTournamentState(active, active.tournamentId);
+        normalized.ui.activeTab = getRequestedPage();
+        normalized.ui.bracketOpen = false;
+        if (normalized.auth.role === 'guest' && normalized.ui.activeTab === 'setup') normalized.ui.activeTab = 'dashboard';
+        if (playerParam) {
+          normalized.ui.activeTab = 'players';
+          normalized.ui.selectedPlayerName = playerParam;
+        }
+        return normalized;
+      }
+
+      let syncTimer = null;
+      let playerData = { loaded: false, loading: false, error: '', tournaments: [], profiles: [] };
+      let playerDataPromise = null;
+      let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
+      let tournamentCatalogPromise = null;
+      let playerAccountProfile = null;
+      let playerInviteContext = null;
+      let playerInviteError = '';
+      let playerAuthError = '';
+
+      function getSyncHeaders() {
+        const headers = { 'Content-Type': 'application/json' };
+        if (state.sync?.syncKey) headers['x-sync-key'] = state.sync.syncKey;
+        return headers;
+      }
+
+      function getSyncApiUrl() {
+        const configuredUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
+        if (configuredUrl) {
+          return configuredUrl.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(configuredUrl)
+            ? configuredUrl
+            : '';
+        }
+        const isLocalOrigin = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(window.location.origin);
+        if (isLocalOrigin && window.location.port === '8080') {
+          return `${window.location.protocol}//${window.location.hostname}:3001`;
+        }
+        return window.location.protocol === 'https:' || isLocalOrigin ? window.location.origin : '';
+      }
+
+      function getPlayerAuthApiUrl() {
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl || new URL(apiUrl).origin !== window.location.origin) {
+          throw new Error('Player login requires the app and API to use the same origin');
+        }
+        return apiUrl;
+      }
+
+      async function requestPlayerApi(path, options) {
+        const response = await fetch(`${getPlayerAuthApiUrl()}${path}`, {
+          credentials: 'same-origin',
+          ...options,
+          headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) }
+        });
+        let result;
+        try {
+          result = await response.json();
+        } catch (_err) {
+          throw new Error(`Unexpected response from player API (HTTP ${response.status})`);
+        }
+        if (!response.ok) throw new Error(result.error || `Player API request failed (HTTP ${response.status})`);
+        return result;
+      }
+
+      function applyPlayerAccount(profile) {
+        playerAccountProfile = profile;
+        playerAuthError = '';
+        playerInviteError = '';
+        state.auth.loggedIn = true;
+        state.auth.role = 'player';
+        state.ui.activeTab = 'players';
+        state.ui.selectedPlayerName = profile.name;
+        playerData.profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
+        playerData.profiles.push(profile);
+        playerData.loaded = false;
+      }
+
+      function clearPlayerAccountProfile() {
+        const accountProfile = playerAccountProfile;
+        if (accountProfile) {
+          playerData.profiles = playerData.profiles.filter(profile => !samePlayerIdentity(profile, accountProfile));
+          try {
+            const cached = JSON.parse(localStorage.getItem(PLAYER_PROFILES_KEY) || '[]');
+            if (Array.isArray(cached)) {
+              localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(
+                cached.filter(profile => !samePlayerIdentity(profile, accountProfile))
+              ));
+            }
+          } catch (_err) {
+            console.error('Could not clear the cached player profile on logout');
+          }
+        }
+        playerAccountProfile = null;
+        playerData.loaded = false;
+      }
+
+      async function restorePlayerSession() {
+        try {
+          const result = await requestPlayerApi('/api/player-auth/me');
+          applyPlayerAccount(result.player);
+          return true;
+        } catch (err) {
+          if (!/HTTP 401/.test(err.message)) {
+            console.error('Could not restore player session:', err);
+            playerAuthError = `Player session could not be restored: ${err.message}`;
+          }
+          return false;
+        }
+      }
+
+      async function loadPlayerInvite() {
+        if (!playerInviteToken) return;
+        state.auth.loggedIn = false;
+        state.auth.role = 'guest';
+        try {
+          playerInviteContext = await requestPlayerApi(`/api/player-auth/invites/${encodeURIComponent(playerInviteToken)}`);
+        } catch (err) {
+          playerInviteError = err.message;
+        }
+      }
+
+      function samePlayerIdentity(left, right) {
+        const names = profile => [profile?.name, ...(Array.isArray(profile?.aliases) ? profile.aliases : [])]
+          .map(name => window.PlayerAnalytics.normalizeName(name)).filter(Boolean);
+        const leftNames = new Set(names(left));
+        return names(right).some(name => leftNames.has(name));
+      }
+
+      function getOwnPlayerRosterEntry() {
+        if (!playerAccountProfile) return null;
+        return getAllImportedPlayers().find(player => {
+          const linkedId = String(state.playerProfileIds?.[normalizeImportName(player.name)] || '').toLowerCase();
+          const profileId = String(playerAccountProfile.playerId || '').toLowerCase();
+          return (profileId && linkedId === profileId) || samePlayerIdentity(playerAccountProfile, { name: player.name });
+        }) || null;
+      }
+
+      function cachePlayerProfile(profile) {
+        const usedCodes = new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean));
+        const savedProfile = {
+          ...profile,
+          playerId: profile.playerId || createPlayerId(),
+          playerCode: profile.playerCode || createPlayerCode(usedCodes)
+        };
+        const profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
+        profiles.push(savedProfile);
+        playerData.profiles = profiles;
+        playerData.loaded = true;
+        try {
+          localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(profiles));
+        } catch (_err) {
+          showToast('Profile saved, but this browser could not cache it locally', 'error');
+        }
+        return savedProfile;
+      }
+
+      function getLocalPlayerProfiles() {
+        try {
+          const profiles = JSON.parse(localStorage.getItem(PLAYER_PROFILES_KEY) || '[]');
+          const storedProfiles = Array.isArray(profiles) ? profiles.filter(profile => profile && typeof profile === 'object') : [];
+          const usedIds = new Set();
+          const usedCodes = new Set();
+          let changed = !Array.isArray(profiles) || storedProfiles.length !== profiles.length;
+          const localProfiles = storedProfiles.map(profile => {
+            let playerId = String(profile.playerId || '').toLowerCase();
+            if (!isValidPlayerId(playerId) || usedIds.has(playerId)) {
+              playerId = createPlayerId();
+              changed = true;
+            }
+            if (playerId !== profile.playerId) changed = true;
+            usedIds.add(playerId);
+            let playerCode = String(profile.playerCode || '');
+            if (!/^\d{6}$/.test(playerCode) || usedCodes.has(playerCode)) {
+              playerCode = createPlayerCode(usedCodes);
+              changed = true;
+            }
+            usedCodes.add(playerCode);
+            return { ...profile, playerId, playerCode };
+          });
+          const knownNames = new Set();
+          localProfiles.forEach(profile => [profile.name, ...(Array.isArray(profile.aliases) ? profile.aliases : [])].forEach(name => {
+            const key = normalizeImportName(name);
+            if (key) knownNames.add(key);
+          }));
+          const addRosterProfile = name => {
+            const cleanName = String(name || '').trim();
+            const key = normalizeImportName(cleanName);
+            if (!key || /^(TBD|Seed\s+\d+)$/i.test(cleanName) || knownNames.has(key)) return;
+            let playerId = createPlayerId();
+            while (usedIds.has(playerId)) playerId = createPlayerId();
+            usedIds.add(playerId);
+            const playerCode = createPlayerCode(usedCodes);
+            usedCodes.add(playerCode);
+            knownNames.add(key);
+            localProfiles.push({
+              playerId,
+              playerCode,
+              name: cleanName,
+              displayName: cleanName,
+              aliases: [],
+              photoUrl: '',
+              age: null,
+              nickname: '',
+              gender: '',
+              club: '',
+              ranking: '',
+              country: '',
+              state: '',
+              city: '',
+              emergencyContact: '',
+              playingHand: '',
+              preferredEvents: [],
+              email: '',
+              visibility: {}
+            });
+            changed = true;
+          };
+          getLocalPlayerTournaments().forEach(tournament => {
+            const data = tournament.data || {};
+            (data.groups || []).forEach(group => (group.players || []).forEach(addRosterProfile));
+            Object.values(data.qr2Pools || {}).forEach(pool => (pool || []).forEach(addRosterProfile));
+          });
+          if (changed) {
+            try {
+              localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(localProfiles));
+            } catch (err) {
+              console.error('Could not store player identifiers in this browser:', err);
+              showToast('Player IDs were generated but could not be cached in this browser', 'error');
+            }
+          }
+          return playerAccountProfile
+            ? [...localProfiles.filter(profile => !samePlayerIdentity(profile, playerAccountProfile)), playerAccountProfile]
+            : localProfiles;
+        } catch (_err) {
+          return [];
+        }
+      }
+
+      function getLocalPlayerTournaments() {
+        const tournaments = new Map();
+        Object.values(registry.items || {}).forEach(tournament => {
+          if (tournament && tournament.tournamentId) {
+            tournaments.set(String(tournament.tournamentId), { id: String(tournament.tournamentId), data: tournament });
+          }
+        });
+        if (state && state.tournamentId && !tournaments.has(String(state.tournamentId))) {
+          tournaments.set(String(state.tournamentId), { id: String(state.tournamentId), data: state });
+        }
+        return [...tournaments.values()];
+      }
+
+      async function loadPlayerData(force) {
+        if (playerData.loading) return playerDataPromise;
+        if (playerData.loaded && !force) return;
+        playerData.loading = true;
+        playerData.error = '';
+        const localTournaments = getLocalPlayerTournaments();
+        playerDataPromise = (async () => {
+          const apiUrl = getSyncApiUrl();
+          if (!apiUrl) {
+            playerData.tournaments = localTournaments;
+            playerData.profiles = getLocalPlayerProfiles();
+            return;
+          }
+          try {
+            const [historyResponse, profilesResponse] = await Promise.all([
+              fetch(`${apiUrl}/api/tournament-history`),
+              fetch(`${apiUrl}/api/players`)
+            ]);
+            const historyJson = await historyResponse.json();
+            const profilesJson = await profilesResponse.json();
+            if (!historyResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${historyResponse.status})`);
+            if (!profilesResponse.ok) throw new Error(profilesJson.error || `Profiles request failed (HTTP ${profilesResponse.status})`);
+            const tournaments = new Map((historyJson.tournaments || []).map(tournament => [String(tournament.id), tournament]));
+            localTournaments.forEach(tournament => {
+              const id = String(tournament.id);
+              const remote = tournaments.get(id);
+              const localSyncStatus = tournament.data?.sync?.status;
+              const localSyncedAt = Date.parse(tournament.data?.sync?.lastSynced || '');
+              const remoteUpdatedAt = Date.parse(remote?.updatedAt || '');
+              if (!remote || localSyncStatus !== 'synced' || !Number.isFinite(remoteUpdatedAt) ||
+                (Number.isFinite(localSyncedAt) && localSyncedAt >= remoteUpdatedAt)) {
+                const data = {
+                  ...(remote?.data || {}),
+                  ...(tournament.data || {}),
+                  playerProfileIds: {
+                    ...(tournament.data?.playerProfileIds || {}),
+                    ...(remote?.data?.playerProfileIds || {})
+                  }
+                };
+                tournaments.set(id, { ...(remote || {}), ...tournament, id, data });
+              }
+            });
+            playerData.tournaments = [...tournaments.values()];
+            const profiles = Array.isArray(profilesJson.players) ? profilesJson.players : [];
+            playerData.profiles = playerAccountProfile
+              ? [...profiles.filter(profile => !samePlayerIdentity(profile, playerAccountProfile)), playerAccountProfile]
+              : profiles;
+          } catch (err) {
+            playerData.tournaments = localTournaments;
+            playerData.profiles = getLocalPlayerProfiles();
+            playerData.error = `Could not load cloud player data: ${err.message}`;
+          }
+        })().finally(() => {
+          playerData.loading = false;
+          playerData.loaded = true;
+          playerDataPromise = null;
+        });
+        return playerDataPromise;
+      }
+
+      function getLocalTournamentCatalog() {
+        return Object.values(registry.items || {}).map(tournament => ({
+          id: String(tournament.tournamentId),
+          name: tournament.config?.name || 'Tournament',
+          date: tournament.config?.date || '',
+          venue: tournament.config?.venue || '',
+          phase: tournament.phase || 'setup',
+          data: tournament,
+          updatedAt: tournament.sync?.lastSynced || ''
+        }));
+      }
+
+      async function loadTournamentCatalog(force) {
+        if (tournamentCatalog.loading) return tournamentCatalogPromise;
+        if (tournamentCatalog.loaded && !force) return;
+        tournamentCatalog.loading = true;
+        tournamentCatalog.error = '';
+        const localTournaments = getLocalTournamentCatalog();
+        tournamentCatalogPromise = (async () => {
+          const apiUrl = getSyncApiUrl();
+          if (!apiUrl) {
+            tournamentCatalog.items = localTournaments;
+            return;
+          }
+          try {
+            const response = await fetch(`${apiUrl}/api/tournament-history`);
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || `Tournament history request failed (HTTP ${response.status})`);
+            const combined = new Map((result.tournaments || []).map(tournament => [String(tournament.id), {
+              ...tournament,
+              id: String(tournament.id),
+              name: tournament.name || tournament.data?.config?.name || 'Tournament',
+              date: tournament.date || tournament.data?.config?.date || '',
+              venue: tournament.data?.config?.venue || '',
+              phase: tournament.phase || tournament.data?.phase || 'setup'
+            }]));
+            localTournaments.forEach(tournament => {
+              if (tournament.id === String(state.tournamentId) || !combined.has(tournament.id)) {
+                combined.set(tournament.id, tournament);
+              }
+            });
+            tournamentCatalog.items = [...combined.values()];
+          } catch (err) {
+            tournamentCatalog.items = localTournaments;
+            tournamentCatalog.error = `Cloud tournament history could not be loaded: ${err.message}`;
+          }
+        })().finally(() => {
+          tournamentCatalog.loading = false;
+          tournamentCatalog.loaded = true;
+          tournamentCatalogPromise = null;
+        });
+        return tournamentCatalogPromise;
+      }
+
+      async function openTournamentFromCatalog(tournamentId) {
+        const id = String(tournamentId || '');
+        const tournament = tournamentCatalog.items.find(item => item.id === id);
+        if (!tournament) {
+          showToast('Tournament details are not available', 'error');
+          return;
+        }
+        try {
+          let data = tournament.data;
+          const apiUrl = getSyncApiUrl();
+          if (apiUrl) {
+            const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`);
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || `Tournament request failed (HTTP ${response.status})`);
+            if (result.exists && result.data) data = result.data;
+          }
+          if (!data || !data.config) throw new Error('Tournament data is incomplete');
+          const previous = registry.items[id];
+          const fresh = createDefaultState(id, tournament.name);
+          const restored = normalizeTournamentState({
+            ...data,
+            tournamentId: id,
+            phase: data.phase || tournament.phase || 'setup',
+            auth: { ...state.auth },
+            sync: { ...state.sync, ...(previous?.sync || {}) },
+            ui: { ...fresh.ui, activeTab: 'dashboard' }
+          }, id);
+          registry.items[id] = restored;
+          state = restored;
+          saveRegistry();
+          if (apiUrl) await pullFromTurso(true);
+          state.ui.activeTab = 'dashboard';
+          await navigateToPage('dashboard');
+        } catch (err) {
+          showToast(`Could not open tournament: ${err.message}`, 'error');
+        }
+      }
+
+      async function persistPlayerProfile(profile) {
+        const apiUrl = getSyncApiUrl();
+        const existing = playerData.profiles.find(item => samePlayerIdentity(item, profile));
+        let savedProfile = {
+          ...profile,
+          playerId: profile.playerId || existing?.playerId || createPlayerId(),
+          playerCode: profile.playerCode || existing?.playerCode || createPlayerCode(
+            new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean))
+          )
+        };
+        if (apiUrl) {
+          const response = await fetch(`${apiUrl}/api/players/${encodeURIComponent(profile.name)}`, {
+            method: 'PUT',
+            headers: getSyncHeaders(),
+            body: JSON.stringify(savedProfile)
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `Profile save failed (HTTP ${response.status})`);
+          savedProfile = result.player;
+        }
+        return cachePlayerProfile(savedProfile);
+      }
+
+      async function getPlayerImportDirectory() {
+        const apiUrl = getSyncApiUrl();
+        if (apiUrl) {
+          const response = await fetch(`${apiUrl}/api/player-import/directory`, {
+            credentials: 'same-origin',
+            headers: getSyncHeaders()
+          });
+          let result;
+          try { result = await response.json(); } catch (_err) {
+            throw new Error(`Unexpected response from player directory (HTTP ${response.status})`);
+          }
+          if (!response.ok) throw new Error(result.error || `Player directory request failed (HTTP ${response.status})`);
+          return {
+            profiles: Array.isArray(result.profiles) ? result.profiles : [],
+            rosterNames: Array.isArray(result.rosterNames) ? result.rosterNames : []
+          };
+        }
+
+        const profiles = getLocalPlayerProfiles();
+        const rosterNames = new Map();
+        const addName = name => {
+          const cleanName = String(name || '').trim();
+          const key = normalizeImportName(cleanName);
+          if (key && !rosterNames.has(key)) rosterNames.set(key, cleanName);
+        };
+        profiles.forEach(profile => addName(profile.name));
+        getLocalPlayerTournaments().forEach(tournament => {
+          const data = tournament.data || {};
+          (data.groups || []).forEach(group => (group.players || []).forEach(addName));
+          Object.values(data.qr2Pools || {}).forEach(pool => (pool || []).forEach(addName));
+        });
+        return { profiles, rosterNames: [...rosterNames.values()] };
+      }
+
+      async function getPlayerProfileDirectory() {
+        const apiUrl = getSyncApiUrl();
+        let profiles;
+        if (apiUrl) {
+          const response = await fetch(`${apiUrl}/api/players`);
+          let result;
+          try { result = await response.json(); } catch (_err) {
+            throw new Error(`Unexpected response from player profiles (HTTP ${response.status})`);
+          }
+          if (!response.ok) throw new Error(result.error || `Player profiles request failed (HTTP ${response.status})`);
+          profiles = Array.isArray(result.players) ? result.players : [];
+        } else {
+          profiles = getLocalPlayerProfiles();
+        }
+
+        const merged = [...profiles];
+        getLocalPlayerProfiles().forEach(profile => {
+          if (!merged.some(existing => samePlayerIdentity(existing, profile))) merged.push(profile);
+        });
+        playerData.profiles = merged;
+        return merged;
+      }
+
+      function addPlayerProfileToGroup(groupIndex, profile, skill) {
+        const group = state.groups[groupIndex];
+        const name = String(profile?.name || '').trim();
+        if (!group || !name || !isValidPlayerId(profile.playerId)) {
+          showToast('Choose a player profile with a valid player ID', 'error');
+          return false;
+        }
+        if (isPlayerProfileInRoster(profile)) {
+          showToast(`${profile.displayName || name} is already in this tournament`, 'error');
+          return false;
+        }
+
+        group.players.push(name);
+        setPlayerSkill(name, skill || 5);
+        if (!group.leader) group.leader = name;
+        [name, ...(Array.isArray(profile.aliases) ? profile.aliases : [])].forEach(alias => {
+          const key = normalizeImportName(alias);
+          if (key) state.playerProfileIds[key] = profile.playerId;
+        });
+        saveState();
+        render();
+        showToast(`Added ${profile.displayName || name} to ${group.name}`, 'success');
+        return true;
+      }
+
+      function isPlayerProfileInRoster(profile) {
+        return state.groups.some(group => group.players.some(name => {
+          const linkedId = state.playerProfileIds[normalizeImportName(name)];
+          return linkedId === profile.playerId || samePlayerIdentity(profile, { name });
+        }));
+      }
+
+      async function pushToTurso(silent) {
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
+        try {
+          state.sync.status = 'syncing';
+          const tid = encodeURIComponent(state.tournamentId || 'default');
+          const payload = { ...state, auth: { ...state.auth, loggedIn: false }, ui: { ...state.ui, bracketOpen: false } };
+          delete payload.sync;
+          const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, {
+            method: 'PUT',
+            headers: getSyncHeaders(),
+            body: JSON.stringify({ data: payload })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          if (data.playerProfileIds && typeof data.playerProfileIds === 'object' && !Array.isArray(data.playerProfileIds)) {
+            state.playerProfileIds = data.playerProfileIds;
+          }
+          state.sync.status = 'synced';
+          state.sync.lastSynced = data.updatedAt || new Date().toISOString();
+          saveRegistry();
+          const badge = document.getElementById('sync-status-pill');
+          if (badge) badge.textContent = 'Cloud Synced';
+          if (!silent) showToast('Saved to Turso DB', 'success');
+        } catch (err) {
+          state.sync.status = 'error';
+          const badge = document.getElementById('sync-status-pill');
+          if (badge) badge.textContent = 'Sync Error';
+          console.error('Cloud sync failed:', err);
+          if (!silent) {
+            const message = /invalid sync key/i.test(err.message)
+              ? 'Admin sync key rejected. Enter the same ADMIN_SYNC_KEY configured in the backend Cloud Sync settings.'
+              : `Cloud sync failed (${err.message}) — saved locally`;
+            showToast(message, 'error');
+          }
+        }
+      }
+
+      async function pullFromTurso(silent) {
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
+        try {
+          // Also fetch tournament list from Turso so switcher shows all DB tournaments
+          try {
+            const listRes = await fetch(`${apiUrl}/api/tournaments`);
+            if (listRes.ok) {
+              const listJson = await listRes.json();
+              (listJson.tournaments || []).forEach(t => {
+                if (!registry.items[t.id]) {
+                  registry.items[t.id] = createDefaultState(t.id, t.name);
+                  registry.items[t.id].config.date = t.date || registry.items[t.id].config.date;
+                  registry.items[t.id].config.venue = t.venue || registry.items[t.id].config.venue;
+                  registry.items[t.id].phase = t.phase || 'setup';
+                  registry.items[t.id].sync = { ...state.sync };
+                }
+              });
+            }
+          } catch (e) {}
+
+          const tid = encodeURIComponent(state.tournamentId || 'default');
+          const res = await fetch(`${apiUrl}/api/tournaments/${tid}`);
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+          if (json && json.exists && json.data) {
+            const keepAuth = state.auth;
+            const keepUi = state.ui;
+            const keepSync = state.sync;
+            state = normalizeTournamentState({ ...json.data, tournamentId: state.tournamentId, auth: keepAuth, ui: keepUi, sync: { ...keepSync, status: 'synced', lastSynced: json.updatedAt || new Date().toISOString() } }, state.tournamentId);
+            saveRegistry();
+            render();
+            if (!silent) showToast('Loaded tournament from Turso DB', 'success');
+          } else {
+            state.sync.status = 'synced';
+            saveRegistry();
+            if (!silent) showToast('Connected to Turso DB (new tournament — push to save)', 'success');
+          }
+        } catch (err) {
+          state.sync.status = 'error';
+          console.error('Could not pull tournament from backend:', err);
+          if (!silent) showToast(`Could not load from backend (${err.message})`, 'error');
+        }
+      }
+
+      async function syncCheckInToServer(playerName, groupName, skill, checkedIn, time, source, walkIn) {
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
+        try {
+          const tid = encodeURIComponent(state.tournamentId || 'default');
+          await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ playerName, groupName, skill, checkedIn, time, source, walkIn })
+          });
+        } catch (e) {}
+      }
+
+      function switchTournament(id) {
+        tournamentCatalog.loaded = false;
+        saveRegistry();
+        const next = registry.items[id];
+        if (!next) return;
+        const keepAuth = state.auth;
+        const keepSync = state.sync;
+        state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey } }, id);
+        state.ui.activeTab = getRequestedPage();
+        if (state.auth.role === 'guest' && state.ui.activeTab === 'setup') state.ui.activeTab = 'dashboard';
+        saveRegistry();
+        render();
+        if (getSyncApiUrl()) {
+          pullFromTurso(true);
+        }
+      }
+
+      async function createNewTournament(name, date, venue) {
+        tournamentCatalog.loaded = false;
+        saveRegistry();
+        const id = 't_' + Date.now();
+        const fresh = createDefaultState(id, name || 'New Badminton Tournament');
+        if (date) fresh.config.date = date;
+        if (venue) fresh.config.venue = venue;
+        fresh.auth = { ...state.auth };
+        fresh.sync = { ...state.sync };
+        fresh.ui.activeTab = state.auth.role === 'admin' ? 'setup' : 'dashboard';
+        registry.items[id] = fresh;
+        state = fresh;
+        saveRegistry();
+        if (getSyncApiUrl()) await pushToTurso(true);
+        await navigateToPage(state.ui.activeTab);
+      }
+
+      async function deleteTournament(id) {
+        tournamentCatalog.loaded = false;
+        const keys = Object.keys(registry.items);
+        if (keys.length <= 1) {
+          showToast('Keep at least one tournament', 'error');
+          return;
+        }
+        delete registry.items[id];
+        const nextId = Object.keys(registry.items)[0];
+        const keepAuth = state.auth;
+        const keepSync = state.sync;
+        state = normalizeTournamentState({ ...registry.items[nextId], auth: keepAuth, sync: keepSync }, nextId);
+        state.ui.activeTab = getRequestedPage();
+        saveRegistry();
+        render();
+        const apiUrl = getSyncApiUrl();
+        if (apiUrl) {
+          try {
+            await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`, { method: 'DELETE', headers: getSyncHeaders() });
+          } catch (e) {}
+        }
+        showToast('Tournament deleted', 'success');
+      }
+
+      function saveState() {
+        tournamentCatalog.loaded = false;
+        const apiUrl = getSyncApiUrl();
+        if (apiUrl) state.sync.status = 'pending';
+        saveRegistry();
+        if (playerData.loaded) {
+          const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
+          tournaments.set(String(state.tournamentId), { id: String(state.tournamentId), data: state });
+          playerData.tournaments = [...tournaments.values()];
+        }
+        if (apiUrl) {
+          clearTimeout(syncTimer);
+          syncTimer = setTimeout(() => { pushToTurso(true); }, 600);
+        }
+      }
+
+      function loadTheme() {
+        try {
+          return localStorage.getItem(THEME_KEY) || 'dark';
+        } catch (e) {
+          return 'dark';
+        }
+      }
+
+      function applyTheme(mode) {
+        themeMode = mode;
+        try { localStorage.setItem(THEME_KEY, mode); } catch (e) {}
+        const root = document.documentElement;
+        const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const isDark = mode === 'dark' || (mode === 'system' && prefersDark);
+        root.classList.toggle('dark', isDark);
+      }
+
+      applyTheme(themeMode);
+
+      function showToast(message, type) {
+        const container = document.getElementById('toast-container');
+        const el = document.createElement('div');
+        const colors = type === 'error'
+          ? 'bg-red-600 text-white'
+          : type === 'success'
+            ? 'bg-emerald-600 text-white'
+            : 'bg-stone-800 text-white dark:bg-stone-200 dark:text-stone-900';
+        el.className = `pointer-events-auto px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium transition-all duration-200 ${colors}`;
+        el.textContent = message;
+        container.appendChild(el);
+        setTimeout(() => {
+          el.classList.add('opacity-0', 'translate-y-1');
+          setTimeout(() => el.remove(), 220);
+        }, 2800);
+      }
+
+      function openModal(html) {
+        const root = document.getElementById('modal-root');
+        root.innerHTML = html;
+        root.classList.remove('hidden');
+        root.classList.add('flex');
+      }
+
+      function closeModal() {
+        const root = document.getElementById('modal-root');
+        root.classList.add('hidden');
+        root.classList.remove('flex');
+        root.innerHTML = '';
+      }
+
+      function esc(str) {
+        return String(str ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      const POOL_ACCENTS = {
+        A: 'text-gold-600 dark:text-gold-400',
+        B: 'text-purple-600 dark:text-purple-400',
+        C: 'text-sky-600 dark:text-sky-400',
+        D: 'text-emerald-600 dark:text-emerald-400',
+        E: 'text-rose-600 dark:text-rose-400',
+        F: 'text-orange-600 dark:text-orange-400'
+      };
+      function getPoolAccent(poolKey) {
+        return POOL_ACCENTS[poolKey] || 'text-gold-600 dark:text-gold-400';
+      }
+      function getConfiguredPoolKeys() {
+        const count = Math.max(2, Math.min(6, Number(state.config.qr2PoolsCount) || 2));
+        return 'ABCDEF'.slice(0, count).split('');
+      }
+      function getActiveQR2PoolKeys() {
+        const keys = Object.keys(state.qr2Pools || {}).filter(k => (state.qr2Pools[k] && state.qr2Pools[k].length > 0) || (state.qr2Matches[k] && state.qr2Matches[k].length > 0));
+        return keys.length > 0 ? keys : Object.keys(state.qr2Pools || { A: [], B: [] });
+      }
+      function getPoolFinalFormat(poolKey) {
+        if (state.config.poolFinalFormats && state.config.poolFinalFormats[poolKey]) return state.config.poolFinalFormats[poolKey];
+        if (poolKey === 'A') return state.config.poolAFinalFormat || 'bo3';
+        if (poolKey === 'B') return state.config.poolBFinalFormat || 'single';
+        return 'single';
+      }
+
+      const TIEBREAKER_LABELS = {
+        wp: 'Win Points (WP)',
+        wins: 'Most Wins',
+        pf: 'Points For (PF)',
+        pa: 'Fewest Points Against (PA)',
+        diff: 'Point Differential (PF-PA)'
+      };
+      function getRankingFormulaText() {
+        const rk = state.config.ranking || { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1 };
+        return `WP = Wins × ${rk.winPointsWeight} + (${rk.winMarginWeight} × win margins) − (${rk.lossMarginWeight} × loss margins)`;
+      }
+      function getTiebreakerText() {
+        const order = state.config.ranking?.tiebreakers || ['wp', 'wins', 'pf', 'pa'];
+        return order.map(k => TIEBREAKER_LABELS[k] || k).join(' → ');
+      }
+      function resizeTotalPlayers(targetTotal, rerender) {
+        const total = Math.max(state.groups.length * 3, Math.min(80, targetTotal));
+        const gCount = state.groups.length;
+        const base = Math.floor(total / gCount);
+        const rem = total % gCount;
+        state.config.playersPerGroup = Math.ceil(total / gCount);
+        state.groups.forEach((g, gi) => {
+          const desired = base + (gi < rem ? 1 : 0);
+          while (g.players.length < desired) {
+            g.players.push(`Player ${g.id}${g.players.length + 1}`);
+          }
+          if (g.players.length > desired) {
+            g.players = g.players.slice(0, desired);
+          }
+          if (!g.players.includes(g.leader)) {
+            g.leader = g.players[0] || '';
+          }
+        });
+        saveState();
+        if (rerender !== false) render();
+      }
+
+      // Generate balanced schedule for a list of players with target matchesPerPlayer
+      function generateGroupSchedule(players, matchesPerPlayer, groupId, roundPrefix) {
+        const n = players.length;
+        const allPairs = [];
+        for (let i = 0; i < n; i++) {
+          for (let j = i + 1; j < n; j++) {
+            allPairs.push([players[i], players[j]]);
+          }
+        }
+        // Shuffle deterministically-ish for variety
+        for (let i = allPairs.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [allPairs[i], allPairs[j]] = [allPairs[j], allPairs[i]];
+        }
+
+        const targetTotal = Math.min(allPairs.length, Math.floor((n * matchesPerPlayer) / 2));
+        const counts = Object.fromEntries(players.map(p => [p, 0]));
+        const selected = [];
+
+        // Greedy selection balancing match counts per player
+        const remaining = [...allPairs];
+        while (selected.length < targetTotal && remaining.length > 0) {
+          remaining.sort((a, b) => (counts[a[0]] + counts[a[1]]) - (counts[b[0]] + counts[b[1]]));
+          const pair = remaining.shift();
+          selected.push(pair);
+          counts[pair[0]]++;
+          counts[pair[1]]++;
+        }
+
+        return selected.map((pair, idx) => ({
+          id: `${roundPrefix}-${groupId}-${idx + 1}`,
+          groupId,
+          p1: pair[0],
+          p2: pair[1],
+          s1: null,
+          s2: null,
+          completed: false
+        }));
+      }
+
+      function isValidSingleScore(s1, s2, pointsToWin, deuceCap) {
+        if (!Number.isInteger(s1) || !Number.isInteger(s2) || s1 < 0 || s2 < 0) return false;
+        if (s1 === s2) return false;
+        const hi = Math.max(s1, s2);
+        const lo = Math.min(s1, s2);
+        if (hi < pointsToWin || hi > deuceCap) return false;
+        if (hi === pointsToWin && hi - lo >= 2) return true;
+        if (hi > pointsToWin && hi < deuceCap && hi - lo === 2) return true;
+        if (hi === deuceCap && hi - lo >= 1) return true;
+        return false;
+      }
+
+      // Ranking formula: WP = Wins * 20 + sum(win margins) - sum(loss margins)
+      function computeStandings(players, matches) {
+        const stats = {};
+        players.forEach(p => {
+          stats[p] = {
+            player: p,
+            played: 0,
+            wins: 0,
+            losses: 0,
+            pf: 0,
+            pa: 0,
+            winMargins: 0,
+            lossMargins: 0,
+            wp: 0,
+            tiedFlag: false
+          };
+        });
+
+        matches.forEach(m => {
+          if (!m.completed) return;
+          const a = stats[m.p1];
+          const b = stats[m.p2];
+          if (!a || !b) return;
+          a.played++; b.played++;
+          a.pf += m.s1; a.pa += m.s2;
+          b.pf += m.s2; b.pa += m.s1;
+          if (m.s1 > m.s2) {
+            a.wins++; b.losses++;
+            a.winMargins += (m.s1 - m.s2);
+            b.lossMargins += (m.s1 - m.s2);
+          } else {
+            b.wins++; a.losses++;
+            b.winMargins += (m.s2 - m.s1);
+            a.lossMargins += (m.s2 - m.s1);
+          }
+        });
+
+        const rk = state.config.ranking || { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
+        const wPts = Number(rk.winPointsWeight ?? 20);
+        const wWinM = Number(rk.winMarginWeight ?? 1);
+        const wLossM = Number(rk.lossMarginWeight ?? 1);
+        const order = Array.isArray(rk.tiebreakers) && rk.tiebreakers.length ? rk.tiebreakers : ['wp', 'wins', 'pf', 'pa'];
+
+        const rows = Object.values(stats).map(r => ({
+          ...r,
+          diff: r.pf - r.pa,
+          wp: r.wins * wPts + r.winMargins * wWinM - r.lossMargins * wLossM
+        }));
+
+        const metricVal = (r, key) => {
+          if (key === 'wp') return r.wp;
+          if (key === 'wins') return r.wins;
+          if (key === 'pf') return r.pf;
+          if (key === 'pa') return -r.pa; // fewer points against is better
+          if (key === 'diff') return r.diff;
+          return 0;
+        };
+
+        rows.sort((a, b) => {
+          for (const key of order) {
+            const diff = metricVal(b, key) - metricVal(a, key);
+            if (diff !== 0) return diff;
+          }
+          return a.player.localeCompare(b.player);
+        });
+
+        for (let i = 0; i < rows.length - 1; i++) {
+          const x = rows[i], y = rows[i + 1];
+          if (x.played > 0 && order.every(k => metricVal(x, k) === metricVal(y, k))) {
+            x.tiedFlag = true;
+            y.tiedFlag = true;
+          }
+        }
+        return rows;
+      }
+
+      function randomValidScore() {
+        const win = state.config.pointsToWin;
+        const cap = state.config.deuceCap;
+        const p1Wins = Math.random() > 0.5;
+        let hi = win;
+        let lo = Math.floor(Math.random() * (win - 3));
+        if (Math.random() < 0.18) {
+          lo = win - 1;
+          hi = Math.min(cap, win + 1);
+          if (hi === cap && Math.random() > 0.5) lo = cap - 1;
+        }
+        return p1Wins ? [hi, lo] : [lo, hi];
+      }
+
+      // Actions
+      function loginAdmin(pin) {
+        if (pin === state.auth.pin) {
+          state.auth.loggedIn = true;
+          state.auth.role = 'admin';
+          saveState();
+          render();
+          showToast('Signed in as Admin', 'success');
+        } else {
+          showToast('Incorrect Admin PIN', 'error');
+        }
+      }
+
+      function loginGuest() {
+        state.auth.loggedIn = true;
+        state.auth.role = 'guest';
+        if (state.ui.activeTab === 'setup') {
+          state.ui.activeTab = state.phase === 'setup' ? 'dashboard' : state.phase;
+        }
+        saveState();
+        if (state.ui.activeTab !== getRequestedPage()) {
+          window.location.replace(getPageUrl(state.ui.activeTab));
+          return;
+        }
+        render();
+      }
+
+      function logout() {
+        state.auth.loggedIn = false;
+        saveState();
+        render();
+      }
+
+      function sortGroupsByName() {
+        state.groups.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+      }
+
+      function syncGroupCount(newCount, rerender) {
+        const count = Math.max(2, Math.min(8, newCount));
+        state.config.numGroups = count;
+        const letters = 'ABCDEFGH'.split('');
+        while (state.groups.length < count) {
+          const usedIds = new Set(state.groups.map(g => g.id));
+          const usedNames = new Set(state.groups.map(g => g.name.trim().toLowerCase()));
+          const id = letters.find(l => !usedIds.has(l) && !usedNames.has(`group ${l.toLowerCase()}`))
+            || letters.find(l => !usedIds.has(l))
+            || String(state.groups.length + 1);
+          let name = `Group ${id}`;
+          let suffix = 2;
+          while (usedNames.has(name.toLowerCase())) {
+            name = `Group ${id} (${suffix++})`;
+          }
+          const players = Array.from({ length: state.config.playersPerGroup }, (_, i) => `Player ${id}${i + 1}`);
+          state.groups.push({ id, name, leader: players[0], players });
+        }
+        if (state.groups.length > count) {
+          state.groups = state.groups.slice(0, count);
+        }
+        sortGroupsByName();
+        saveState();
+        if (rerender !== false) render();
+      }
+
+      function startTournament() {
+        if (state.auth.role !== 'admin') return;
+        for (const g of state.groups) {
+          if (g.players.length < 3) {
+            showToast(`${g.name} needs at least 3 players`, 'error');
+            return;
+          }
+          if (!g.leader || !g.players.includes(g.leader)) {
+            showToast(`${g.name} needs a designated leader`, 'error');
+            return;
+          }
+        }
+        const qr1 = [];
+        state.groups.forEach(g => {
+          const sched = generateGroupSchedule(g.players, state.config.matchesPerPlayer, g.id, 'QR1');
+          qr1.push(...sched);
+        });
+        state.qr1Matches = qr1;
+        state.qr2Pools = { A: [], B: [] };
+        state.qr2Matches = { A: [], B: [] };
+        state.semis = { A: [], B: [] };
+        state.finals = { A: null, B: null };
+        state.phase = 'qr1';
+        state.ui.activeTab = 'qr1';
+        state.ui.qr1GroupFilter = 'ALL';
+        saveState();
+        navigateToPage('qr1');
+      }
+
+      function advanceToQR2() {
+        if (state.qr1Matches.some(m => !m.completed)) {
+          showToast('Complete all QR1 matches before advancing', 'error');
+          return;
+        }
+        const poolKeys = getConfiguredPoolKeys();
+        const pools = {};
+        poolKeys.forEach(k => { pools[k] = []; });
+
+        state.groups.forEach(g => {
+          const gMatches = state.qr1Matches.filter(m => m.groupId === g.id);
+          const standings = computeStandings(g.players, gMatches);
+          const topN = Math.min(state.config.advanceTopN, standings.length);
+          standings.slice(0, topN).forEach(r => pools.A.push(r.player));
+          const rest = standings.slice(topN).map(r => r.player);
+          const otherKeys = poolKeys.slice(1);
+          if (otherKeys.length === 1) {
+            pools[otherKeys[0]].push(...rest);
+          } else if (otherKeys.length > 1) {
+            const perTier = Math.max(1, Math.ceil(rest.length / otherKeys.length));
+            rest.forEach((p, idx) => {
+              const targetIdx = Math.min(otherKeys.length - 1, Math.floor(idx / perTier));
+              pools[otherKeys[targetIdx]].push(p);
+            });
+          }
+        });
+
+        const matches = {};
+        poolKeys.forEach(k => {
+          matches[k] = pools[k].length >= 2
+            ? generateGroupSchedule(pools[k], state.config.matchesPerPlayer, `Pool${k}`, `QR2${k}`)
+            : [];
+        });
+        state.qr2Pools = pools;
+        state.qr2Matches = matches;
+        state.phase = 'qr2';
+        state.ui.activeTab = 'qr2';
+        saveState();
+        navigateToPage('qr2');
+      }
+
+      function addQR2Pool(poolKey, playerNames, sourcePoolKeysToRegen) {
+        state.qr2Pools[poolKey] = playerNames;
+        state.qr2Matches[poolKey] = playerNames.length >= 2
+          ? generateGroupSchedule(playerNames, state.config.matchesPerPlayer, `Pool${poolKey}`, `QR2${poolKey}`)
+          : [];
+        (sourcePoolKeysToRegen || []).forEach(k => {
+          state.qr2Matches[k] = state.qr2Pools[k].length >= 2
+            ? generateGroupSchedule(state.qr2Pools[k], state.config.matchesPerPlayer, `Pool${k}`, `QR2${k}`)
+            : [];
+        });
+        state.config.qr2PoolsCount = Math.max(Number(state.config.qr2PoolsCount) || 2, Object.keys(state.qr2Pools).length);
+        saveState();
+        render();
+      }
+
+      function advanceToSemis() {
+        const poolKeys = getActiveQR2PoolKeys().filter(k => (state.qr2Pools[k] || []).length >= 2);
+        const allDone = poolKeys.every(k => (state.qr2Matches[k] || []).every(m => m.completed));
+        if (!allDone) {
+          showToast('Complete all QR2 matches across all pools first', 'error');
+          return;
+        }
+        const buildPoolSemis = (poolKey) => {
+          const standings = computeStandings(state.qr2Pools[poolKey] || [], state.qr2Matches[poolKey] || []);
+          const slots = Math.min(state.config.semiFinalSlots, standings.length);
+          const top = standings.slice(0, slots).map(r => r.player);
+          if (top.length >= 8) {
+            return [
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: `${top[0]} & ${top[7]}`, t2: `${top[3]} & ${top[4]}`, s1: null, s2: null, completed: false },
+              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: `${top[1]} & ${top[6]}`, t2: `${top[2]} & ${top[5]}`, s1: null, s2: null, completed: false }
+            ];
+          } else if (top.length >= 4) {
+            return [
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0], t2: top[3], s1: null, s2: null, completed: false },
+              { id: `SF-${poolKey}-2`, pool: poolKey, label: 'Semi-Final 2', t1: top[1], t2: top[2], s1: null, s2: null, completed: false }
+            ];
+          } else {
+            return [
+              { id: `SF-${poolKey}-1`, pool: poolKey, label: 'Semi-Final 1', t1: top[0] || 'Seed 1', t2: top[1] || 'Seed 2', s1: null, s2: null, completed: false }
+            ];
+          }
+        };
+        const nextSemis = {};
+        poolKeys.forEach(k => { nextSemis[k] = buildPoolSemis(k); });
+        state.semis = nextSemis;
+        state.phase = 'semis';
+        state.ui.activeTab = 'semis';
+        saveState();
+        navigateToPage('semis');
+      }
+
+      function advanceToFinals() {
+        const poolKeys = Object.keys(state.semis).filter(k => (state.semis[k] || []).length > 0);
+        const allDone = poolKeys.every(k => state.semis[k].every(m => m.completed));
+        if (!allDone) {
+          showToast('Complete all Semi-Final matches first', 'error');
+          return;
+        }
+        const getWinner = (m) => (m.s1 > m.s2 ? m.t1 : m.t2);
+        const makeFinal = (poolKey, format) => {
+          const ms = state.semis[poolKey] || [];
+          const t1 = ms[0] ? getWinner(ms[0]) : 'TBD';
+          const t2 = ms[1] ? getWinner(ms[1]) : 'TBD';
+          return {
+            id: `FINAL-${poolKey}`,
+            pool: poolKey,
+            format,
+            t1,
+            t2,
+            games: format === 'bo3' ? [{ s1: null, s2: null }, { s1: null, s2: null }, { s1: null, s2: null }] : [{ s1: null, s2: null }],
+            completed: false,
+            winner: null
+          };
+        };
+        const nextFinals = {};
+        poolKeys.forEach(k => { nextFinals[k] = makeFinal(k, getPoolFinalFormat(k)); });
+        state.finals = nextFinals;
+        state.phase = 'finals';
+        state.ui.activeTab = 'finals';
+        saveState();
+        navigateToPage('finals');
+      }
+
+      function simulateMatches(list) {
+        list.forEach(m => {
+          if (!m.completed) {
+            const [s1, s2] = randomValidScore();
+            m.s1 = s1; m.s2 = s2; m.completed = true; m.completedAt = new Date().toISOString();
+          }
+        });
+        saveState();
+        render();
+        showToast('Simulated remaining matches', 'success');
+      }
+
+      // Compute overall KPIs
+      function getStatsSummary() {
+        const totalPlayers = state.groups.reduce((sum, g) => sum + g.players.length, 0);
+        const qr1Total = state.qr1Matches.length;
+        const qr1Done = state.qr1Matches.filter(m => m.completed).length;
+        const allQr2 = Object.values(state.qr2Matches || {}).flat();
+        const qr2Total = allQr2.length;
+        const qr2Done = allQr2.filter(m => m.completed).length;
+        const allSemis = Object.values(state.semis || {}).flat();
+        const semiTotal = allSemis.length;
+        const semiDone = allSemis.filter(m => m.completed).length;
+        const allFinals = Object.values(state.finals || {}).filter(Boolean);
+        const finalTotal = allFinals.length;
+        const finalDone = allFinals.filter(f => f.completed).length;
+        const total = qr1Total + qr2Total + semiTotal + finalTotal;
+        const done = qr1Done + qr2Done + semiDone + finalDone;
+        const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+        return { totalPlayers, qr1Total, qr1Done, qr2Total, qr2Done, semiTotal, semiDone, finalTotal, finalDone, total, done, pct };
+      }
+
+      function getPlayerSkill(name) {
+        const val = Number(state.playerSkills?.[name]);
+        return Number.isFinite(val) && val >= 1 && val <= 10 ? Math.round(val) : 5;
+      }
+
+      function setPlayerSkill(name, val) {
+        if (!state.playerSkills) state.playerSkills = {};
+        const clamped = Math.max(1, Math.min(10, Math.round(Number(val) || 5)));
+        state.playerSkills[name] = clamped;
+      }
+
+      function getAllImportedPlayers() {
+        const list = [];
+        state.groups.forEach((g, gi) => {
+          g.players.forEach((p, pi) => {
+            list.push({ name: p, group: g.name, groupIndex: gi, playerIndex: pi, isLeader: g.leader === p });
+          });
+        });
+        return list;
+      }
+
+      function renamePlayerEverywhere(gi, pi, rawNewName) {
+        const oldName = state.groups[gi].players[pi];
+        const newName = (rawNewName || '').trim();
+        if (!newName || newName === oldName) return false;
+        state.groups[gi].players[pi] = newName;
+        if (state.groups[gi].leader === oldName) state.groups[gi].leader = newName;
+        if (state.playerSkills && state.playerSkills[oldName] !== undefined) {
+          state.playerSkills[newName] = state.playerSkills[oldName];
+          delete state.playerSkills[oldName];
+        }
+        if (state.checkIns && state.checkIns[oldName]) {
+          state.checkIns[newName] = state.checkIns[oldName];
+          delete state.checkIns[oldName];
+        }
+        const replaceTeamName = (str) => {
+          if (!str) return str;
+          if (str === oldName) return newName;
+          return str.split(' & ').map(part => part === oldName ? newName : part).join(' & ');
+        };
+        (state.qr1Matches || []).forEach(m => {
+          if (m.p1 === oldName) m.p1 = newName;
+          if (m.p2 === oldName) m.p2 = newName;
+        });
+        Object.keys(state.qr2Pools || {}).forEach(k => {
+          state.qr2Pools[k] = (state.qr2Pools[k] || []).map(p => p === oldName ? newName : p);
+        });
+        Object.keys(state.qr2Matches || {}).forEach(k => {
+          (state.qr2Matches[k] || []).forEach(m => {
+            if (m.p1 === oldName) m.p1 = newName;
+            if (m.p2 === oldName) m.p2 = newName;
+          });
+        });
+        Object.keys(state.semis || {}).forEach(k => {
+          (state.semis[k] || []).forEach(m => {
+            m.t1 = replaceTeamName(m.t1);
+            m.t2 = replaceTeamName(m.t2);
+          });
+        });
+        Object.keys(state.finals || {}).forEach(k => {
+          const f = state.finals[k];
+          if (!f) return;
+          f.t1 = replaceTeamName(f.t1);
+          f.t2 = replaceTeamName(f.t2);
+          f.winner = replaceTeamName(f.winner);
+        });
+        return true;
+      }
+
+      function markPlayerCheckedIn(name, source, walkIn, checkedInAt) {
+        if (!state.checkIns) state.checkIns = {};
+        const time = checkedInAt || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        state.checkIns[name] = { checkedIn: true, time, source: source || 'qr' };
+        if (state.auth.role === 'player') {
+          saveRegistry();
+          return;
+        }
+        saveState();
+        const grp = state.groups.find(g => g.players.includes(name));
+        syncCheckInToServer(name, grp ? grp.name : null, getPlayerSkill(name), true, time, source || 'qr', Boolean(walkIn));
+      }
+
+      window.addEventListener('hashchange', () => {
+        if (window.location.hash === '#checkin') {
+          state.ui.playerCheckInMode = true;
+          render();
+        }
+      });
+
+      // Renderers
+      function render() {
+        const app = document.getElementById('app');
+        if (state.ui.playerCheckInMode) {
+          app.innerHTML = renderPlayerCheckInScreen();
+          if (state.auth.role === 'player') bindReadOnlyPlayerCheckInEvents();
+          else bindPlayerCheckInEvents();
+          return;
+        }
+        if (!state.auth.loggedIn) {
+          app.innerHTML = renderLoginScreen();
+          bindLoginEvents();
+          return;
+        }
+        app.innerHTML = `
+          ${renderHeader()}
+          ${renderNavTabs()}
+          <main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 ${state.auth.role === 'player' ? 'player-read-only' : ''}">
+            ${renderActiveView()}
+          </main>
+          ${state.ui.bracketOpen ? renderBracketOverlay() : ''}
+        `;
+        if (state.auth.role === 'player') {
+          applyPlayerReadOnlyControls();
+          bindPlayerAppEvents();
+        } else {
+          bindAppEvents();
+        }
+      }
+
+      function renderThemeSwitcher() {
+        const btn = (mode, label) => {
+          const active = themeMode === mode;
+          return `<button data-theme-btn="${mode}" class="px-2.5 py-1 text-xs font-medium rounded-md transition ${active ? 'bg-gold-500 text-stone-950 shadow-sm' : 'text-stone-600 dark:text-stone-300 hover:bg-stone-200/70 dark:hover:bg-stone-700/60'}">${label}</button>`;
+        };
+        return `
+          <div class="inline-flex items-center p-0.5 rounded-lg bg-cream-200/80 dark:bg-stone-800 border border-stone-300/70 dark:border-stone-700">
+            ${btn('light', 'Light')}
+            ${btn('dark', 'Dark')}
+            ${btn('system', 'System')}
+          </div>
+        `;
+      }
+
+      function renderLoginScreen() {
+        const inviteForm = playerInviteContext ? `
+          <form id="player-register-form" class="mt-4 border-t border-stone-200 dark:border-stone-800 pt-4 space-y-3">
+            <h2 class="text-sm font-bold">Create Player Account</h2>
+            ${playerInviteContext.invite.targetName ? `
+              <div>
+                <label for="register-player-name" class="block text-xs font-semibold text-stone-500 mb-1">Full name</label>
+                <input id="register-player-name" type="text" readonly value="${esc(playerInviteContext.invite.targetName)}" class="w-full px-3 py-2 rounded-lg bg-stone-100 dark:bg-stone-800 border border-stone-300 dark:border-stone-700 text-sm" />
+              </div>
+            ` : `
+              <div>
+                <label for="register-player-type" class="block text-xs font-semibold text-stone-500 mb-1">Player identity</label>
+                <select id="register-player-type" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                  <option value="existing" ${playerInviteContext.roster.length ? '' : 'disabled'}>I am an existing roster player</option>
+                  <option value="new" ${playerInviteContext.roster.length ? '' : 'selected'}>Create a new player profile</option>
+                </select>
+              </div>
+              <div id="register-existing-player-wrap">
+                <label for="register-existing-player" class="block text-xs font-semibold text-stone-500 mb-1">Roster player</label>
+                <select id="register-existing-player" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                  ${playerInviteContext.roster.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}
+                </select>
+              </div>
+              <div id="register-new-player-wrap" class="hidden">
+                <label for="register-new-player" class="block text-xs font-semibold text-stone-500 mb-1">Full name</label>
+                <input id="register-new-player" type="text" maxlength="120" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+              </div>
+              ${playerInviteContext.roster.length === 0 ? '<p class="text-[11px] text-stone-500">No unclaimed roster players are available; choose a new profile.</p>' : ''}
+            `}
+            <div>
+              <label for="register-player-email" class="block text-xs font-semibold text-stone-500 mb-1">Email address</label>
+              <input id="register-player-email" type="email" maxlength="254" required value="${esc(playerInviteContext.invite.targetEmail)}" ${playerInviteContext.invite.targetEmail ? 'readonly' : ''} class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+            </div>
+            <div>
+              <label for="register-player-password" class="block text-xs font-semibold text-stone-500 mb-1">Password (12+ characters)</label>
+              <input id="register-player-password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+            </div>
+            <div>
+              <label for="register-player-password-confirm" class="block text-xs font-semibold text-stone-500 mb-1">Confirm password</label>
+              <input id="register-player-password-confirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+            </div>
+            <p id="player-register-error" role="alert" class="${playerInviteError ? '' : 'hidden'} text-xs text-red-600 dark:text-red-400">${esc(playerInviteError)}</p>
+            <button type="submit" class="w-full py-2.5 px-4 rounded-xl bg-gold-500 hover:bg-gold-400 text-stone-950 font-semibold text-sm">Create Player Account</button>
+          </form>
+        ` : '';
+        return `
+          <div class="min-h-screen flex flex-col items-center justify-center p-4">
+            <div class="absolute top-4 right-4">${renderThemeSwitcher()}</div>
+            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 sm:p-8">
+              <div class="flex items-center gap-3 mb-6">
+                <div class="w-11 h-11 rounded-xl bg-gold-500/15 border border-gold-500/30 flex items-center justify-center text-gold-600 dark:text-gold-400">
+                  <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <circle cx="10" cy="10" r="6"/><path d="M14.5 14.5L20 20"/><path d="M7 7l6 6M13 7l-6 6"/>
+                  </svg>
+                </div>
+                <div>
+                  <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">Tournament Manager Login</p>
+                </div>
+              </div>
+
+              <form id="login-form" class="space-y-4">
+                <div>
+                  <label class="block text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">4-Digit Admin PIN</label>
+                  <input id="pin-input" type="password" inputmode="numeric" maxlength="4" placeholder="••••"
+                    class="w-full px-4 py-2.5 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-center text-lg tracking-[0.4em] font-semibold focus:outline-none focus:ring-2 focus:ring-gold-500" />
+                </div>
+                <button type="submit" class="w-full py-2.5 px-4 rounded-xl bg-gold-500 hover:bg-gold-400 text-stone-950 font-semibold text-sm transition shadow-sm">
+                  Enter as Admin
+                </button>
+              </form>
+
+              <div class="relative my-5 flex items-center">
+                <div class="flex-grow border-t border-stone-200 dark:border-stone-800"></div>
+                <span class="px-3 text-xs text-stone-400">or</span>
+                <div class="flex-grow border-t border-stone-200 dark:border-stone-800"></div>
+              </div>
+
+              <div class="space-y-2.5">
+                <details ${playerInviteContext ? 'open' : ''} class="rounded-xl border border-stone-200 dark:border-stone-800 p-3">
+                  <summary class="cursor-pointer text-sm font-semibold">Player Login</summary>
+                  <form id="player-login-form" class="pt-3 space-y-3">
+                    <div>
+                      <label for="player-login-email" class="block text-xs font-semibold text-stone-500 mb-1">Email</label>
+                      <input id="player-login-email" type="email" required autocomplete="username" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                    </div>
+                    <div>
+                      <label for="player-login-password" class="block text-xs font-semibold text-stone-500 mb-1">Password</label>
+                      <input id="player-login-password" type="password" required autocomplete="current-password" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                    </div>
+                    <p id="player-login-error" role="alert" class="${playerAuthError ? '' : 'hidden'} text-xs text-red-600 dark:text-red-400">${esc(playerAuthError)}</p>
+                    <button type="submit" class="w-full py-2.5 px-4 rounded-xl bg-gold-500 hover:bg-gold-400 text-stone-950 font-semibold text-sm">Sign In as Player</button>
+                  </form>
+                  ${inviteForm}
+                  ${!playerInviteContext ? '<p class="text-[11px] text-stone-500 mt-2">Player registration requires an invitation link from an administrator.</p>' : ''}
+                  ${!playerInviteContext && playerInviteError ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(playerInviteError)}</p>` : ''}
+                </details>
+                <button id="guest-btn" class="w-full py-2.5 px-4 rounded-xl border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 font-medium text-sm transition">
+                  Continue as Guest (View Only)
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderHeader() {
+        const isAdmin = state.auth.role === 'admin';
+        const roleLabel = isAdmin ? 'Admin' : state.auth.role === 'player' ? 'Player' : 'Guest';
+        const phaseLabels = { setup: 'Setup', qr1: 'Qualifier R1', qr2: 'Qualifier R2', semis: 'Semi-Finals', finals: 'Finals', completed: 'Completed' };
+        return `
+          <header class="border-b border-stone-200 dark:border-stone-800 bg-white/90 dark:bg-[#17191D]/90 backdrop-blur sticky top-0 z-30">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+              <div class="flex items-center gap-3 flex-wrap">
+                <div class="w-9 h-9 rounded-lg bg-gold-500/15 border border-gold-500/30 flex items-center justify-center text-gold-600 dark:text-gold-400 shrink-0">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <circle cx="10" cy="10" r="6"/><path d="M14.5 14.5L20 20"/>
+                  </svg>
+                </div>
+                <select id="tournament-switcher" aria-label="Switch current tournament" class="font-bold text-sm sm:text-base tracking-tight bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 rounded-lg px-2.5 py-1 max-w-[240px] sm:max-w-xs truncate">
+                  ${Object.values(registry.items).map(t => `<option value="${esc(t.tournamentId)}" ${t.tournamentId === state.tournamentId ? 'selected' : ''}>${esc(t.config?.name || 'Tournament')}</option>`).join('')}
+                </select>
+                ${state.phase !== 'setup' && phaseLabels[state.phase] ? `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gold-500/15 text-gold-600 dark:text-gold-400 border border-gold-500/30">${phaseLabels[state.phase]}</span>` : ''}
+                <span class="px-2 py-0.5 text-xs font-medium rounded-full ${isAdmin ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' : state.auth.role === 'player' ? 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border border-blue-500/30' : 'bg-stone-200 dark:bg-stone-800 text-stone-600 dark:text-stone-300'}">${roleLabel}</span>
+                ${state.auth.role === 'player' ? '' : `<button id="open-sync-modal-btn" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs border ${state.sync?.status === 'synced' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : state.sync?.status === 'error' ? 'border-red-500/30 bg-red-500/10 text-red-500' : 'border-stone-300 dark:border-stone-700 text-stone-500 dark:text-stone-400'}"><span class="w-1.5 h-1.5 rounded-full ${state.sync?.status === 'synced' ? 'bg-emerald-500' : state.sync?.status === 'error' ? 'bg-red-500' : 'bg-stone-400'}"></span><span id="sync-status-pill">${state.sync?.status === 'synced' ? 'Cloud Synced' : state.sync?.status === 'error' ? 'Sync Error' : 'Cloud Sync'}</span></button>`}
+                <button id="logout-btn" class="text-xs text-stone-500 hover:text-stone-900 dark:hover:text-stone-100 underline underline-offset-2">Logout</button>
+              </div>
+
+              <div class="flex items-center gap-2 flex-wrap">
+                ${isAdmin ? `
+                  <button id="share-btn" class="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 transition">Share</button>
+                  <button id="export-btn" class="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 transition">Export</button>
+                  <button id="reset-btn" class="px-2.5 py-1.5 text-xs font-medium rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition">Reset</button>
+                ` : ''}
+                ${renderThemeSwitcher()}
+              </div>
+            </div>
+          </header>
+        `;
+      }
+
+      function renderNavTabs() {
+        const isAdmin = state.auth.role === 'admin';
+        const isPlayer = state.auth.role === 'player';
+        const stats = getStatsSummary();
+        const checkIns = getAllImportedPlayers();
+        const navButton = (id, label, badge) => `
+          <a href="${esc(getPageUrl(id))}" data-tab="${id}" aria-current="${state.ui.activeTab === id ? 'page' : 'false'}" class="w-full min-h-11 text-left flex items-center justify-between gap-3 px-3 py-2 rounded-lg text-xs font-medium transition ${state.ui.activeTab === id ? 'bg-gold-500/15 text-gold-700 dark:text-gold-300' : 'text-stone-600 dark:text-stone-300 hover:bg-cream-100 dark:hover:bg-stone-800'}">
+            <span>${label}</span>
+            ${badge ? `<span class="text-[10px] text-stone-500 tabular-nums">${badge}</span>` : ''}
+          </a>
+        `;
+        const categoryLabel = 'block px-2 pb-1 text-[9px] font-bold uppercase tracking-[0.14em] text-stone-400 dark:text-stone-500';
+        const summaryClass = active => `inline-flex items-center gap-1.5 px-3 py-2 rounded-lg cursor-pointer list-none text-xs font-semibold transition ${active ? 'bg-gold-500/15 text-gold-700 dark:text-gold-300' : 'text-stone-600 dark:text-stone-300 hover:bg-cream-100 dark:hover:bg-stone-800'}`;
+        const matchActive = ['qr1', 'qr2', 'semis', 'finals', 'bracket'].includes(state.ui.activeTab);
+        const peopleActive = ['players', 'checkin'].includes(state.ui.activeTab);
+        return `
+          <nav aria-label="Tournament navigation" class="relative z-20 border-b border-stone-200 dark:border-stone-800 bg-white dark:bg-[#15171B]">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 py-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div class="min-w-[7rem]">
+                <span class="${categoryLabel}">Overview</span>
+                ${navButton('dashboard', 'Dashboard')}
+              </div>
+              <div class="min-w-[9rem]">
+                <span class="${categoryLabel}">Tournament</span>
+                <div class="grid grid-cols-2 gap-1">
+                  ${navButton('tournaments', 'Tournaments')}
+                  ${isAdmin || isPlayer ? navButton('setup', 'Setup') : ''}
+                </div>
+              </div>
+              <details class="relative min-w-[8rem]">
+                <summary class="${summaryClass(matchActive)}">
+                  <span class="${categoryLabel.replace('block ', 'inline-block ')} !px-0 !pb-0">Match Center</span>
+                  <span aria-hidden="true" class="text-[10px]">▾</span>
+                </summary>
+                <div class="absolute left-0 top-full mt-1 w-56 rounded-xl border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#191B1F] p-2 shadow-xl">
+                  <span class="${categoryLabel}">Rounds</span>
+                  ${navButton('qr1', 'Qualifier Round 1', `${stats.qr1Done}/${stats.qr1Total || 0}`)}
+                  ${navButton('qr2', 'Qualifier Round 2', `${stats.qr2Done}/${stats.qr2Total || 0}`)}
+                  ${navButton('semis', 'Semi-Finals', `${stats.semiDone}/${stats.semiTotal || 0}`)}
+                  ${navButton('finals', 'Finals', `${stats.finalDone}/${stats.finalTotal || 0}`)}
+                  <div class="mt-1 border-t border-stone-200 dark:border-stone-700 pt-1">
+                    <a id="open-bracket-btn" href="${esc(getPageUrl('bracket'))}" data-tab="bracket" aria-current="${state.ui.activeTab === 'bracket' ? 'page' : 'false'}" class="block w-full min-h-11 text-left px-3 py-3 rounded-lg text-xs font-semibold text-gold-700 dark:text-gold-300 hover:bg-cream-100 dark:hover:bg-stone-800">View tournament bracket</a>
+                  </div>
+                </div>
+              </details>
+              <details class="relative min-w-[8rem]">
+                <summary class="${summaryClass(peopleActive)}">
+                  <span class="${categoryLabel.replace('block ', 'inline-block ')} !px-0 !pb-0">Players &amp; Check-In</span>
+                  <span aria-hidden="true" class="text-[10px]">▾</span>
+                </summary>
+                <div class="absolute left-0 top-full mt-1 w-52 rounded-xl border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#191B1F] p-2 shadow-xl">
+                  <span class="${categoryLabel}">Participants</span>
+                  ${navButton('players', 'Players & Performance')}
+                  ${navButton('checkin', 'Attendance', `${checkIns.filter(player => state.checkIns?.[player.name]?.checkedIn).length}/${checkIns.length}`)}
+                </div>
+              </details>
+              <div class="min-w-[5rem]">
+                <span class="${categoryLabel}">Information</span>
+                ${navButton('rules', 'Rules & Format')}
+              </div>
+            </div>
+          </nav>
+        `;
+      }
+
+      function renderActiveView() {
+        switch (state.ui.activeTab) {
+          case 'setup': return renderSetupView();
+          case 'qr1': return renderQR1View();
+          case 'qr2': return renderQR2View();
+          case 'semis': return renderSemisView();
+          case 'finals': return renderFinalsView();
+          case 'bracket': return renderBracketOverlay(true);
+          case 'dashboard': return renderDashboardView();
+          case 'tournaments':
+            if (!tournamentCatalog.loaded && !tournamentCatalog.loading) {
+              loadTournamentCatalog().then(() => {
+                if (state.ui.activeTab === 'tournaments') render();
+              });
+            }
+            return renderTournamentCatalogView();
+          case 'rules': return renderRulesView();
+          case 'players':
+            if (!playerData.loaded && !playerData.loading) {
+              loadPlayerData().then(() => {
+                if (state.ui.activeTab === 'players') render();
+              });
+            }
+            return renderPlayerProfilesView();
+          case 'checkin': return renderCheckInView();
+          default: return renderDashboardView();
+        }
+      }
+
+      function renderSetupView() {
+        const c = state.config;
+        const setupSteps = [
+          { title: 'Event details', description: 'Name your event and share any organizer-specific rules.' },
+          { title: 'Format & scoring', description: 'Choose group sizes, match counts, scoring, and tournament progression.' },
+          { title: 'Players & groups', description: 'Review the roster, assign group leaders, and organize players.' },
+          { title: 'Ranking rules', description: 'Set how standings and tiebreakers are calculated.' },
+          { title: 'Review & start', description: 'Confirm the tournament setup before generating the schedule.' }
+        ];
+        const setupStep = Math.max(1, Math.min(setupSteps.length, Number(state.ui.setupStep) || 1));
+        const totalPlayers = state.groups.reduce((s, g) => s + g.players.length, 0);
+        const poolACount = state.groups.length * Math.min(c.advanceTopN, c.playersPerGroup);
+        const poolBCount = Math.max(0, totalPlayers - poolACount);
+        const invalidGroup = state.groups.find(g => g.players.length < 3 || !g.leader || !g.players.includes(g.leader));
+        const setupReady = state.groups.length >= 2 && !invalidGroup;
+
+        return `
+          <div class="space-y-6">
+            <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-4">
+              <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2">
+                <div>
+                  <p class="text-[10px] font-bold uppercase tracking-[0.16em] text-gold-600 dark:text-gold-400">Tournament setup</p>
+                  <h1 class="mt-1 text-xl sm:text-2xl font-bold">Set up your tournament</h1>
+                  <p class="mt-1 text-xs sm:text-sm text-stone-500 dark:text-stone-400">${esc(setupSteps[setupStep - 1].description)}</p>
+                </div>
+                <span class="shrink-0 text-xs font-semibold text-stone-500 dark:text-stone-400">Step ${setupStep} of ${setupSteps.length}</span>
+              </div>
+              <div class="h-1.5 rounded-full bg-stone-100 dark:bg-stone-800 overflow-hidden" role="progressbar" aria-label="Tournament setup progress" aria-valuemin="1" aria-valuemax="${setupSteps.length}" aria-valuenow="${setupStep}">
+                <div class="h-full rounded-full bg-gold-500 transition-all" style="width:${setupStep / setupSteps.length * 100}%"></div>
+              </div>
+              <nav aria-label="Tournament setup steps" class="flex gap-2 overflow-x-auto pb-1 sm:grid sm:grid-cols-5 sm:overflow-visible">
+                ${setupSteps.map((step, index) => {
+                  const stepNumber = index + 1;
+                  const active = stepNumber === setupStep;
+                  const complete = stepNumber < setupStep;
+                  return `
+                    <button type="button" data-setup-step-nav="${stepNumber}" aria-label="Go to step ${stepNumber}: ${esc(step.title)}" aria-current="${active ? 'step' : 'false'}"
+                      class="min-h-11 min-w-32 sm:min-w-0 shrink-0 rounded-lg border px-3 py-2 text-left text-xs font-semibold transition ${active ? 'border-gold-500 bg-gold-500/10 text-gold-700 dark:text-gold-300' : 'border-stone-200 dark:border-stone-700 text-stone-500 hover:bg-cream-100 dark:hover:bg-stone-800'}">
+                      <span class="flex items-center gap-2"><span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${active ? 'bg-gold-500 text-stone-950' : complete ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-stone-100 dark:bg-stone-800'}">${complete ? '✓' : stepNumber}</span>${esc(step.title)}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </nav>
+            </section>
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <!-- Event -->
+              <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4 lg:col-span-2 ${setupStep === 1 ? '' : 'hidden'}">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">Event</h2>
+                <div class="space-y-3">
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Tournament Name</label>
+                    <input data-cfg="name" type="text" value="${esc(c.name)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                  </div>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Date</label>
+                      <input data-cfg="date" type="date" value="${esc(c.date)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                    </div>
+                    <div>
+                      <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Venue</label>
+                      <input data-cfg="venue" type="text" value="${esc(c.venue)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <!-- Format & Scoring -->
+              <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4 lg:col-span-2 ${setupStep === 2 ? '' : 'hidden'}">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">Format &amp; Scoring</h2>
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Groups</label>
+                    <input id="cfg-num-groups" type="number" min="2" max="8" value="${c.numGroups}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Total Players</label>
+                    <input id="cfg-total-players" type="number" min="${state.groups.length * 3}" max="80" value="${totalPlayers}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Players / Group</label>
+                    <input id="cfg-players-per-group" type="number" min="3" max="12" value="${c.playersPerGroup}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Matches / Player</label>
+                    <input data-cfg-num="matchesPerPlayer" type="number" min="1" max="9" value="${c.matchesPerPlayer}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Points to Win</label>
+                    <input data-cfg-num="pointsToWin" type="number" min="11" max="30" value="${c.pointsToWin}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Deuce Cap</label>
+                    <input data-cfg-num="deuceCap" type="number" min="15" max="35" value="${c.deuceCap}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Advance Top N</label>
+                    <input data-cfg-num="advanceTopN" type="number" min="1" max="6" value="${c.advanceTopN}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 2 Pools</label>
+                    <input data-cfg-num="qr2PoolsCount" type="number" min="2" max="6" value="${c.qr2PoolsCount || 2}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Semi-Final Slots</label>
+                    <input data-cfg-num="semiFinalSlots" type="number" min="4" max="8" step="4" value="${c.semiFinalSlots}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Pool A Final</label>
+                    <select data-cfg="poolAFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                      <option value="bo3" ${c.poolAFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
+                      <option value="single" ${c.poolAFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Pool B Final</label>
+                    <select data-cfg="poolBFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                      <option value="single" ${c.poolBFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
+                      <option value="bo3" ${c.poolBFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
+                    </select>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-3 ${setupStep === 1 ? '' : 'hidden'}">
+              <div>
+                <h2 class="text-sm font-bold">Event-specific rules</h2>
+                <p class="mt-1 text-xs text-stone-500">Add organizer notes, check-in guidance, or event-specific policies. Players can read these from Rules &amp; Format.</p>
+              </div>
+              <textarea data-cfg="rules" maxlength="8000" rows="4" placeholder="Add event rules and player guidance…" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm resize-y">${esc(c.rules || '')}</textarea>
+            </section>
+
+            <!-- Editable Ranking Rules -->
+            <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4 ${setupStep === 4 ? '' : 'hidden'}">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">Ranking Rules</h2>
+                <span class="text-xs font-mono text-gold-600 dark:text-gold-400">${esc(getRankingFormulaText())}</span>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Win Points (per Win)</label>
+                  <input data-rk-num="winPointsWeight" type="number" min="0" max="100" value="${c.ranking?.winPointsWeight ?? 20}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                </div>
+                <div>
+                  <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Win Margin Multiplier</label>
+                  <input data-rk-num="winMarginWeight" type="number" min="0" max="10" step="0.5" value="${c.ranking?.winMarginWeight ?? 1}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                </div>
+                <div>
+                  <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Loss Margin Penalty</label>
+                  <input data-rk-num="lossMarginWeight" type="number" min="0" max="10" step="0.5" value="${c.ranking?.lossMarginWeight ?? 1}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                </div>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                ${[0, 1, 2, 3].map(idx => {
+                  const cur = (c.ranking?.tiebreakers || ['wp', 'wins', 'pf', 'pa'])[idx];
+                  return `
+                    <div>
+                      <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">${idx === 0 ? 'Primary Rank' : `Tiebreaker ${idx}`}</label>
+                      <select data-rk-tb="${idx}" class="w-full px-2.5 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs">
+                        ${Object.entries(TIEBREAKER_LABELS).map(([k, lbl]) => `<option value="${k}" ${cur === k ? 'selected' : ''}>${lbl}</option>`).join('')}
+                      </select>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </section>
+
+            <!-- Players & Group Configuration -->
+            <section class="space-y-4 ${setupStep === 3 ? '' : 'hidden'}">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 class="text-base font-bold">Players &amp; Group Configuration</h2>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">${totalPlayers} registered across ${state.groups.length} groups · Drag a player by the handle to move them, or use the group menu on touch screens. Click ★ to set a leader.</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  ${state.auth.role === 'admin' ? '<button id="import-roster-btn" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-3 py-2 text-xs font-semibold transition hover:bg-cream-100 dark:hover:bg-stone-800">Import players</button>' : ''}
+                  <button id="sort-groups-btn" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-3 py-2 text-xs font-semibold transition hover:bg-cream-100 dark:hover:bg-stone-800">Sort A–Z</button>
+                  <button id="add-group-btn" class="min-h-11 rounded-lg border border-gold-500/30 bg-gold-500/15 px-3 py-2 text-xs font-semibold text-gold-600 transition hover:bg-gold-500/25 dark:text-gold-400">+ Add Group</button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                ${state.groups.map((g, gi) => `
+                  <div data-player-drop-group="${gi}" aria-label="Drop players into ${esc(g.name)}" class="player-drop-group rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 flex flex-col gap-3 transition-colors">
+                    <div class="flex items-center justify-between gap-2">
+                      <div class="flex items-center gap-2 flex-1 min-w-0">
+                        <input data-group-name="${gi}" type="text" value="${esc(g.name)}" class="w-28 sm:w-32 px-2 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 font-bold text-sm" />
+                        <span class="text-xs px-2 py-0.5 rounded-full bg-stone-100 dark:bg-stone-800 text-stone-600 dark:text-stone-400 tabular-nums">${g.players.length}/${c.playersPerGroup}</span>
+                        <span class="text-[11px] px-2 py-0.5 rounded-full bg-gold-500/10 text-gold-600 dark:text-gold-400 tabular-nums" title="Average skill level (1-10)">Avg ${g.players.length ? (g.players.reduce((sum, p) => sum + getPlayerSkill(p), 0) / g.players.length).toFixed(1) : '0.0'}</span>
+                      </div>
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-xs text-gold-600 dark:text-gold-400 font-medium truncate max-w-[90px]">★ ${esc(g.leader || 'None')}</span>
+                        ${state.groups.length > 2 ? `<button data-remove-group="${gi}" title="Remove group" class="w-6 h-6 rounded text-stone-400 hover:text-red-500 hover:bg-red-500/10 text-xs">✕</button>` : ''}
+                      </div>
+                    </div>
+
+                    <div class="space-y-1.5">
+                      ${g.players.map((p, pi) => {
+                        const isLeader = g.leader === p;
+                        return `
+                          <div data-player-row="${gi}:${pi}" class="player-roster-row flex items-center gap-1.5 rounded-lg border border-transparent p-1 transition-opacity">
+                            ${state.auth.role === 'admin' ? `<button data-player-drag="${gi}:${pi}" type="button" draggable="true" aria-label="Drag ${esc(p)} to another group" title="Drag to another group" class="player-drag-handle w-7 h-8 shrink-0 rounded-md text-stone-400 hover:bg-stone-100 hover:text-stone-700 dark:hover:bg-stone-800 dark:hover:text-stone-200" aria-grabbed="false">
+                              <svg class="mx-auto h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="5" cy="3" r="1"/><circle cx="11" cy="3" r="1"/><circle cx="5" cy="8" r="1"/><circle cx="11" cy="8" r="1"/><circle cx="5" cy="13" r="1"/><circle cx="11" cy="13" r="1"/></svg>
+                            </button>` : ''}
+                            <button data-set-leader="${gi}:${pi}" title="Set as group leader" class="w-7 h-7 rounded-lg flex items-center justify-center text-sm transition ${isLeader ? 'bg-gold-500/20 text-gold-500' : 'text-stone-400 hover:text-gold-500 hover:bg-stone-100 dark:hover:bg-stone-800'}">★</button>
+                            <input data-player-edit="${gi}:${pi}" type="text" value="${esc(p)}" class="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs sm:text-sm" />
+                            <input data-player-skill="${gi}:${pi}" type="number" min="1" max="10" value="${getPlayerSkill(p)}" title="Skill level (1-10)" class="w-12 px-1.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs text-center font-semibold tabular-nums" />
+                            <select data-move-player="${gi}:${pi}" title="Move to another group" class="px-1.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-[11px] text-stone-500">
+                              ${state.groups.map((og, ogi) => `<option value="${ogi}" ${ogi === gi ? 'selected' : ''}>${esc(og.id)}</option>`).join('')}
+                            </select>
+                            <button data-remove-player="${gi}:${pi}" title="Remove player" class="w-7 h-7 rounded-lg text-stone-400 hover:text-red-500 hover:bg-red-500/10 flex items-center justify-center text-xs">✕</button>
+                          </div>
+                        `;
+                      }).join('')}
+                    </div>
+
+                    <div class="flex items-center gap-1.5 pt-1">
+                      <input data-add-player-skill="${gi}" type="number" min="1" max="10" value="5" title="Skill level (1-10)" class="w-12 px-1.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs text-center font-semibold tabular-nums" />
+                      <button data-add-player-btn="${gi}" class="flex-1 px-3 py-1.5 rounded-lg bg-stone-200 dark:bg-stone-800 hover:bg-stone-300 dark:hover:bg-stone-700 text-xs font-medium">+ Add player from profiles</button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+
+              <div class="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <p class="text-xs text-stone-500 dark:text-stone-400">Each group needs at least 3 players and a ★ leader.</p>
+              </div>
+            </section>
+
+            <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-4 ${setupStep === 5 ? '' : 'hidden'}">
+              <div>
+                <h2 class="text-base font-bold">Review your tournament</h2>
+                <p class="mt-1 text-xs text-stone-500 dark:text-stone-400">Check the event, scoring, roster, and standings rules before you create the schedule.</p>
+              </div>
+              <div class="rounded-xl bg-gold-500/10 border border-gold-500/30 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm">
+                <div class="flex flex-wrap items-center gap-4">
+                  <span><strong class="text-gold-600 dark:text-gold-400">Players:</strong> <span class="tabular-nums font-semibold">${totalPlayers}</span></span>
+                  <span><strong class="text-gold-600 dark:text-gold-400">Pool A:</strong> <span class="tabular-nums font-semibold">${poolACount}</span></span>
+                  ${(() => {
+                    const keys = getConfiguredPoolKeys().slice(1);
+                    const base = Math.floor(poolBCount / keys.length);
+                    const rem = poolBCount % keys.length;
+                    return keys.map((k, idx) => `<span><strong class="${getPoolAccent(k)}">Pool ${k}:</strong> <span class="tabular-nums font-semibold">${base + (idx < rem ? 1 : 0)}</span></span>`).join('');
+                  })()}
+                </div>
+                <span class="text-stone-600 dark:text-stone-300"><strong>Ranking:</strong> ${esc(getTiebreakerText())}</span>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2">
+                  <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Event</h3>
+                  <p class="text-sm font-semibold break-words">${esc(c.name || 'Unnamed tournament')}</p>
+                  <p class="text-xs text-stone-500">${esc(c.date || 'Date not set')}${c.venue ? ` · ${esc(c.venue)}` : ''}</p>
+                  <p class="text-xs text-stone-500">${c.rules ? 'Event-specific rules added' : 'No additional event rules'}</p>
+                </article>
+                <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2">
+                  <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Format &amp; scoring</h3>
+                  <p class="text-xs">${state.groups.length} groups · ${totalPlayers} players · ${c.matchesPerPlayer} matches per player</p>
+                  <p class="text-xs">Games to ${c.pointsToWin}, win by two until ${c.deuceCap}</p>
+                  <p class="text-xs">Top ${c.advanceTopN} from each group advance</p>
+                </article>
+                <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2 sm:col-span-2">
+                  <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Ranking &amp; tiebreakers</h3>
+                  <p class="text-xs">${esc(getRankingFormulaText())}</p>
+                  <p class="text-xs text-stone-500">${esc(getTiebreakerText())}</p>
+                </article>
+              </div>
+              <div class="space-y-2">
+                <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Group readiness</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                  ${state.groups.map(group => {
+                    const ready = group.players.length >= 3 && group.leader && group.players.includes(group.leader);
+                    return `<div class="flex items-center justify-between gap-2 rounded-lg border ${ready ? 'border-emerald-500/30' : 'border-red-500/40'} px-3 py-2 text-xs">
+                      <span class="min-w-0 truncate font-semibold">${esc(group.name)}</span>
+                      <span class="shrink-0 text-stone-500">${group.players.length} players · ${esc(group.leader || 'No leader')}</span>
+                      <span class="${ready ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}">${ready ? 'Ready' : 'Needs attention'}</span>
+                    </div>`;
+                  }).join('')}
+                </div>
+              </div>
+              ${setupReady ? `
+                <p class="rounded-lg bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">Your roster is ready to generate a schedule.</p>
+              ` : `
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-3 py-2">
+                  <p class="text-xs text-amber-700 dark:text-amber-400">${invalidGroup ? `${esc(invalidGroup.name)} needs at least 3 players and a group leader.` : 'Add at least two groups before starting.'}</p>
+                  <button type="button" data-setup-step-nav="3" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Review players &amp; groups</button>
+                </div>
+              `}
+            </section>
+
+            <div class="sticky bottom-0 z-10 -mx-4 sm:-mx-6 border-t border-stone-200 dark:border-stone-800 bg-cream-50/95 dark:bg-[#111214]/95 px-4 sm:px-6 py-3 backdrop-blur">
+              <div class="max-w-7xl mx-auto flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-2">
+                <button type="button" data-setup-step-nav="${Math.max(1, setupStep - 1)}" ${setupStep === 1 ? 'disabled' : ''} class="min-h-11 w-full sm:w-auto rounded-lg border border-stone-300 dark:border-stone-700 px-4 py-2 text-sm font-semibold disabled:opacity-40">Back</button>
+                ${setupStep < setupSteps.length ? `
+                  <div class="flex flex-col sm:flex-row sm:items-center gap-2">
+                    <span class="hidden sm:inline text-xs text-stone-500">Changes save automatically</span>
+                    <button type="button" data-setup-step-nav="${setupStep + 1}" class="min-h-11 w-full sm:w-auto rounded-lg bg-gold-500 px-5 py-2 text-sm font-bold text-stone-950 hover:bg-gold-400">Continue to ${esc(setupSteps[setupStep].title)} <span aria-hidden="true">→</span></button>
+                  </div>
+                ` : `
+                  <button type="button" id="start-tournament-btn" ${setupReady ? '' : 'disabled'} class="min-h-11 w-full sm:w-auto rounded-lg bg-gold-500 px-5 py-2 text-sm font-bold text-stone-950 shadow-md transition hover:bg-gold-400 disabled:cursor-not-allowed disabled:opacity-50">
+                    Start Tournament — Generate QR1 Schedule
+                  </button>
+                `}
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderStandingsTable(title, players, matches, highlightTopN, accentClass) {
+        const rows = computeStandings(players, matches);
+        return `
+          <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
+            <div class="px-4 py-3 border-b border-stone-200 dark:border-stone-800 flex items-center justify-between">
+              <h3 class="font-bold text-sm ${accentClass || ''}">${esc(title)}</h3>
+              ${highlightTopN ? `<span class="text-[11px] text-stone-500 dark:text-stone-400">Top ${highlightTopN} → Pool A</span>` : ''}
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full text-xs sm:text-sm text-left">
+                <thead class="bg-cream-100/70 dark:bg-stone-800/60 text-stone-500 dark:text-stone-400 text-[11px] uppercase">
+                  <tr>
+                    <th class="px-3 py-2">#</th>
+                    <th class="px-3 py-2">Player</th>
+                    <th class="px-2 py-2 text-center">P</th>
+                    <th class="px-2 py-2 text-center">W</th>
+                    <th class="px-2 py-2 text-center">L</th>
+                    <th class="px-2 py-2 text-center">PF</th>
+                    <th class="px-2 py-2 text-center">PA</th>
+                    <th class="px-3 py-2 text-right">WP</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-stone-100 dark:divide-stone-800/70 tabular-nums">
+                  ${rows.map((r, idx) => {
+                    const isTop = highlightTopN && idx < highlightTopN;
+                    return `
+                      <tr class="${isTop ? 'bg-gold-500/5' : ''}">
+                        <td class="px-3 py-2 font-semibold ${isTop ? 'text-gold-600 dark:text-gold-400' : 'text-stone-400'}">${idx + 1}</td>
+                        <td class="px-3 py-2 font-medium">
+                          ${esc(r.player)}
+                          <span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-stone-100 dark:bg-stone-800 text-stone-500 dark:text-stone-400 font-semibold" title="Skill level">${getPlayerSkill(r.player)}</span>
+                          ${r.tiedFlag ? `<span title="Tied on all tiebreakers — officiating table" class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-500">TIE</span>` : ''}
+                        </td>
+                        <td class="px-2 py-2 text-center">${r.played}</td>
+                        <td class="px-2 py-2 text-center text-emerald-600 dark:text-emerald-400 font-medium">${r.wins}</td>
+                        <td class="px-2 py-2 text-center text-stone-500">${r.losses}</td>
+                        <td class="px-2 py-2 text-center">${r.pf}</td>
+                        <td class="px-2 py-2 text-center">${r.pa}</td>
+                        <td class="px-3 py-2 text-right font-bold">${r.wp}</td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderMatchCard(m, listKey) {
+        const isAdmin = state.auth.role === 'admin';
+        const p1Won = m.completed && m.s1 > m.s2;
+        const p2Won = m.completed && m.s2 > m.s1;
+        return `
+          <div class="rounded-xl bg-white dark:bg-[#191B1F] border ${m.completed ? 'border-emerald-500/30' : 'border-stone-200 dark:border-stone-800'} p-3.5 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400">
+              <span class="font-mono">${esc(m.id)}</span>
+              <span class="px-2 py-0.5 rounded-full font-medium ${m.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-stone-100 dark:bg-stone-800 text-stone-500'}">${m.completed ? 'Completed' : 'Pending'}</span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold truncate ${p1Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p1 || m.t1)}</div>
+                <div class="text-xs text-stone-400 my-0.5">vs</div>
+                <div class="text-sm font-semibold truncate ${p2Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p2 || m.t2)}</div>
+              </div>
+              ${isAdmin ? `
+                <div class="flex items-center gap-1.5">
+                  <div class="flex flex-col gap-1">
+                    <input data-score-input="${listKey}:${m.id}:1" type="number" min="0" max="${state.config.deuceCap}" value="${m.s1 !== null ? m.s1 : ''}" placeholder="0"
+                      class="w-14 px-2 py-1 text-center rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm font-bold tabular-nums" />
+                    <input data-score-input="${listKey}:${m.id}:2" type="number" min="0" max="${state.config.deuceCap}" value="${m.s2 !== null ? m.s2 : ''}" placeholder="0"
+                      class="w-14 px-2 py-1 text-center rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm font-bold tabular-nums" />
+                  </div>
+                  <button data-save-match="${listKey}:${m.id}" class="px-2.5 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold transition">Save</button>
+                </div>
+              ` : `
+                <div class="flex flex-col items-end gap-1 font-bold text-base tabular-nums">
+                  <span>${m.s1 !== null ? m.s1 : '—'}</span>
+                  <span>${m.s2 !== null ? m.s2 : '—'}</span>
+                </div>
+              `}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderQR1View() {
+        if (state.qr1Matches.length === 0) {
+          return renderEmptyState('No schedule yet', 'Complete setup and start the tournament to generate the Qualifier Round 1 schedule.');
+        }
+        const isAdmin = state.auth.role === 'admin';
+        const filter = state.ui.qr1GroupFilter;
+        const visibleGroups = filter === 'ALL' ? state.groups : state.groups.filter(g => g.id === filter);
+        const allDone = state.qr1Matches.every(m => m.completed);
+
+        return `
+          <div class="space-y-6">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <button data-qr1-filter="ALL" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${filter === 'ALL' ? 'bg-gold-500 text-stone-950' : 'bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800'}">All Groups</button>
+                ${state.groups.map(g => `
+                  <button data-qr1-filter="${g.id}" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${filter === g.id ? 'bg-gold-500 text-stone-950' : 'bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800'}">${esc(g.name)}</button>
+                `).join('')}
+              </div>
+              ${isAdmin ? `
+                <div class="flex items-center gap-2">
+                  ${!allDone ? `<button id="sim-qr1-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>` : ''}
+                  <button id="advance-qr2-btn" ${allDone ? '' : 'disabled'} class="px-4 py-1.5 rounded-lg text-xs font-bold transition ${allDone ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-stone-300 dark:bg-stone-800 text-stone-500 cursor-not-allowed'}">
+                    Advance to QR2 →
+                  </button>
+                </div>
+              ` : ''}
+            </div>
+
+            ${visibleGroups.map(g => {
+              const gMatches = state.qr1Matches.filter(m => m.groupId === g.id);
+              return `
+                <div class="space-y-3">
+                  ${renderStandingsTable(g.name + ' Standings', g.players, gMatches, state.config.advanceTopN, 'text-gold-600 dark:text-gold-400')}
+                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${gMatches.map(m => renderMatchCard(m, 'qr1')).join('')}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `;
+      }
+
+      function renderQR2View() {
+        const poolKeys = Object.keys(state.qr2Pools || {});
+        const hasAnyMatches = poolKeys.some(k => (state.qr2Matches[k] || []).length > 0 || (state.qr2Pools[k] || []).length > 0);
+        if (!hasAnyMatches) {
+          return renderEmptyState('Waiting on Qualifier Round 1', 'Pools are formed once every QR1 match is recorded and the round is advanced.');
+        }
+        const isAdmin = state.auth.role === 'admin';
+        const allMatches = poolKeys.flatMap(k => state.qr2Matches[k] || []);
+        const allDone = allMatches.length > 0 && allMatches.every(m => m.completed);
+
+        return `
+          <div class="space-y-6">
+            ${isAdmin ? `
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <button id="add-qr2-pool-btn" class="px-3.5 py-1.5 rounded-lg bg-gold-500/15 hover:bg-gold-500/25 text-gold-600 dark:text-gold-400 border border-gold-500/30 text-xs font-semibold transition">
+                  + Add Pool
+                </button>
+                <div class="flex items-center gap-2">
+                  ${!allDone && allMatches.length > 0 ? `<button id="sim-qr2-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>` : ''}
+                  <button id="advance-semis-btn" ${allDone ? '' : 'disabled'} class="px-4 py-1.5 rounded-lg text-xs font-bold transition ${allDone ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-stone-300 dark:bg-stone-800 text-stone-500 cursor-not-allowed'}">
+                    Advance to Semi-Finals →
+                  </button>
+                </div>
+              </div>
+            ` : ''}
+
+            ${poolKeys.map((k, idx) => {
+              const players = state.qr2Pools[k] || [];
+              const matches = state.qr2Matches[k] || [];
+              return `
+                <div class="space-y-4 ${idx > 0 ? 'pt-4 border-t border-stone-200 dark:border-stone-800' : ''}">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs text-stone-500 dark:text-stone-400">${players.length} players · ${matches.length} matches</span>
+                    ${isAdmin ? `
+                      <div class="flex items-center gap-2">
+                        <button data-regen-pool="${k}" class="px-2.5 py-1 rounded-lg border border-stone-300 dark:border-stone-700 text-[11px] font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Regenerate Schedule</button>
+                        ${poolKeys.length > 2 ? `<button data-remove-pool="${k}" class="px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-[11px] font-medium hover:bg-red-50 dark:hover:bg-red-950/40">Remove Pool ${k}</button>` : ''}
+                      </div>
+                    ` : ''}
+                  </div>
+                  ${renderStandingsTable(`Pool ${k} Standings (Top ${state.config.semiFinalSlots} → Semi-Finals)`, players, matches, state.config.semiFinalSlots, getPoolAccent(k))}
+                  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${matches.length > 0 ? matches.map(m => renderMatchCard(m, `qr2_${k}`)).join('') : `<div class="col-span-full text-xs text-stone-500 italic">No matches generated yet for Pool ${k} (needs at least 2 players).</div>`}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `;
+      }
+
+      function renderSemisView() {
+        const poolKeys = Object.keys(state.semis || {}).filter(k => (state.semis[k] || []).length > 0);
+        if (poolKeys.length === 0) {
+          return renderEmptyState('Semi-Finals not set', 'Finish Qualifier Round 2 and advance to seed the semi-final matches.');
+        }
+        const isAdmin = state.auth.role === 'admin';
+        const allMatches = poolKeys.flatMap(k => state.semis[k] || []);
+        const allDone = allMatches.every(m => m.completed);
+
+        return `
+          <div class="space-y-6">
+            ${isAdmin ? `
+              <div class="flex items-center justify-end gap-2">
+                ${!allDone ? `<button id="sim-semis-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>` : ''}
+                <button id="advance-finals-btn" ${allDone ? '' : 'disabled'} class="px-4 py-1.5 rounded-lg text-xs font-bold transition ${allDone ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-stone-300 dark:bg-stone-800 text-stone-500 cursor-not-allowed'}">
+                  Advance to Finals →
+                </button>
+              </div>
+            ` : ''}
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              ${poolKeys.map(k => `
+                <div class="space-y-3">
+                  <h2 class="text-sm font-bold ${getPoolAccent(k)} uppercase tracking-wider">Pool ${k} Semi-Finals</h2>
+                  ${state.semis[k].map(m => renderMatchCard(m, `semi_${k}`)).join('')}
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderFinalsView() {
+        const finalKeys = Object.keys(state.finals || {}).filter(k => Boolean(state.finals[k]));
+        if (finalKeys.length === 0) {
+          return renderEmptyState('Finals not set', 'Complete both semi-final matches in each pool to unlock the finals.');
+        }
+        const isAdmin = state.auth.role === 'admin';
+
+        const renderFinalCard = (f, poolKey, accent) => {
+          if (!f) return '';
+          return `
+            <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h3 class="font-bold text-base ${accent}">Pool ${poolKey} Final</h3>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">${f.format === 'bo3' ? 'Best of 3 Games' : 'Single Game'}</p>
+                </div>
+                ${f.completed ? `<span class="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-bold">Champion: ${esc(f.winner)}</span>` : ''}
+              </div>
+
+              <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 flex items-center justify-between text-sm font-semibold">
+                <span class="${f.winner === f.t1 ? 'text-emerald-500' : ''}">${esc(f.t1)}</span>
+                <span class="text-xs text-stone-400 px-2">VS</span>
+                <span class="${f.winner === f.t2 ? 'text-emerald-500' : ''}">${esc(f.t2)}</span>
+              </div>
+
+              <div class="space-y-2">
+                ${f.games.map((g, gi) => `
+                  <div class="flex items-center justify-between gap-2 text-xs">
+                    <span class="font-medium text-stone-500">Game ${gi + 1}</span>
+                    ${isAdmin ? `
+                      <div class="flex items-center gap-2">
+                        <input data-final-input="${poolKey}:${gi}:1" type="number" min="0" max="${state.config.deuceCap}" value="${g.s1 !== null ? g.s1 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
+                        <span>–</span>
+                        <input data-final-input="${poolKey}:${gi}:2" type="number" min="0" max="${state.config.deuceCap}" value="${g.s2 !== null ? g.s2 : ''}" placeholder="0" class="w-14 px-2 py-1 text-center rounded bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 font-bold tabular-nums" />
+                      </div>
+                    ` : `
+                      <span class="font-bold tabular-nums">${g.s1 !== null ? `${g.s1} – ${g.s2}` : '—'}</span>
+                    `}
+                  </div>
+                `).join('')}
+              </div>
+
+              ${isAdmin ? `<button data-save-final="${poolKey}" class="w-full py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 font-bold text-xs transition">Save Pool ${poolKey} Final</button>` : ''}
+            </div>
+          `;
+        };
+
+        return `
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            ${finalKeys.map(k => renderFinalCard(state.finals[k], k, getPoolAccent(k))).join('')}
+          </div>
+        `;
+      }
+
+      function renderDashboardView() {
+        const s = getStatsSummary();
+        const c = state.config;
+        const roundStatus = (done, total, activePhase) => {
+          if (total > 0 && done === total) return '<span class="px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">Completed</span>';
+          if (state.phase === activePhase || total > 0) return '<span class="px-2 py-0.5 rounded-full text-[11px] bg-gold-500/15 text-gold-600 dark:text-gold-400 font-medium">In Progress</span>';
+          return '<span class="px-2 py-0.5 rounded-full text-[11px] bg-stone-100 dark:bg-stone-800 text-stone-500 font-medium">Pending</span>';
+        };
+
+        return `
+          <div class="space-y-6">
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Players</div>
+                <div class="text-2xl font-extrabold mt-1 tabular-nums">${s.totalPlayers}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Groups</div>
+                <div class="text-2xl font-extrabold mt-1 tabular-nums">${state.groups.length}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Matches Played</div>
+                <div class="text-2xl font-extrabold mt-1 tabular-nums">${s.done}/${s.total || '—'}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Progress</div>
+                <div class="text-2xl font-extrabold mt-1 text-gold-600 dark:text-gold-400 tabular-nums">${s.pct}%</div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
+                <div class="flex items-center justify-between">
+                  <h2 class="font-bold text-base">Tournament Progress</h2>
+                  <span class="text-xs text-stone-500 tabular-nums">${s.done} of ${s.total} matches recorded</span>
+                </div>
+                <div class="divide-y divide-stone-100 dark:divide-stone-800 text-sm">
+                  <div class="py-3 flex items-center justify-between">
+                    <div><div class="font-semibold">Qualifier Round 1</div><div class="text-xs text-stone-500">${state.groups.length} groups of ${c.playersPerGroup}</div></div>
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr1Done}/${s.qr1Total}</span>${roundStatus(s.qr1Done, s.qr1Total, 'qr1')}</div>
+                  </div>
+                  <div class="py-3 flex items-center justify-between">
+                    <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => 'Pool ' + k).join(' + ')}</div></div>
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr2Done}/${s.qr2Total}</span>${roundStatus(s.qr2Done, s.qr2Total, 'qr2')}</div>
+                  </div>
+                  <div class="py-3 flex items-center justify-between">
+                    <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">4 matches (2 per pool)</div></div>
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.semiDone}/${s.semiTotal}</span>${roundStatus(s.semiDone, s.semiTotal, 'semis')}</div>
+                  </div>
+                  <div class="py-3 flex items-center justify-between">
+                    <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">Pool A (${c.poolAFinalFormat === 'bo3' ? 'Bo3' : 'Single'}) · Pool B (${c.poolBFinalFormat === 'bo3' ? 'Bo3' : 'Single'})</div></div>
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.finalDone}/${s.finalTotal}</span>${roundStatus(s.finalDone, s.finalTotal, 'finals')}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
+                <h2 class="font-bold text-base">Ranking Rules &amp; Parameters</h2>
+                <div class="p-3.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 space-y-1.5 text-xs sm:text-sm">
+                  <div class="font-mono font-semibold text-gold-600 dark:text-gold-400">${esc(getRankingFormulaText())}</div>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">Order: ${esc(getTiebreakerText())} · still tied → flagged for the officiating table.</p>
+                </div>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+                  <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+                    <div class="text-[11px] text-stone-500 uppercase">Game To</div>
+                    <div class="font-bold text-sm mt-0.5">${c.pointsToWin} pts</div>
+                  </div>
+                  <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+                    <div class="text-[11px] text-stone-500 uppercase">Deuce Cap</div>
+                    <div class="font-bold text-sm mt-0.5">${c.deuceCap}</div>
+                  </div>
+                  <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+                    <div class="text-[11px] text-stone-500 uppercase">Pool A</div>
+                    <div class="font-bold text-sm mt-0.5">Top ${c.advanceTopN} / grp</div>
+                  </div>
+                  <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+                    <div class="text-[11px] text-stone-500 uppercase">Semi-Finals</div>
+                    <div class="font-bold text-sm mt-0.5">Top ${c.semiFinalSlots} / pool</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderTournamentCatalogView() {
+        const now = new Date();
+        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        const isPast = tournament => {
+          const phase = tournament.phase || tournament.data?.phase || 'setup';
+          const date = tournament.date || tournament.data?.config?.date || '';
+          if (phase === 'completed') return true;
+          if (String(tournament.id) === String(state.tournamentId)) return false;
+          return Boolean(date && date < today);
+        };
+        const currentTournaments = tournamentCatalog.items.filter(tournament => !isPast(tournament));
+        const pastTournaments = tournamentCatalog.items.filter(isPast)
+          .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+        const phaseLabels = {
+          setup: 'Setup',
+          qr1: 'Qualifier Round 1',
+          qr2: 'Qualifier Round 2',
+          semis: 'Semi-Finals',
+          finals: 'Finals',
+          completed: 'Completed'
+        };
+        const renderTournamentCard = tournament => {
+          const data = tournament.data || {};
+          const config = data.config || {};
+          const groups = Array.isArray(data.groups) ? data.groups : [];
+          const players = new Set(groups.flatMap(group => Array.isArray(group.players) ? group.players : []));
+          Object.values(data.qr2Pools || {}).flat().forEach(name => players.add(name));
+          const matches = [
+            ...(Array.isArray(data.qr1Matches) ? data.qr1Matches : []),
+            ...Object.values(data.qr2Matches || {}).flat(),
+            ...Object.values(data.semis || {}).flat(),
+            ...Object.values(data.finals || {}).filter(Boolean)
+          ];
+          const completedMatches = matches.filter(match => match.completed).length;
+          const phase = tournament.phase || data.phase || 'setup';
+          const date = tournament.date || config.date || '';
+          const dateLabel = date
+            ? new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+            : 'Date not set';
+          const selected = String(tournament.id) === String(state.tournamentId);
+          return `
+            <article class="rounded-xl bg-white dark:bg-[#191B1F] border ${selected ? 'border-gold-500/50 ring-1 ring-gold-500/20' : 'border-stone-200 dark:border-stone-800'} p-4 sm:p-5 space-y-4">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <h3 class="font-bold text-base truncate">${esc(tournament.name || config.name || 'Tournament')}</h3>
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phaseLabels[phase] || phase)}</span>
+                    ${selected ? '<span class="text-[10px] font-semibold text-gold-700 dark:text-gold-300">Currently open</span>' : ''}
+                  </div>
+                  <p class="text-xs text-stone-500 mt-1">${esc(dateLabel)}${(tournament.venue || config.venue) ? ` · ${esc(tournament.venue || config.venue)}` : ''}</p>
+                </div>
+                <button data-open-tournament="${esc(tournament.id)}" class="shrink-0 px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">${selected ? 'Open tournament' : 'View tournament'}</button>
+              </div>
+              <div class="grid grid-cols-3 gap-2 border-t border-stone-100 dark:border-stone-800 pt-3">
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Players</div><div class="mt-1 text-sm font-bold tabular-nums">${players.size || groups.reduce((sum, group) => sum + (group.players?.length || 0), 0)}</div></div>
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Groups</div><div class="mt-1 text-sm font-bold tabular-nums">${groups.length || config.numGroups || 0}</div></div>
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Matches</div><div class="mt-1 text-sm font-bold tabular-nums">${completedMatches}/${matches.length}</div></div>
+              </div>
+            </article>
+          `;
+        };
+        const section = (title, items, emptyText) => `
+          <section class="space-y-3">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">${title}</h2>
+              <span class="text-[11px] text-stone-500">${items.length} event${items.length === 1 ? '' : 's'}</span>
+            </div>
+            ${items.length ? `<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">${items.map(renderTournamentCard).join('')}</div>` : `<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 p-5 text-sm text-stone-500">${emptyText}</div>`}
+          </section>
+        `;
+
+        return `
+          <section class="space-y-6">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-[11px] font-bold uppercase tracking-[0.16em] text-gold-600 dark:text-gold-400">Tournament library</p>
+                <h1 class="mt-1 text-xl sm:text-2xl font-extrabold tracking-tight">Current &amp; Past Tournaments</h1>
+                <p class="mt-1 text-sm text-stone-500 dark:text-stone-400">Open an event to view its schedule, standings, results, bracket, and rules.</p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button id="tournament-history-refresh" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-stone-100 dark:hover:bg-stone-800">Refresh list</button>
+                ${state.auth.role === 'admin' ? '<button id="new-tournament-btn" class="px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">+ New Tournament</button>' : ''}
+                ${state.auth.role === 'admin' && Object.keys(registry.items).length > 1 ? '<button id="delete-tournament-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-xs font-semibold">Delete Current</button>' : ''}
+              </div>
+            </div>
+            ${tournamentCatalog.error ? `<p role="status" class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">${esc(tournamentCatalog.error)} Showing tournaments saved in this browser.</p>` : ''}
+            ${tournamentCatalog.loading ? '<p class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">Loading tournament history…</p>' : ''}
+            ${tournamentCatalog.loaded && !tournamentCatalog.items.length ? renderEmptyState('No tournaments yet', 'Create a tournament or connect to a database to see saved events here.') : ''}
+            ${section('Current & Upcoming', currentTournaments, 'No current or upcoming tournaments. Completed events are listed below.')}
+            ${section('Past Tournaments', pastTournaments, 'Completed and previous events will appear here.')}
+          </section>
+        `;
+      }
+
+      function renderRulesView() {
+        const config = state.config;
+        const customRules = String(config.rules || '').trim();
+        const poolKeys = getConfiguredPoolKeys();
+        return `
+          <section class="max-w-5xl mx-auto space-y-5">
+            <div>
+              <p class="text-[11px] font-bold uppercase tracking-[0.16em] text-gold-600 dark:text-gold-400">${esc(config.name)}</p>
+              <h1 class="mt-1 text-xl sm:text-2xl font-extrabold tracking-tight">Rules &amp; Tournament Format</h1>
+              <p class="mt-1 text-sm text-stone-500 dark:text-stone-400">A quick guide for players, spectators, and organizers.</p>
+            </div>
+            <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
+              <h2 class="font-bold text-sm">Event-specific rules</h2>
+              ${customRules
+                ? `<div class="whitespace-pre-wrap text-sm leading-6 text-stone-600 dark:text-stone-300">${esc(customRules)}</div>`
+                : '<p class="text-sm text-stone-500">The organizer has not added extra event rules. The scoring and tournament format below apply.</p>'}
+            </section>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
+                <h2 class="font-bold text-sm">Match scoring</h2>
+                <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
+                  <li>Games are played to <b>${config.pointsToWin} points</b>.</li>
+                  <li>Players must win by two points until the configured cap of <b>${config.deuceCap}</b>.</li>
+                  <li>Scores that do not meet the event scoring rules cannot be saved.</li>
+                </ul>
+              </section>
+              <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
+                <h2 class="font-bold text-sm">Tournament progression</h2>
+                <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
+                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; target ${config.matchesPerPlayer} matches per player.</li>
+                  <li><b>Qualifier 2:</b> ${poolKeys.length} pools; the top ${config.advanceTopN} from each group advance to Pool A.</li>
+                  <li><b>Semi-finals:</b> up to ${config.semiFinalSlots} players or seeds per pool qualify.</li>
+                  <li><b>Finals:</b> Pool A ${getPoolFinalFormat('A') === 'bo3' ? 'best of three' : 'single game'}; Pool B ${getPoolFinalFormat('B') === 'bo3' ? 'best of three' : 'single game'}.</li>
+                </ul>
+              </section>
+              <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3 md:col-span-2">
+                <h2 class="font-bold text-sm">Standings &amp; tie-breakers</h2>
+                <p class="font-mono text-xs sm:text-sm text-gold-700 dark:text-gold-300">${esc(getRankingFormulaText())}</p>
+                <p class="text-sm text-stone-600 dark:text-stone-300">Tie-break order: ${esc(getTiebreakerText())}. Players still tied on every configured metric are flagged for the officiating table.</p>
+              </section>
+            </div>
+            ${state.auth.role === 'admin' ? '<p class="text-xs text-stone-500">To update event-specific rules, open Tournament → Setup and edit the rules section.</p>' : ''}
+          </section>
+        `;
+      }
+
+      function getPlayerAvatar(name, profile, size) {
+        const dimensions = size || 'w-20 h-20';
+        const displayName = profile?.displayName || name;
+        const initials = String(displayName || '?').trim().split(/\s+/).slice(0, 2).map(part => part[0] || '').join('').toUpperCase();
+        let photoUrl = '';
+        try {
+          const value = String(profile?.photoUrl || '');
+          if (/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value) && value.length <= 900000) {
+            photoUrl = value;
+          } else {
+            const parsed = new URL(value);
+            if (parsed.protocol === 'https:' || parsed.protocol === 'http:') photoUrl = parsed.href;
+          }
+        } catch (_err) {}
+        return `
+          <div class="${dimensions} relative shrink-0 rounded-full bg-gold-500/15 border border-gold-500/30 flex items-center justify-center text-gold-600 dark:text-gold-400 font-extrabold overflow-hidden">
+            <span>${esc(initials)}</span>
+            ${photoUrl ? `<img data-player-photo src="${esc(photoUrl)}" alt="${esc(displayName)}" class="absolute inset-0 w-full h-full object-cover" />` : ''}
+          </div>
+        `;
+      }
+
+      async function openGroupPlayerPicker(groupIndex) {
+        let profiles;
+        try {
+          profiles = await getPlayerProfileDirectory();
+        } catch (err) {
+          showToast(`Could not load player profiles: ${err.message}`, 'error');
+          return;
+        }
+        const group = state.groups[groupIndex];
+        if (!group) return;
+        const availableProfiles = profiles
+          .filter(profile => profile && profile.name && isValidPlayerId(profile.playerId))
+          .filter(profile => !isPlayerProfileInRoster(profile))
+          .sort((a, b) => (a.displayName || a.name).localeCompare(b.displayName || b.name));
+        const skill = document.querySelector(`[data-add-player-skill="${groupIndex}"]`)?.value || '5';
+        let selectedPlayerId = availableProfiles[0]?.playerId || '';
+        openModal(`
+          <div class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-6 space-y-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="text-[10px] uppercase tracking-[0.18em] font-bold text-gold-700 dark:text-gold-400">Player directory</p>
+                <h3 class="mt-1 text-lg font-bold">Add a player to ${esc(group.name)}</h3>
+                <p class="mt-1 text-xs text-stone-500">Select a profile to link tournament scores to the player’s record.</p>
+              </div>
+              <span class="shrink-0 rounded-full bg-stone-100 dark:bg-[#111214] px-2.5 py-1 text-[10px] font-semibold text-stone-500">${availableProfiles.length} available</span>
+            </div>
+            ${availableProfiles.length ? `
+              <label class="sr-only" for="group-profile-search">Search by name, player code, or club</label>
+              <input id="group-profile-search" type="search" placeholder="Search name, 6-digit code, or club..." class="w-full px-4 py-3 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm focus:outline-none focus:ring-2 focus:ring-gold-500/50" />
+              <div id="group-profile-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[48vh] overflow-y-auto pr-1">
+                ${availableProfiles.map((profile, index) => `
+                  <button type="button" data-group-profile-id="${esc(profile.playerId)}" data-profile-search="${esc(`${profile.displayName || profile.name} ${profile.playerCode || ''} ${profile.club || ''}`.toLocaleLowerCase())}" aria-pressed="${index === 0}" class="group w-full flex items-center gap-3 rounded-xl border ${index === 0 ? 'border-gold-500 bg-gold-500/10 ring-1 ring-gold-500/30' : 'border-stone-200 dark:border-stone-700 hover:border-gold-500/60'} p-3 text-left transition">
+                    ${getPlayerAvatar(profile.displayName || profile.name, profile, 'w-11 h-11')}
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-sm font-bold">${esc(profile.displayName || profile.name)}</span>
+                      <span class="mt-0.5 block truncate text-[11px] text-stone-500">${esc(profile.club || 'No club listed')}</span>
+                    </span>
+                    <span class="shrink-0 text-right">
+                      <span class="block text-[9px] uppercase tracking-wide text-stone-400">Player code</span>
+                      <span class="font-mono text-xs font-bold text-gold-700 dark:text-gold-400">${esc(profile.playerCode || 'Pending')}</span>
+                    </span>
+                  </button>
+                `).join('')}
+              </div>
+              <p id="group-profile-empty-search" class="hidden rounded-xl bg-cream-50 dark:bg-[#111214] p-4 text-center text-xs text-stone-500">No profiles match that search. Try another name or code.</p>
+            ` : '<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 bg-cream-50 dark:bg-[#111214] p-5 text-center"><p class="text-sm font-semibold">No unassigned profiles</p><p class="mt-1 text-xs text-stone-500">Create a profile first, then add it to this group.</p></div>'}
+            <div class="flex flex-col-reverse sm:flex-row sm:items-center sm:justify-between gap-2 border-t border-stone-200 dark:border-stone-800 pt-4">
+              <button id="group-create-profile-btn" type="button" class="px-3 py-2.5 rounded-lg border border-gold-500/40 text-xs font-semibold text-gold-700 dark:text-gold-400 hover:bg-gold-500/10">Create new player profile</button>
+              <div class="flex justify-end gap-2">
+                <button id="group-player-picker-cancel" type="button" class="px-3 py-2.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+                <button id="group-player-picker-add" type="button" ${selectedPlayerId ? '' : 'disabled'} class="px-4 py-2.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold disabled:opacity-50">Add selected player</button>
+              </div>
+            </div>
+          </div>
+        `);
+        document.getElementById('group-player-picker-cancel').addEventListener('click', closeModal);
+        document.getElementById('group-create-profile-btn').addEventListener('click', () => {
+          closeModal();
+          renderPlayerProfileEditor(null, profile => addPlayerProfileToGroup(groupIndex, profile, skill));
+        });
+        const search = document.getElementById('group-profile-search');
+        const cards = [...document.querySelectorAll('[data-group-profile-id]')];
+        const addButton = document.getElementById('group-player-picker-add');
+        cards.forEach(card => card.addEventListener('click', () => {
+          selectedPlayerId = card.getAttribute('data-group-profile-id');
+          cards.forEach(item => {
+            const selected = item === card;
+            item.setAttribute('aria-pressed', String(selected));
+            item.classList.toggle('border-gold-500', selected);
+            item.classList.toggle('border-stone-200', !selected);
+            item.classList.toggle('dark:border-stone-700', !selected);
+            item.classList.toggle('bg-gold-500/10', selected);
+            item.classList.toggle('ring-1', selected);
+            item.classList.toggle('ring-gold-500/30', selected);
+          });
+          addButton.disabled = false;
+        }));
+        search?.addEventListener('input', () => {
+          const query = search.value.toLocaleLowerCase().trim();
+          let visibleCount = 0;
+          cards.forEach(card => {
+            const visible = !query || card.getAttribute('data-profile-search').includes(query);
+            card.hidden = !visible;
+            if (visible) visibleCount++;
+          });
+          document.getElementById('group-profile-empty-search').classList.toggle('hidden', visibleCount > 0);
+          addButton.disabled = !selectedPlayerId || cards.find(card => card.getAttribute('data-group-profile-id') === selectedPlayerId)?.hidden;
+        });
+        document.getElementById('group-player-picker-add').addEventListener('click', () => {
+          const profile = availableProfiles.find(item => item.playerId === selectedPlayerId);
+          if (!profile) {
+            showToast('Select an available player profile', 'error');
+            return;
+          }
+          closeModal();
+          addPlayerProfileToGroup(groupIndex, profile, skill);
+        });
+      }
+
+      function renderPlayerProfileEditor(profile, onSaved) {
+        const current = profile || { name: '', photoUrl: '', age: '', club: '', ranking: '' };
+        const editing = Boolean(current.name);
+        openModal(`
+          <form id="player-profile-form" class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold">${editing ? 'Edit Player Profile' : 'Add Player Profile'}</h3>
+              <p class="text-xs text-stone-500 dark:text-stone-400 mt-1">Profiles are shared across tournaments. Ranking is maintained manually.</p>
+              ${editing && current.playerCode ? `<p class="mt-2 text-xs font-mono font-bold text-gold-700 dark:text-gold-400">Player code: ${esc(current.playerCode)}</p>` : ''}
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div class="sm:col-span-2">
+                <label for="profile-player-name" class="block font-semibold text-stone-500 mb-1">Player name</label>
+                <input id="profile-player-name" type="text" maxlength="120" required value="${esc(current.name)}" ${editing ? 'readonly' : ''} class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div class="sm:col-span-2">
+                <label for="profile-photo-url" class="block font-semibold text-stone-500 mb-1">Profile photo</label>
+                <input id="profile-photo-url" type="text" maxlength="2048" value="${esc(current.photoUrl && !current.photoUrl.startsWith('data:') ? current.photoUrl : '')}" placeholder="Paste an image URL or upload from your device" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                <input id="profile-photo-data" type="hidden" value="${esc(current.photoUrl?.startsWith('data:') ? current.photoUrl : '')}" />
+                <div class="mt-2 flex items-center gap-3">
+                  <img id="profile-photo-preview" alt="Player photo preview" hidden class="h-12 w-12 rounded-full object-cover border border-stone-300 dark:border-stone-700" />
+                  <label class="cursor-pointer rounded-lg border border-stone-300 dark:border-stone-700 px-3 py-2 text-xs font-semibold hover:border-gold-500">Upload photo<input id="profile-photo-file" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only" /></label>
+                  <button id="profile-photo-clear" type="button" class="text-xs text-stone-500 hover:text-red-500">Remove photo</button>
+                </div>
+              </div>
+              <div>
+                <label for="profile-age" class="block font-semibold text-stone-500 mb-1">Age</label>
+                <input id="profile-age" type="number" min="1" max="120" step="1" value="${esc(current.age ?? '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="profile-club" class="block font-semibold text-stone-500 mb-1">Club</label>
+                <input id="profile-club" type="text" maxlength="120" value="${esc(current.club || '')}" placeholder="Club name" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div class="sm:col-span-2">
+                <label for="profile-ranking" class="block font-semibold text-stone-500 mb-1">National / Club Ranking</label>
+                <input id="profile-ranking" type="text" maxlength="120" value="${esc(current.ranking || '')}" placeholder="e.g. Club #8 · National B" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+            </div>
+            <div class="flex justify-end gap-2 pt-1">
+              <button id="player-profile-cancel" type="button" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button type="submit" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Save Profile</button>
+            </div>
+          </form>
+        `);
+        bindProfilePhotoControls('profile');
+        document.getElementById('player-profile-cancel').addEventListener('click', closeModal);
+        document.getElementById('player-profile-form').addEventListener('submit', async event => {
+          event.preventDefault();
+          const name = document.getElementById('profile-player-name').value.trim();
+          const photoUrl = getProfilePhotoValue('profile');
+          const ageInput = document.getElementById('profile-age').value;
+          const usedCodes = new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean));
+          const profile = {
+            name,
+            playerId: current.playerId || createPlayerId(),
+            playerCode: current.playerCode || createPlayerCode(usedCodes),
+            photoUrl,
+            age: ageInput ? Number(ageInput) : null,
+            club: document.getElementById('profile-club').value.trim(),
+            ranking: document.getElementById('profile-ranking').value.trim()
+          };
+          if (photoUrl && !photoUrl.startsWith('data:')) {
+            try {
+              const parsedUrl = new URL(photoUrl);
+              if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('Unsupported protocol');
+            } catch (_err) {
+              showToast('Photo must be an HTTP or HTTPS URL', 'error');
+              return;
+            }
+          }
+          if (profile.age !== null && (!Number.isInteger(profile.age) || profile.age < 1 || profile.age > 120)) {
+            showToast('Age must be a whole number between 1 and 120', 'error');
+            return;
+          }
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          submit.disabled = true;
+          try {
+            const savedProfile = await persistPlayerProfile(profile);
+            closeModal();
+              if (onSaved) {
+                onSaved(savedProfile);
+              } else {
+                state.ui.selectedPlayerName = savedProfile.name;
+                state.ui.headToHeadOpponent = '';
+                playerData.error = '';
+                saveRegistry();
+                render();
+                showToast('Player profile saved', 'success');
+              }
+          } catch (err) {
+            submit.disabled = false;
+            showToast(`Could not save player profile: ${err.message}`, 'error');
+          }
+        });
+      }
+
+      function renderOwnPlayerProfileEditor(profile) {
+        const visibility = profile.visibility || {};
+        const preferredEvents = new Set(profile.preferredEvents || []);
+        const visible = field => visibility[field] !== false;
+        const visibilityFields = [
+          ['name', 'Full name'], ['nickname', 'Nickname'], ['photoUrl', 'Profile photo'],
+          ['age', 'Age'], ['gender', 'Gender'], ['club', 'Club / Academy'], ['ranking', 'Ranking'], ['country', 'Country'],
+          ['state', 'State'], ['city', 'City'], ['emergencyContact', 'Emergency contact'],
+          ['playingHand', 'Playing hand'], ['preferredEvents', 'Preferred events'], ['email', 'Email']
+        ];
+        openModal(`
+          <form id="player-own-profile-form" class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold">My Player Profile</h3>
+              <p class="text-xs text-stone-500 dark:text-stone-400 mt-1">These details appear on your player card when their visibility is enabled.</p>
+              ${profile.playerCode ? `<p class="mt-2 text-xs font-mono font-bold text-gold-700 dark:text-gold-400">Player code: ${esc(profile.playerCode)}</p>` : ''}
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label for="own-profile-name" class="block font-semibold text-stone-500 mb-1">Full name</label>
+                <input id="own-profile-name" type="text" maxlength="120" required value="${esc(profile.name || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-nickname" class="block font-semibold text-stone-500 mb-1">Nickname</label>
+                <input id="own-profile-nickname" type="text" maxlength="80" value="${esc(profile.nickname || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div class="sm:col-span-2">
+                <label for="own-profile-photo-url" class="block font-semibold text-stone-500 mb-1">Profile photo</label>
+                <input id="own-profile-photo-url" type="text" maxlength="2048" value="${esc(profile.photoUrl && !profile.photoUrl.startsWith('data:') ? profile.photoUrl : '')}" placeholder="Paste an image URL or upload from your device" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                <input id="own-profile-photo-data" type="hidden" value="${esc(profile.photoUrl?.startsWith('data:') ? profile.photoUrl : '')}" />
+                <div class="mt-2 flex items-center gap-3">
+                  <img id="own-profile-photo-preview" alt="Profile photo preview" hidden class="h-12 w-12 rounded-full object-cover border border-stone-300 dark:border-stone-700" />
+                  <label class="cursor-pointer rounded-lg border border-stone-300 dark:border-stone-700 px-3 py-2 text-xs font-semibold hover:border-gold-500">Upload photo<input id="own-profile-photo-file" type="file" accept="image/jpeg,image/png,image/webp" class="sr-only" /></label>
+                  <button id="own-profile-photo-clear" type="button" class="text-xs text-stone-500 hover:text-red-500">Remove photo</button>
+                </div>
+              </div>
+              <div>
+                <label for="own-profile-gender" class="block font-semibold text-stone-500 mb-1">Gender</label>
+                <input id="own-profile-gender" type="text" maxlength="40" value="${esc(profile.gender || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-club" class="block font-semibold text-stone-500 mb-1">Club / Academy</label>
+                <input id="own-profile-club" type="text" maxlength="120" value="${esc(profile.club || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-country" class="block font-semibold text-stone-500 mb-1">Country</label>
+                <input id="own-profile-country" type="text" maxlength="80" value="${esc(profile.country || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-state" class="block font-semibold text-stone-500 mb-1">State</label>
+                <input id="own-profile-state" type="text" maxlength="80" value="${esc(profile.state || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-city" class="block font-semibold text-stone-500 mb-1">City</label>
+                <input id="own-profile-city" type="text" maxlength="80" value="${esc(profile.city || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-emergency" class="block font-semibold text-stone-500 mb-1">Emergency contact</label>
+                <input id="own-profile-emergency" type="text" maxlength="200" value="${esc(profile.emergencyContact || '')}" placeholder="Name and phone number" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-hand" class="block font-semibold text-stone-500 mb-1">Playing hand</label>
+                <select id="own-profile-hand" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700">
+                  <option value="" ${!profile.playingHand ? 'selected' : ''}>Not specified</option>
+                  <option value="Right" ${profile.playingHand === 'Right' ? 'selected' : ''}>Right</option>
+                  <option value="Left" ${profile.playingHand === 'Left' ? 'selected' : ''}>Left</option>
+                </select>
+              </div>
+              <div class="sm:col-span-2">
+                <span class="block font-semibold text-stone-500 mb-1">Preferred events</span>
+                <div class="flex flex-wrap gap-3">
+                  ${['Singles', 'Doubles', 'Mixed'].map(event => `
+                    <label class="inline-flex items-center gap-1.5">
+                      <input type="checkbox" name="own-profile-event" value="${event}" ${preferredEvents.has(event) ? 'checked' : ''} class="rounded border-stone-300 text-gold-500" />
+                      <span>${event}</span>
+                    </label>
+                  `).join('')}
+                </div>
+              </div>
+              <div class="sm:col-span-2">
+                <label for="own-profile-email" class="block font-semibold text-stone-500 mb-1">Email address (used to sign in)</label>
+                <input id="own-profile-email" type="email" maxlength="254" required value="${esc(profile.email || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+            </div>
+            <fieldset class="rounded-xl border border-stone-200 dark:border-stone-800 p-3">
+              <legend class="px-1 text-xs font-bold">Public profile visibility</legend>
+              <p class="text-[11px] text-stone-500 mb-2">You can hide any profile detail. Your name may still appear on historical tournament records.</p>
+              <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                ${visibilityFields.map(([field, label]) => `
+                  <label class="inline-flex items-center gap-2 text-[11px]">
+                    <input type="checkbox" data-own-profile-visibility="${field}" ${visible(field) ? 'checked' : ''} class="rounded border-stone-300 text-gold-500" />
+                    <span>Show ${label}</span>
+                  </label>
+                `).join('')}
+              </div>
+            </fieldset>
+            <div class="flex justify-end gap-2 pt-1">
+              <button id="player-own-profile-cancel" type="button" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button type="submit" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Save My Profile</button>
+            </div>
+          </form>
+        `);
+      }
+
+      function renderPlayerProfilesView() {
+        const analytics = window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId);
+        const directory = [...analytics.players].sort((a, b) => a.name.localeCompare(b.name));
+        const playerSearch = (state.ui.playerSearch || '').toLocaleLowerCase().trim();
+        const selected = analytics.getPlayer(state.ui.selectedPlayerName) || directory[0] || null;
+        const opponent = directory.find(player =>
+          player.key !== selected?.key && player.key === window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent)
+        ) || directory.find(player => player.key !== selected?.key) || null;
+        const headToHead = selected && opponent ? analytics.getHeadToHead(selected.name, opponent.name) : null;
+        const prediction = selected && opponent
+          ? analytics.getPrediction(selected.name, opponent.name, state.config.pointsToWin, state.config.deuceCap)
+          : null;
+        const profile = selected?.profile || {};
+        const badges = window.PlayerAnalytics.getBadges(selected);
+        const matchHistory = selected ? [...selected.results].reverse() : [];
+        const tournamentRank = selected ? analytics.getTournamentRank(selected.name, state.tournamentId) : null;
+        const seedPosition = selected ? analytics.getSeedPosition(selected.name, state.tournamentId) : null;
+        const playerState = playerData.tournaments.find(tournament =>
+          String(tournament.id || tournament.tournamentId) === String(state.tournamentId)
+        );
+        const groups = playerState?.data?.groups || [];
+        const playerGroup = selected && groups.find(group =>
+          (group.players || []).some(name => window.PlayerAnalytics.normalizeName(analytics.resolveName(name)) === selected.key)
+        );
+        const partnerships = selected ? analytics.getPartnerships(selected.name) : [];
+        const isOwnProfile = state.auth.role === 'player' && playerAccountProfile && samePlayerIdentity(profile, playerAccountProfile);
+        const ownRosterPlayer = isOwnProfile ? getOwnPlayerRosterEntry() : null;
+        const ownCheckIn = ownRosterPlayer ? state.checkIns?.[ownRosterPlayer.name] : null;
+        const publicName = profile.displayName || selected?.name || '';
+        const profileDetail = (field, label, value) => {
+          if (!value) return '';
+          const isVisible = profile.visibility?.[field] !== false;
+          if (!isVisible && !isOwnProfile) return '';
+          return `<span><b>${label}:</b> ${esc(value)}${!isVisible ? ' <span class="text-stone-400">(hidden publicly)</span>' : ''}</span>`;
+        };
+        const panelClass = 'rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800';
+        const metricCard = (label, value, note) => `
+          <div class="p-3.5 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+            <div class="text-[10px] sm:text-[11px] font-semibold uppercase tracking-wide text-stone-500">${label}</div>
+            <div class="text-xl font-extrabold mt-1 tabular-nums">${value}</div>
+            ${note ? `<div class="text-[10px] text-stone-500 mt-1">${esc(note)}</div>` : ''}
+          </div>
+        `;
+
+        return `
+          <section class="space-y-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight">Players &amp; Performance</h1>
+                <p class="text-sm text-stone-500 dark:text-stone-400 mt-1">Stats recalculate from completed scores across saved tournaments; pending matches are excluded.</p>
+              </div>
+              <div class="flex gap-2">
+                <button id="player-refresh-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-stone-100 dark:hover:bg-stone-800">Refresh Stats</button>
+                ${state.auth.role === 'admin' ? '<button id="player-invites-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Player Invites</button><button id="player-add-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">+ Add Profile</button>' : ''}
+              </div>
+            </div>
+            ${playerData.error ? `<div role="status" class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-700 dark:text-amber-300">${esc(playerData.error)}. Showing locally available results.</div>` : ''}
+            ${playerData.loading ? `<div class="p-3 rounded-lg ${panelClass} text-xs text-stone-500">Loading player history…</div>` : ''}
+            ${directory.length === 0 && !playerData.loading ? renderEmptyState('No players found', 'Add players to a tournament roster or create a player profile as an admin.') : `
+              <div class="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-5 items-start">
+                <aside class="${panelClass} p-4 space-y-3">
+                  <div class="flex items-center justify-between">
+                    <h2 class="font-bold text-sm">Player Directory</h2>
+                    <span class="text-[11px] text-stone-500">${directory.length} players</span>
+                  </div>
+                  <input id="player-directory-search" type="search" value="${esc(state.ui.playerSearch || '')}" placeholder="Search players…" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  <div class="max-h-[28rem] overflow-y-auto space-y-1">
+                    ${directory.map(player => `
+                      <button data-player-select="${esc(player.name)}" data-player-directory-name="${esc((player.profile.displayName || player.name).toLocaleLowerCase())}" class="w-full flex items-center gap-2.5 text-left p-2 rounded-lg transition ${playerSearch && !(player.profile.displayName || player.name).toLocaleLowerCase().includes(playerSearch) ? 'hidden' : ''} ${player.key === selected?.key ? 'bg-gold-500/15 border border-gold-500/30' : 'hover:bg-cream-100 dark:hover:bg-stone-800 border border-transparent'}">
+                        ${getPlayerAvatar(player.name, player.profile, 'w-9 h-9')}
+                        <span class="min-w-0 flex-1">
+                          <span class="block truncate text-xs font-semibold">${esc(player.profile.displayName || player.name)}</span>
+                          <span class="block text-[10px] text-stone-500">${player.wins}W · ${player.losses}L · PI ${Math.round(player.performanceIndex)}</span>
+                        </span>
+                      </button>
+                    `).join('')}
+                  </div>
+                </aside>
+
+                ${selected ? `
+                  <div class="space-y-5 min-w-0">
+                    <article class="${panelClass} p-4 sm:p-5 flex flex-wrap items-center gap-4">
+                      ${getPlayerAvatar(selected.name, profile, 'w-20 h-20')}
+                      <div class="min-w-0 flex-1">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <h2 class="text-xl font-extrabold">${esc(publicName)}</h2>
+                          <span class="px-2 py-0.5 rounded-full bg-gold-500/15 text-gold-700 dark:text-gold-400 text-[11px] font-bold">${selected.rating}</span>
+                        </div>
+                        <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-xs text-stone-500">
+                          ${profileDetail('age', 'Age', profile.age)}
+                          ${profileDetail('club', 'Club / Academy', profile.club)}
+                          ${profileDetail('ranking', 'Ranking', profile.ranking)}
+                        </div>
+                        <div class="text-xs font-semibold mt-2">${selected.titlesWon} title${selected.titlesWon === 1 ? '' : 's'} · ${selected.wins}W–${selected.losses}L</div>
+                        ${profile.playerCode ? `<div class="mt-1 text-[10px] font-mono text-stone-500">Player code: ${esc(profile.playerCode)}</div>` : ''}
+                        <div class="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-[11px] text-stone-500">
+                          ${profileDetail('nickname', 'Nickname', profile.nickname)}
+                          ${profileDetail('gender', 'Gender', profile.gender)}
+                          ${profileDetail('country', 'Country', profile.country)}
+                          ${profileDetail('state', 'State', profile.state)}
+                          ${profileDetail('city', 'City', profile.city)}
+                          ${profileDetail('emergencyContact', 'Emergency contact', profile.emergencyContact)}
+                          ${profileDetail('playingHand', 'Playing hand', profile.playingHand)}
+                          ${profileDetail('preferredEvents', 'Preferred events', (profile.preferredEvents || []).join(', '))}
+                          ${profileDetail('email', 'Email', profile.email)}
+                        </div>
+                      </div>
+                      <div class="flex gap-2">
+                        <button id="player-share-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Share Card</button>
+                        ${state.auth.role === 'admin' ? `<button id="player-edit-profile-btn" data-player-edit-name="${esc(selected.name)}" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit Profile</button>` : ''}
+                        ${isOwnProfile ? '<button id="player-edit-own-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Edit My Profile</button>' : ''}
+                        ${isOwnProfile && ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold ${ownCheckIn?.checkedIn ? 'opacity-70 cursor-not-allowed' : 'hover:bg-emerald-500'}">${ownCheckIn?.checkedIn ? `Checked In${ownCheckIn.time ? ` · ${esc(ownCheckIn.time)}` : ''}` : 'Check In'}</button>` : ''}
+                      </div>
+                      ${isOwnProfile && !ownRosterPlayer ? '<p class="w-full text-xs text-stone-500">You are not on this tournament roster, so check-in is unavailable.</p>' : ''}
+                    </article>
+
+                    <section class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+                      ${metricCard('Matches Played', selected.matchesPlayed)}
+                      ${metricCard('Matches Won', selected.wins)}
+                      ${metricCard('Matches Lost', selected.losses)}
+                      ${metricCard('Win Percentage', `${selected.winPercentage.toFixed(1)}%`)}
+                    </section>
+
+                    <section class="${panelClass} p-4 sm:p-5 space-y-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <h3 class="font-bold text-sm">Tournament Performance</h3>
+                          <p class="text-[11px] text-stone-500 mt-1">Ranking points use the tournament’s configured win and point-margin rules.</p>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
+                        ${metricCard('Tournament Rank', tournamentRank ? `#${tournamentRank}` : '—', state.config.name)}
+                        ${metricCard('Seed Position', seedPosition ? `#${seedPosition.position}` : '—', seedPosition ? `${playerGroup?.name || 'QR1 group'} · ${seedPosition.total} players` : 'Available after QR1')}
+                        ${metricCard('Ranking Points Earned', Math.round(selected.rankingPointsEarned))}
+                        ${metricCard('Titles Won', selected.titlesWon)}
+                        ${metricCard('Finals Reached', selected.finalsReached)}
+                        ${metricCard('Longest Win Streak', selected.longestWinningStreak)}
+                        ${metricCard('National / Club Rank', profile.visibility?.ranking === false && !isOwnProfile ? '—' : esc(profile.ranking || '—'))}
+                        ${metricCard('Avg. Point Difference', selected.averagePointDifference.toFixed(1))}
+                      </div>
+                    </section>
+
+                    <section class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div class="${panelClass} p-4 sm:p-5 space-y-3">
+                        <div class="flex items-center justify-between">
+                          <h3 class="font-bold text-sm">Recent Form</h3>
+                          <span class="text-sm font-extrabold text-gold-600 dark:text-gold-400">${Math.round(selected.formRating)}%</span>
+                        </div>
+                        <div class="flex items-center gap-1.5">
+                          ${(selected.form === '—' ? [] : selected.form.split('-')).map(result => `<span class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-extrabold ${result === 'W' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'}">${result}</span>`).join('') || '<span class="text-xs text-stone-500">No recorded matches</span>'}
+                        </div>
+                        <p class="text-xs text-stone-500">Last 5 matches · Form score ${Math.round(selected.formRating)}%</p>
+                      </div>
+                      <div class="${panelClass} p-4 sm:p-5 space-y-3">
+                        <div class="flex items-center justify-between gap-2">
+                          <div>
+                            <h3 class="font-bold text-sm">Performance Index</h3>
+                            <p class="text-[11px] text-stone-500 mt-1">Win rate 40% · normalized point diff 20% · normalized titles 20% · form 20%</p>
+                          </div>
+                          <div class="text-2xl font-extrabold tabular-nums">${Math.round(selected.performanceIndex)}</div>
+                        </div>
+                        <div class="h-2 rounded-full bg-stone-200 dark:bg-stone-800 overflow-hidden"><div class="h-full bg-gold-500 rounded-full" style="width:${selected.performanceIndex}%"></div></div>
+                        <div class="flex justify-between text-[10px] text-stone-500"><span>Beginner &lt;60</span><span>Intermediate 60–74</span><span>Advanced 75–89</span><span>Elite 90+</span></div>
+                      </div>
+                    </section>
+
+                    <section class="${panelClass} p-4 sm:p-5 space-y-3">
+                      <div>
+                        <h3 class="font-bold text-sm">Completed Match Scores</h3>
+                        <p class="text-[11px] text-stone-500 mt-1">Every saved score for this player, shown from their side of the match.</p>
+                      </div>
+                      ${matchHistory.length ? `
+                        <div class="max-h-96 overflow-y-auto divide-y divide-stone-200 dark:divide-stone-800">
+                          ${matchHistory.map(({ record, won, opponentSide }) => {
+                            const onSide1 = record.side1.some(name => window.PlayerAnalytics.normalizeName(name) === selected.key);
+                            const pointsFor = onSide1 ? record.points1 : record.points2;
+                            const pointsAgainst = onSide1 ? record.points2 : record.points1;
+                            const scoreText = record.gameScores?.length > 1
+                              ? record.gameScores.map(game => `${onSide1 ? game.s1 : game.s2}–${onSide1 ? game.s2 : game.s1}`).join(' · ')
+                              : `${pointsFor}–${pointsAgainst}`;
+                            const stage = { qr1: 'Qualifier 1', qr2: 'Qualifier 2', semis: 'Semi-final', finals: 'Final' }[record.stage] || record.stage;
+                            return `
+                              <article data-player-match-result="${esc(record.id)}" class="flex flex-wrap items-center justify-between gap-2 py-2.5 text-xs">
+                                <div class="min-w-0">
+                                  <div class="font-semibold">${esc(record.tournamentName)} · ${esc(stage)}${record.groupId ? ` · ${esc(record.groupId)}` : ''}</div>
+                                  <div class="mt-0.5 text-stone-500">vs ${esc(opponentSide.join(' & '))}${record.tournamentDate ? ` · ${esc(record.tournamentDate)}` : ''}</div>
+                                </div>
+                                <div class="flex items-center gap-2 shrink-0">
+                                  <span class="${won ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'} font-bold">${won ? 'Win' : 'Loss'}</span>
+                                  <span class="font-extrabold tabular-nums">${scoreText}</span>
+                                </div>
+                              </article>
+                            `;
+                          }).join('')}
+                        </div>
+                      ` : '<p class="rounded-lg bg-cream-50 dark:bg-[#111214] p-3 text-xs text-stone-500">No completed match scores yet.</p>'}
+                    </section>
+
+                    <section class="${panelClass} p-4 sm:p-5 space-y-4">
+                      <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 class="font-bold text-sm">Head-to-Head &amp; Match Forecast</h3>
+                          <p class="text-[11px] text-stone-500 mt-1">Includes singles and opposing doubles matchups.</p>
+                        </div>
+                        <select id="head-to-head-opponent" class="max-w-48 px-2.5 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" ${directory.length < 2 ? 'disabled' : ''}>
+                          ${directory.filter(player => player.key !== selected.key).map(player => `<option value="${esc(player.name)}" ${player.key === opponent?.key ? 'selected' : ''}>${esc(player.profile.displayName || player.name)}</option>`).join('')}
+                        </select>
+                      </div>
+                      ${opponent && headToHead ? `
+                        <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
+                          ${metricCard('Meetings', headToHead.totalMeetings)}
+                          ${metricCard('Wins / Losses', `${headToHead.wins} / ${headToHead.losses}`)}
+                          ${metricCard('Win % vs Opponent', `${headToHead.winPercentage.toFixed(1)}%`)}
+                          ${metricCard('Avg. Score Diff.', headToHead.averageScoreDifference.toFixed(1))}
+                          ${metricCard('Last Result', headToHead.lastMatchResult, headToHead.lastTournament)}
+                          ${metricCard('Win Streak', headToHead.currentWinStreak)}
+                        </div>
+                        <div class="rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 p-3 flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div class="text-xs font-semibold">Estimated next-match outlook</div>
+                            <div class="text-[10px] text-stone-500 mt-1">Heuristic from the Performance Index and recorded scores; not betting or official ranking advice.</div>
+                          </div>
+                          ${prediction ? `<div class="text-right text-xs tabular-nums"><div><b>${prediction.winProbabilityA.toFixed(0)}%</b> win chance · expected score <b>${prediction.expectedScoreA}–${prediction.expectedScoreB}</b></div><div class="text-[10px] text-stone-500 mt-1">Upset probability ${prediction.upsetProbability.toFixed(0)}% · sample confidence ${prediction.confidence.toFixed(0)}%</div></div>` : '<span class="text-xs text-stone-500">Select another player</span>'}
+                        </div>
+                      ` : '<p class="text-xs text-stone-500">Select another player to view comparison stats.</p>'}
+                    </section>
+
+                    <section class="${panelClass} p-4 sm:p-5 space-y-3">
+                      <div>
+                        <h3 class="font-bold text-sm">Doubles Partnerships</h3>
+                        <p class="text-[11px] text-stone-500 mt-1">Chemistry is wins together divided by completed matches together.</p>
+                      </div>
+                      ${partnerships.length ? `
+                        <div class="overflow-x-auto">
+                          <table class="w-full min-w-[600px] text-xs text-left">
+                            <thead class="text-[10px] uppercase text-stone-500 border-b border-stone-200 dark:border-stone-800"><tr><th class="py-2 pr-3">Partner</th><th class="px-2 py-2 text-center">Played</th><th class="px-2 py-2 text-center">Win Rate / Chemistry</th><th class="px-2 py-2 text-center">Titles Together</th><th class="px-2 py-2 text-center">Avg Points</th><th class="pl-2 py-2 text-right">Best Finish</th></tr></thead>
+                            <tbody class="divide-y divide-stone-100 dark:divide-stone-800/70">
+                              ${partnerships.map(partnership => `<tr><td class="py-2.5 pr-3 font-semibold">${esc(partnership.partnerName)}</td><td class="px-2 py-2.5 text-center">${partnership.matchesPlayedTogether}</td><td class="px-2 py-2.5 text-center">${partnership.winRateTogether.toFixed(0)}%</td><td class="px-2 py-2.5 text-center">${partnership.titlesTogether}</td><td class="px-2 py-2.5 text-center">${partnership.averagePointsPerMatch.toFixed(1)}</td><td class="pl-2 py-2.5 text-right">${esc(partnership.bestTournamentFinish)}</td></tr>`).join('')}
+                            </tbody>
+                          </table>
+                        </div>
+                      ` : '<p class="text-xs text-stone-500">Doubles partnership stats appear after completed doubles matches.</p>'}
+                    </section>
+
+                    <section class="${panelClass} p-4 sm:p-5 space-y-3">
+                      <h3 class="font-bold text-sm">Career Badges</h3>
+                      <div class="flex flex-wrap gap-2">
+                        ${badges.map(badge => `<span class="px-2.5 py-1.5 rounded-full border border-gold-500/30 bg-gold-500/10 text-xs font-semibold">${badge.icon} ${esc(badge.label)}</span>`).join('')}
+                        <span title="Awarding this badge is deferred until tournaments record three event categories." class="px-2.5 py-1.5 rounded-full border border-dashed border-stone-300 dark:border-stone-700 text-xs text-stone-500">👑 Triple Crown · 3-event tracking required</span>
+                        ${badges.length === 0 ? '<span class="text-xs text-stone-500">Milestone badges unlock as results are recorded.</span>' : ''}
+                      </div>
+                    </section>
+                  </div>
+                ` : ''}
+              </div>
+            `}
+          </section>
+        `;
+      }
+
+      function renderPlayerCheckInScreen() {
+        if (state.auth.role === 'player') {
+          const players = getAllImportedPlayers();
+          const checkedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
+          return `
+            <div class="min-h-screen flex flex-col items-center justify-center p-4">
+              <div class="absolute top-4 right-4">${renderThemeSwitcher()}</div>
+              <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 space-y-5">
+                <div class="flex items-center justify-between gap-2">
+                  <div>
+                    <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
+                    <p class="text-xs text-stone-500">Check-in is view-only for player accounts.</p>
+                  </div>
+                  <button id="exit-player-checkin-btn" class="px-2.5 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Back</button>
+                </div>
+                <div class="rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 p-4">
+                  <div class="text-xs text-stone-500">Players checked in</div>
+                  <div class="mt-1 text-2xl font-extrabold tabular-nums">${checkedInCount} / ${players.length}</div>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+        const players = getAllImportedPlayers();
+        const checkedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
+        return `
+          <div class="min-h-screen flex flex-col items-center justify-center p-4">
+            <div class="absolute top-4 right-4">${renderThemeSwitcher()}</div>
+            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 sm:p-8 space-y-5">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">Player QR Check-In · ${checkedInCount}/${players.length} signed in</p>
+                </div>
+                <button id="exit-player-checkin-btn" class="px-2.5 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-cream-100 dark:hover:bg-stone-800">Back</button>
+              </div>
+
+              <div id="checkin-confirm-banner" class="hidden rounded-xl bg-emerald-500/15 border border-emerald-500/30 p-3 text-xs font-semibold text-emerald-700 dark:text-emerald-300"></div>
+
+              <div class="space-y-2">
+                <label class="block text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400">Find Your Name</label>
+                <input id="player-checkin-search" type="text" placeholder="Search imported player name..." class="w-full px-3.5 py-2.5 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm focus:outline-none focus:ring-2 focus:ring-gold-500" />
+              </div>
+
+              <div id="player-checkin-list" class="max-h-64 overflow-y-auto divide-y divide-stone-100 dark:divide-stone-800 border border-stone-200 dark:border-stone-800 rounded-xl">
+                ${players.map(p => {
+                  const isSignedIn = Boolean(state.checkIns?.[p.name]?.checkedIn);
+                  const time = state.checkIns?.[p.name]?.time || '';
+                  return `
+                    <div class="px-3.5 py-2.5 flex items-center justify-between gap-2" data-checkin-item="${esc(p.name.toLowerCase())}">
+                      <div class="min-w-0">
+                        <div class="text-sm font-semibold truncate">${esc(p.name)}</div>
+                        <div class="text-[11px] text-stone-500">${esc(p.group)}${p.isLeader ? ' · ★ Leader' : ''}</div>
+                      </div>
+                      ${isSignedIn
+                        ? `<span class="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-semibold whitespace-nowrap">✓ Signed In (${esc(time)})</span>`
+                        : `<button data-player-self-checkin="${esc(p.name)}" class="px-3 py-1.5 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold whitespace-nowrap transition">Sign In</button>`}
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+
+            </div>
+          </div>
+        `;
+      }
+
+      function renderCheckInView() {
+        const isAdmin = state.auth.role === 'admin';
+        const players = getAllImportedPlayers();
+        const signedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
+        const pendingCount = players.length - signedInCount;
+        const pct = players.length > 0 ? Math.round((signedInCount / players.length) * 100) : 0;
+        const filter = state.ui.checkInFilter || 'ALL';
+        const search = (state.ui.checkInSearch || '').toLowerCase().trim();
+        const groupFilter = state.ui.checkInGroupFilter ?? 'ALL';
+        const skillMin = state.ui.checkInSkillMin !== '' && state.ui.checkInSkillMin !== undefined ? Number(state.ui.checkInSkillMin) : 1;
+        const skillMax = state.ui.checkInSkillMax !== '' && state.ui.checkInSkillMax !== undefined ? Number(state.ui.checkInSkillMax) : 10;
+
+        const filtered = players.filter(p => {
+          const isSignedIn = Boolean(state.checkIns?.[p.name]?.checkedIn);
+          const skill = getPlayerSkill(p.name);
+          if (filter === 'SIGNED_IN' && !isSignedIn) return false;
+          if (filter === 'PENDING' && isSignedIn) return false;
+          if (groupFilter !== 'ALL' && String(p.groupIndex) !== String(groupFilter)) return false;
+          if (skill < skillMin || skill > skillMax) return false;
+          if (search && !p.name.toLowerCase().includes(search) && !p.group.toLowerCase().includes(search)) return false;
+          return true;
+        });
+
+        return `
+          <div class="space-y-6">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 class="text-base font-bold">Imported vs. Signed-In Players</h2>
+                <p class="text-xs text-stone-500 dark:text-stone-400">Track attendance from your imported roster and QR check-ins</p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                ${isAdmin ? '<button id="ci-import-btn" class="px-3.5 py-2 rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 text-xs font-semibold transition">Import Players</button>' : ''}
+                <button id="show-qr-modal-btn" class="px-3.5 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold transition">Show Check-In QR Code</button>
+                <button id="launch-kiosk-btn" class="px-3.5 py-2 rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 text-xs font-semibold transition">Open Player Sign-In</button>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Imported Players</div>
+                <div class="text-2xl font-extrabold mt-1 tabular-nums">${players.length}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Signed In</div>
+                <div class="text-2xl font-extrabold mt-1 text-emerald-600 dark:text-emerald-400 tabular-nums">${signedInCount}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Not Signed In</div>
+                <div class="text-2xl font-extrabold mt-1 text-amber-600 dark:text-amber-400 tabular-nums">${pendingCount}</div>
+              </div>
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Attendance</div>
+                <div class="text-2xl font-extrabold mt-1 text-gold-600 dark:text-gold-400 tabular-nums">${pct}%</div>
+              </div>
+            </div>
+
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <button data-checkin-filter="ALL" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${filter === 'ALL' ? 'bg-gold-500 text-stone-950' : 'bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800'}">All (${players.length})</button>
+                <button data-checkin-filter="SIGNED_IN" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${filter === 'SIGNED_IN' ? 'bg-emerald-600 text-white' : 'bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800'}">Signed In (${signedInCount})</button>
+                <button data-checkin-filter="PENDING" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${filter === 'PENDING' ? 'bg-amber-500 text-stone-950' : 'bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800'}">Not Signed In (${pendingCount})</button>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <input id="checkin-table-search" type="text" value="${esc(state.ui.checkInSearch || '')}" placeholder="Filter by name..." class="w-40 sm:w-48 px-3 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs" />
+                <select id="checkin-group-filter" class="px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs">
+                  <option value="ALL" ${groupFilter === 'ALL' ? 'selected' : ''}>All Groups</option>
+                  ${state.groups.map((g, gi) => `<option value="${gi}" ${String(groupFilter) === String(gi) ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}
+                </select>
+                <div class="inline-flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+                  <span>Skill:</span>
+                  <input id="checkin-skill-min" type="number" min="1" max="10" placeholder="1" value="${esc(state.ui.checkInSkillMin ?? '')}" class="w-12 px-1.5 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs text-center tabular-nums" />
+                  <span>–</span>
+                  <input id="checkin-skill-max" type="number" min="1" max="10" placeholder="10" value="${esc(state.ui.checkInSkillMax ?? '')}" class="w-12 px-1.5 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs text-center tabular-nums" />
+                </div>
+                ${(filter !== 'ALL' || search || groupFilter !== 'ALL' || state.ui.checkInSkillMin || state.ui.checkInSkillMax)
+                  ? '<button id="checkin-clear-filters" class="px-2.5 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Clear</button>'
+                  : ''}
+              </div>
+            </div>
+
+            ${isAdmin ? `
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-3.5 flex flex-wrap items-center gap-2">
+                <span class="text-xs font-bold text-stone-500 dark:text-stone-400 mr-1">Add Player:</span>
+                <input id="ci-add-name" type="text" placeholder="Player name" class="flex-1 min-w-[150px] px-3 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                <select id="ci-add-group" class="px-2.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs">
+                  ${state.groups.map((g, gi) => `<option value="${gi}">${esc(g.name)}</option>`).join('')}
+                </select>
+                <input id="ci-add-skill" type="number" min="1" max="10" value="5" title="Skill (1-10)" class="w-14 px-2 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs text-center font-semibold tabular-nums" />
+                <label class="inline-flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-300 px-1">
+                  <input id="ci-add-signedin" type="checkbox" checked class="rounded border-stone-300 text-gold-500" />
+                  <span>Signed In</span>
+                </label>
+                <button id="ci-add-btn" class="px-3.5 py-1.5 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold transition">+ Add</button>
+              </div>
+            ` : ''}
+
+            <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
+              <div class="overflow-x-auto">
+                <table class="w-full text-xs sm:text-sm text-left">
+                  <thead class="bg-cream-100/70 dark:bg-stone-800/60 text-stone-500 dark:text-stone-400 text-[11px] uppercase">
+                    <tr>
+                      <th class="px-4 py-2.5">Player</th>
+                      <th class="px-4 py-2.5">Group</th>
+                      <th class="px-4 py-2.5 text-center">Skill</th>
+                      <th class="px-4 py-2.5">Status</th>
+                      <th class="px-4 py-2.5">Sign-In Time</th>
+                      ${isAdmin ? '<th class="px-4 py-2.5 text-right">Action</th>' : ''}
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-stone-100 dark:divide-stone-800/70">
+                    ${filtered.length === 0 ? `<tr><td colspan="${isAdmin ? 5 : 4}" class="px-4 py-6 text-center text-xs text-stone-500">No players match this filter.</td></tr>` : filtered.map(p => {
+                      const info = state.checkIns?.[p.name];
+                      const isSignedIn = Boolean(info?.checkedIn);
+                      return `
+                        <tr>
+                          <td class="px-4 py-2">
+                            ${isAdmin ? `
+                              <div class="flex items-center gap-1.5">
+                                <button data-ci-leader="${p.groupIndex}:${p.playerIndex}" title="Toggle group leader" class="w-6 h-6 rounded flex items-center justify-center text-xs ${p.isLeader ? 'bg-gold-500/20 text-gold-500' : 'text-stone-400 hover:text-gold-500'}">★</button>
+                                <input data-ci-edit-name="${p.groupIndex}:${p.playerIndex}" type="text" value="${esc(p.name)}" class="w-32 sm:w-40 px-2 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs font-semibold" />
+                              </div>
+                            ` : `<span class="font-semibold">${esc(p.name)} ${p.isLeader ? '<span class="text-gold-500 text-xs">★</span>' : ''}</span>`}
+                          </td>
+                          <td class="px-4 py-2">
+                            ${isAdmin ? `
+                              <select data-ci-move-group="${p.groupIndex}:${p.playerIndex}" class="px-2 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs">
+                                ${state.groups.map((og, ogi) => `<option value="${ogi}" ${ogi === p.groupIndex ? 'selected' : ''}>${esc(og.name)}</option>`).join('')}
+                              </select>
+                            ` : `<span class="text-stone-500 dark:text-stone-400">${esc(p.group)}</span>`}
+                          </td>
+                          <td class="px-4 py-2 text-center">
+                            ${isAdmin ? `
+                              <input data-ci-edit-skill="${esc(p.name)}" type="number" min="1" max="10" value="${getPlayerSkill(p.name)}" class="w-12 px-1.5 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs text-center font-semibold tabular-nums" />
+                            ` : `<span class="font-semibold tabular-nums">${getPlayerSkill(p.name)}/10</span>`}
+                          </td>
+                          <td class="px-4 py-2">
+                            ${isSignedIn
+                              ? '<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">Signed In</span>'
+                              : '<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400">Not Signed In</span>'}
+                          </td>
+                          <td class="px-4 py-2 text-xs text-stone-500 tabular-nums">
+                            ${isAdmin && isSignedIn
+                              ? `<input data-ci-edit-time="${esc(p.name)}" type="text" value="${esc(info.time || '')}" class="w-20 px-2 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs tabular-nums" />`
+                              : (isSignedIn ? esc(info.time || '—') : '—')}
+                          </td>
+                          ${isAdmin ? `
+                            <td class="px-4 py-2 text-right whitespace-nowrap">
+                              <div class="inline-flex items-center gap-1.5">
+                                <button data-toggle-checkin="${esc(p.name)}" class="px-2.5 py-1 rounded-lg text-xs font-semibold transition ${isSignedIn ? 'border border-stone-300 dark:border-stone-700 text-stone-500 hover:bg-stone-100 dark:hover:bg-stone-800' : 'bg-emerald-600 hover:bg-emerald-500 text-white'}">
+                                  ${isSignedIn ? 'Undo' : 'Check In'}
+                                </button>
+                                <button data-ci-remove="${p.groupIndex}:${p.playerIndex}" title="Remove player" class="w-7 h-7 rounded-lg text-stone-400 hover:text-red-500 hover:bg-red-500/10 text-xs">✕</button>
+                              </div>
+                            </td>
+                          ` : ''}
+                        </tr>
+                      `;
+                    }).join('')}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderBracketOverlay(asPage) {
+        const poolBracket = (poolKey, accent) => {
+          const sf = state.semis[poolKey] || [];
+          const fn = state.finals[poolKey];
+          return `
+            <div class="rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
+              <h3 class="font-bold text-base ${accent}">Pool ${poolKey} Bracket</h3>
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+                <div class="space-y-3">
+                  <div class="text-xs font-semibold uppercase text-stone-500">Semi-Finals</div>
+                  ${[0, 1].map(i => {
+                    const m = sf[i];
+                    return `
+                      <div class="p-3 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 text-xs space-y-1">
+                        <div class="text-stone-400 font-medium">Semi-Final ${i + 1}</div>
+                        ${m ? `<div class="font-semibold">${esc(m.t1)} ${m.completed ? `(${m.s1})` : ''}</div><div class="font-semibold">${esc(m.t2)} ${m.completed ? `(${m.s2})` : ''}</div>` : `<div class="italic text-stone-400">Awaiting QR2</div>`}
+                      </div>
+                    `;
+                  }).join('')}
+                </div>
+                <div class="space-y-2">
+                  <div class="text-xs font-semibold uppercase text-stone-500">Final</div>
+                  <div class="p-3 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 text-xs space-y-1">
+                    <div class="text-stone-400 font-medium">Pool ${poolKey} Final</div>
+                    ${fn ? `<div class="font-semibold">${esc(fn.t1)}</div><div class="font-semibold">${esc(fn.t2)}</div>` : `<div class="italic text-stone-400">Awaiting Semis</div>`}
+                  </div>
+                </div>
+                <div class="space-y-2">
+                  <div class="text-xs font-semibold uppercase text-stone-500">Winner</div>
+                  <div class="p-4 rounded-lg bg-gold-500/10 border border-gold-500/30 text-sm font-bold text-center">
+                    ${fn?.winner ? esc(fn.winner) : 'TBD'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          `;
+        };
+
+        return `
+          <div class="${asPage ? 'space-y-4' : 'fixed inset-0 z-40 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto'}">
+            <div class="w-full max-w-5xl ${asPage ? 'mx-auto rounded-xl' : 'rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto'} bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-6 space-y-5">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <h2 class="text-lg font-bold">Tournament Bracket</h2>
+                ${asPage
+                  ? `<a href="${esc(getPageUrl('finals'))}" data-tab="finals" class="inline-flex min-h-11 items-center rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-stone-950">View Finals</a>`
+                  : '<button id="close-bracket-btn" class="px-3 py-1.5 rounded-lg bg-stone-200 dark:bg-stone-800 text-xs font-semibold">Close</button>'}
+              </div>
+              ${getActiveQR2PoolKeys().map(k => poolBracket(k, getPoolAccent(k))).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      function renderEmptyState(title, desc) {
+        return `
+          <div class="rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-10 text-center max-w-lg mx-auto my-8 space-y-2">
+            <h2 class="text-base font-bold">${esc(title)}</h2>
+            <p class="text-sm text-stone-500 dark:text-stone-400">${esc(desc)}</p>
+          </div>
+        `;
+      }
+
+      function bindThemeButtons() {
+        document.querySelectorAll('[data-theme-btn]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            applyTheme(btn.getAttribute('data-theme-btn'));
+            render();
+          });
+        });
+      }
+
+      function bindReadOnlyPlayerCheckInEvents() {
+        bindThemeButtons();
+        document.getElementById('exit-player-checkin-btn')?.addEventListener('click', () => {
+          state.ui.playerCheckInMode = false;
+          if (window.location.hash === '#checkin') {
+            try { history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e) {}
+          }
+          render();
+        });
+      }
+
+      function bindPlayerCheckInEvents() {
+        bindThemeButtons();
+        document.getElementById('exit-player-checkin-btn')?.addEventListener('click', () => {
+          state.ui.playerCheckInMode = false;
+          if (window.location.hash === '#checkin') {
+            try { history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e) {}
+          }
+          render();
+        });
+        document.getElementById('player-checkin-search')?.addEventListener('input', (e) => {
+          const q = e.target.value.toLowerCase().trim();
+          document.querySelectorAll('[data-checkin-item]').forEach(row => {
+            const name = row.getAttribute('data-checkin-item') || '';
+            row.classList.toggle('hidden', Boolean(q && !name.includes(q)));
+          });
+        });
+        document.querySelectorAll('[data-player-self-checkin]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const name = btn.getAttribute('data-player-self-checkin');
+            markPlayerCheckedIn(name, 'qr');
+            render();
+            const banner = document.getElementById('checkin-confirm-banner');
+            if (banner) {
+              banner.textContent = `✓ ${name} is signed in!`;
+              banner.classList.remove('hidden');
+            }
+            showToast(`${name} signed in`, 'success');
+          });
+        });
+      }
+
+      function bindLoginEvents() {
+        bindThemeButtons();
+        document.getElementById('login-form').addEventListener('submit', (e) => {
+          e.preventDefault();
+          loginAdmin(document.getElementById('pin-input').value.trim());
+        });
+        document.getElementById('guest-btn').addEventListener('click', loginGuest);
+        document.getElementById('player-login-form')?.addEventListener('submit', async event => {
+          event.preventDefault();
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          const error = document.getElementById('player-login-error');
+          submit.disabled = true;
+          error.classList.add('hidden');
+          playerAuthError = '';
+          try {
+            const result = await requestPlayerApi('/api/player-auth/login', {
+              method: 'POST',
+              body: JSON.stringify({
+                email: document.getElementById('player-login-email').value.trim(),
+                password: document.getElementById('player-login-password').value
+              })
+            });
+            applyPlayerAccount(result.player);
+            render();
+            showToast('Signed in as Player', 'success');
+          } catch (err) {
+            error.textContent = err.message;
+            error.classList.remove('hidden');
+            submit.disabled = false;
+          }
+        });
+        document.getElementById('register-player-type')?.addEventListener('change', event => {
+          const existing = event.target.value === 'existing' && playerInviteContext?.roster.length > 0;
+          document.getElementById('register-existing-player-wrap')?.classList.toggle('hidden', !existing);
+          document.getElementById('register-new-player-wrap')?.classList.toggle('hidden', existing);
+        });
+        if (playerInviteContext && !playerInviteContext.invite.targetName) {
+          document.getElementById('register-player-type')?.dispatchEvent(new Event('change'));
+        }
+        document.getElementById('player-register-form')?.addEventListener('submit', async event => {
+          event.preventDefault();
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          const password = document.getElementById('register-player-password').value;
+          const confirmation = document.getElementById('register-player-password-confirm').value;
+          if (password !== confirmation) {
+            playerInviteError = 'Passwords do not match';
+            const error = document.getElementById('player-register-error');
+            error.textContent = playerInviteError;
+            error.classList.remove('hidden');
+            return;
+          }
+          const body = {
+            inviteToken: playerInviteToken,
+            email: document.getElementById('register-player-email').value.trim(),
+            password
+          };
+          if (playerInviteContext.invite.targetName) {
+            body.registrationType = 'player';
+          } else if (document.getElementById('register-player-type').value === 'existing') {
+            body.registrationType = 'existing';
+            body.playerName = document.getElementById('register-existing-player').value;
+          } else {
+            body.registrationType = 'new';
+            body.playerName = document.getElementById('register-new-player').value.trim();
+          }
+          submit.disabled = true;
+          playerInviteError = '';
+          try {
+            const result = await requestPlayerApi('/api/player-auth/register', {
+              method: 'POST',
+              body: JSON.stringify(body)
+            });
+            applyPlayerAccount(result.player);
+            const url = new URL(window.location.href);
+            url.searchParams.delete('playerInvite');
+            history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+            render();
+            showToast('Player account created', 'success');
+          } catch (err) {
+            playerInviteError = err.message;
+            const error = document.getElementById('player-register-error');
+            error.textContent = playerInviteError;
+            error.classList.remove('hidden');
+            submit.disabled = false;
+          }
+        });
+      }
+
+      function bindSetupWizardEvents() {
+        document.querySelectorAll('[data-setup-step-nav]').forEach(button => {
+          button.addEventListener('click', () => {
+            const step = Number(button.getAttribute('data-setup-step-nav'));
+            if (!Number.isInteger(step) || step < 1 || step > 5 || step === state.ui.setupStep) return;
+            if (state.auth.role === 'admin' && state.ui.setupStep === 3) sortGroupsByName();
+            state.ui.setupStep = step;
+            if (state.auth.role === 'player') render();
+            else {
+              saveState();
+              render();
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          });
+        });
+      }
+
+      function applyPlayerReadOnlyControls() {
+        const safeSelectors = [
+          '[data-tab]', '[data-player-select]', '#open-bracket-btn', '#player-refresh-btn',
+          '#player-directory-search', '#head-to-head-opponent', '#player-share-btn',
+          '#player-edit-own-profile-btn', '#player-self-checkin-btn', '[data-open-tournament]', '#tournament-history-refresh',
+          '[data-setup-step-nav]'
+        ].join(',');
+        document.querySelectorAll('main input, main select, main textarea, main button').forEach(control => {
+          if (control.matches(safeSelectors)) return;
+          control.disabled = true;
+          control.classList.add('opacity-50', 'cursor-not-allowed');
+        });
+      }
+
+      function bindPlayerAppEvents() {
+        bindThemeButtons();
+        bindSetupWizardEvents();
+        bindPageLinks();
+        document.getElementById('logout-btn')?.addEventListener('click', async () => {
+          try {
+            await requestPlayerApi('/api/player-auth/logout', { method: 'POST' });
+          } catch (err) {
+            showToast(`Could not end the player session cleanly: ${err.message}`, 'error');
+          }
+          clearPlayerAccountProfile();
+          state.auth.loggedIn = false;
+          state.auth.role = 'guest';
+          saveRegistry();
+          render();
+        });
+        document.getElementById('tournament-switcher')?.addEventListener('change', event => switchTournament(event.target.value));
+        document.querySelectorAll('[data-open-tournament]').forEach(button => {
+          button.addEventListener('click', () => openTournamentFromCatalog(button.getAttribute('data-open-tournament')));
+        });
+        document.getElementById('tournament-history-refresh')?.addEventListener('click', async event => {
+          event.currentTarget.disabled = true;
+          await loadTournamentCatalog(true);
+          render();
+        });
+        document.getElementById('player-directory-search')?.addEventListener('input', event => {
+          const query = event.target.value.toLocaleLowerCase().trim();
+          document.querySelectorAll('[data-player-directory-name]').forEach(button => {
+            button.classList.toggle('hidden', Boolean(query && !button.getAttribute('data-player-directory-name').includes(query)));
+          });
+        });
+        document.querySelectorAll('[data-player-select]').forEach(button => {
+          button.addEventListener('click', () => {
+            state.ui.selectedPlayerName = button.getAttribute('data-player-select');
+            if (window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent) === window.PlayerAnalytics.normalizeName(state.ui.selectedPlayerName)) {
+              state.ui.headToHeadOpponent = '';
+            }
+            render();
+          });
+        });
+        document.getElementById('head-to-head-opponent')?.addEventListener('change', event => {
+          state.ui.headToHeadOpponent = event.target.value;
+          render();
+        });
+        document.querySelectorAll('[data-player-photo]').forEach(image => {
+          image.addEventListener('error', () => image.remove(), { once: true });
+        });
+        document.getElementById('player-refresh-btn')?.addEventListener('click', async event => {
+          event.currentTarget.disabled = true;
+          await loadPlayerData(true);
+          render();
+        });
+        document.getElementById('player-share-btn')?.addEventListener('click', () => {
+          const shareUrl = new URL(window.location.href);
+          shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
+          if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(shareUrl.toString())
+              .then(() => showToast('Player card link copied', 'success'))
+              .catch(() => showToast(shareUrl.toString()));
+          } else {
+            showToast(shareUrl.toString());
+          }
+        });
+        document.getElementById('player-edit-own-profile-btn')?.addEventListener('click', () => {
+          renderOwnPlayerProfileEditor(playerAccountProfile);
+          bindOwnPlayerProfileEditor();
+        });
+        document.getElementById('player-self-checkin-btn')?.addEventListener('click', async event => {
+          const button = event.currentTarget;
+          const rosterEntry = getOwnPlayerRosterEntry();
+          if (!rosterEntry) return;
+          button.disabled = true;
+          try {
+            const playerName = rosterEntry.name;
+            const result = await requestPlayerApi(`/api/player-auth/tournaments/${encodeURIComponent(state.tournamentId)}/checkin`, {
+              method: 'POST',
+              body: JSON.stringify({ playerName })
+            });
+            markPlayerCheckedIn(playerName, 'player', false, result.time);
+            render();
+            showToast('You are checked in', 'success');
+          } catch (err) {
+            button.disabled = false;
+            showToast(`Could not check in: ${err.message}`, 'error');
+          }
+        });
+      }
+
+      function bindOwnPlayerProfileEditor() {
+        bindProfilePhotoControls('own-profile');
+        document.getElementById('player-own-profile-cancel')?.addEventListener('click', closeModal);
+        document.getElementById('player-own-profile-form')?.addEventListener('submit', async event => {
+          event.preventDefault();
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          const photoUrl = getProfilePhotoValue('own-profile');
+          if (photoUrl && !photoUrl.startsWith('data:')) {
+            try {
+              const parsed = new URL(photoUrl);
+              if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported protocol');
+            } catch (_err) {
+              showToast('Photo must be an HTTP or HTTPS URL', 'error');
+              return;
+            }
+          }
+          const profile = {
+            name: document.getElementById('own-profile-name').value.trim(),
+            nickname: document.getElementById('own-profile-nickname').value.trim(),
+            photoUrl,
+            gender: document.getElementById('own-profile-gender').value.trim(),
+            club: document.getElementById('own-profile-club').value.trim(),
+            country: document.getElementById('own-profile-country').value.trim(),
+            state: document.getElementById('own-profile-state').value.trim(),
+            city: document.getElementById('own-profile-city').value.trim(),
+            emergencyContact: document.getElementById('own-profile-emergency').value.trim(),
+            playingHand: document.getElementById('own-profile-hand').value,
+            preferredEvents: [...document.querySelectorAll('[name="own-profile-event"]:checked')].map(input => input.value),
+            email: document.getElementById('own-profile-email').value.trim(),
+            visibility: Object.fromEntries([...document.querySelectorAll('[data-own-profile-visibility]')].map(input => [
+              input.getAttribute('data-own-profile-visibility'), input.checked
+            ]))
+          };
+          submit.disabled = true;
+          try {
+            const result = await requestPlayerApi('/api/player-auth/me', {
+              method: 'PUT',
+              body: JSON.stringify(profile)
+            });
+            applyPlayerAccount(result.player);
+            closeModal();
+            render();
+            showToast('Player profile updated', 'success');
+          } catch (err) {
+            submit.disabled = false;
+            showToast(`Could not update player profile: ${err.message}`, 'error');
+          }
+        });
+      }
+
+      async function openPlayerInvitesModal() {
+        await loadPlayerData();
+        const apiUrl = getSyncApiUrl();
+        const playerNames = [...new Set([
+          ...playerData.profiles.map(profile => profile.name),
+          ...window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId).players.map(player => player.name)
+        ])].sort((a, b) => a.localeCompare(b));
+        const adminRequest = async (path, options) => {
+          if (!apiUrl) throw new Error('Configure the backend API URL before managing player invitations');
+          const response = await fetch(`${apiUrl}${path}`, {
+            credentials: 'same-origin',
+            ...options,
+            headers: { ...getSyncHeaders(), ...(options?.headers || {}) }
+          });
+          let result;
+          try { result = await response.json(); } catch (_err) {
+            throw new Error(`Unexpected response from invite API (HTTP ${response.status})`);
+          }
+          if (!response.ok) throw new Error(result.error || `Invite API request failed (HTTP ${response.status})`);
+          return result;
+        };
+        let inviteList = [];
+        let listError = '';
+        try {
+          inviteList = (await adminRequest('/api/player-invites')).invites || [];
+        } catch (err) {
+          listError = err.message;
+        }
+        openModal(`
+          <div class="w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-5">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-base font-bold">Player Invitations</h3>
+                <p class="text-xs text-stone-500 mt-1">Generate links to share manually. No email or SMS is sent by the app.</p>
+              </div>
+              <button id="player-invites-close" type="button" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs">Close</button>
+            </div>
+            <form id="player-invite-create-form" class="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+              <label class="text-xs font-semibold text-stone-500">
+                Invitation type
+                <select id="player-invite-kind" class="mt-1 w-full px-3 py-2 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs">
+                  <option value="player">Specific roster player (one use)</option>
+                  <option value="generic">Reusable invitation</option>
+                </select>
+              </label>
+              <label id="player-invite-player-wrap" class="text-xs font-semibold text-stone-500">
+                Player
+                <select id="player-invite-player" class="mt-1 w-full px-3 py-2 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs">
+                  ${playerNames.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}
+                </select>
+                ${playerNames.length ? '' : '<span class="block mt-1 font-normal">No current players found; a specific invitation can create a profile with the entered name.</span>'}
+                ${playerNames.length ? '' : '<input id="player-invite-new-name" type="text" maxlength="120" placeholder="Player full name" class="mt-2 w-full px-3 py-2 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs" />'}
+              </label>
+              <label class="text-xs font-semibold text-stone-500">
+                Share method
+                <select id="player-invite-contact-type" class="mt-1 w-full px-3 py-2 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs">
+                  <option value="link">Copy link</option><option value="email">Email</option><option value="text">Text message</option>
+                </select>
+              </label>
+              <label id="player-invite-contact-wrap" class="hidden text-xs font-semibold text-stone-500">
+                <span id="player-invite-contact-label">Contact</span>
+                <input id="player-invite-contact-value" type="text" maxlength="254" class="mt-1 w-full px-3 py-2 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs" />
+              </label>
+              <p id="player-invite-error" role="alert" class="hidden sm:col-span-2 text-xs text-red-600 dark:text-red-400"></p>
+              <div class="sm:col-span-2 flex justify-end">
+                <button type="submit" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Generate Invitation Link</button>
+              </div>
+            </form>
+            <div id="player-invite-created" class="hidden p-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 space-y-2"></div>
+            <div>
+              <h4 class="text-sm font-bold mb-2">Existing invitations</h4>
+              ${listError ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(listError)}</p>` : inviteList.length ? `
+                <div class="max-h-64 overflow-y-auto space-y-2">
+                  ${inviteList.map(invite => {
+                    const expired = Date.parse(invite.expiresAt) <= Date.now();
+                    const exhausted = invite.maxUses !== null && Number(invite.usedCount) >= Number(invite.maxUses);
+                    const active = !invite.revokedAt && !expired && !exhausted;
+                    return `<div class="flex flex-wrap items-center justify-between gap-2 p-3 rounded-lg border border-stone-200 dark:border-stone-800 text-xs">
+                      <div><b>${invite.kind === 'player' ? esc(invite.targetName) : 'Reusable invite'}</b>
+                        <span class="text-stone-500"> · ${invite.contactType || 'link'}${invite.targetEmail ? ` · ${esc(invite.targetEmail)}` : ''}${invite.contactValue && invite.contactType === 'text' ? ` · ${esc(invite.contactValue)}` : ''}</span>
+                        <div class="mt-1 text-[10px] text-stone-500">${Number(invite.usedCount)} used · expires ${esc(new Date(invite.expiresAt).toLocaleDateString())} · ${invite.revokedAt ? 'revoked' : expired ? 'expired' : exhausted ? 'used' : 'active'}</div>
+                      </div>
+                      ${active ? `<button type="button" data-revoke-player-invite="${esc(invite.id)}" class="px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400">Revoke</button>` : ''}
+                    </div>`;
+                  }).join('')}
+                </div>
+              ` : '<p class="text-xs text-stone-500">No invitations created yet.</p>'}
+            </div>
+          </div>
+        `);
+        document.getElementById('player-invites-close').addEventListener('click', closeModal);
+        const kindSelect = document.getElementById('player-invite-kind');
+        const contactSelect = document.getElementById('player-invite-contact-type');
+        const playerSelect = document.getElementById('player-invite-player');
+        const newName = document.getElementById('player-invite-new-name');
+        const playerWrap = document.getElementById('player-invite-player-wrap');
+        const contactWrap = document.getElementById('player-invite-contact-wrap');
+        const contactLabel = document.getElementById('player-invite-contact-label');
+        const contactInput = document.getElementById('player-invite-contact-value');
+        const updateInviteInputs = () => {
+          playerWrap.classList.toggle('hidden', kindSelect.value !== 'player');
+          const method = contactSelect.value;
+          contactWrap.classList.toggle('hidden', method === 'link');
+          contactLabel.textContent = method === 'email' ? 'Email address (registration must use this email)' : 'Phone number';
+          contactInput.type = method === 'email' ? 'email' : 'tel';
+          contactInput.required = method !== 'link';
+          contactInput.placeholder = method === 'email' ? 'player@example.com' : '+1 555 123 4567';
+        };
+        kindSelect.addEventListener('change', updateInviteInputs);
+        contactSelect.addEventListener('change', updateInviteInputs);
+        updateInviteInputs();
+        document.getElementById('player-invite-create-form').addEventListener('submit', async event => {
+          event.preventDefault();
+          const submit = event.currentTarget.querySelector('button[type="submit"]');
+          const error = document.getElementById('player-invite-error');
+          const contactType = contactSelect.value;
+          const body = {
+            kind: kindSelect.value,
+            targetName: kindSelect.value === 'player' ? (newName?.value.trim() || playerSelect?.value || '') : '',
+            contactType,
+            contactValue: contactType === 'link' ? '' : contactInput.value.trim()
+          };
+          submit.disabled = true;
+          error.classList.add('hidden');
+          try {
+            const result = await adminRequest('/api/player-invites', {
+              method: 'POST',
+              body: JSON.stringify(body)
+            });
+            const inviteUrl = new URL(window.location.href);
+            inviteUrl.searchParams.delete('player');
+            inviteUrl.searchParams.set('playerInvite', result.invite.token);
+            const link = inviteUrl.toString();
+            const shareAction = contactType === 'email'
+              ? ` <a class="underline font-semibold" href="mailto:${encodeURIComponent(body.contactValue)}?subject=${encodeURIComponent('Player account invitation')}&body=${encodeURIComponent(`Create your player account: ${link}`)}">Open email</a>`
+              : contactType === 'text'
+                ? ` <a class="underline font-semibold" href="sms:${encodeURIComponent(body.contactValue)}?body=${encodeURIComponent(`Create your player account: ${link}`)}">Open text message</a>`
+                : '';
+            const created = document.getElementById('player-invite-created');
+            created.innerHTML = `<div class="text-xs font-semibold">Invitation link generated. Share it manually; it expires in 30 days.</div>
+              <div class="break-all text-[11px]">${esc(link)}</div>
+              <div class="flex gap-3 text-xs"><button id="player-invite-copy" type="button" class="underline font-semibold">Copy link</button>${shareAction}</div>`;
+            created.classList.remove('hidden');
+            document.getElementById('player-invite-copy').addEventListener('click', async () => {
+              try {
+                await navigator.clipboard.writeText(link);
+                showToast('Player invitation link copied', 'success');
+              } catch (_err) {
+                showToast(link);
+              }
+            });
+            showToast('Player invitation created', 'success');
+          } catch (err) {
+            error.textContent = err.message;
+            error.classList.remove('hidden');
+          } finally {
+            submit.disabled = false;
+          }
+        });
+        document.querySelectorAll('[data-revoke-player-invite]').forEach(button => {
+          button.addEventListener('click', async () => {
+            button.disabled = true;
+            try {
+              await adminRequest(`/api/player-invites/${encodeURIComponent(button.getAttribute('data-revoke-player-invite'))}/revoke`, { method: 'POST' });
+              closeModal();
+              await openPlayerInvitesModal();
+              showToast('Player invitation revoked', 'success');
+            } catch (err) {
+              button.disabled = false;
+              showToast(`Could not revoke invitation: ${err.message}`, 'error');
+            }
+          });
+        });
+      }
+
+      function loadSpreadsheetParser() {
+        if (window.XLSX) return Promise.resolve(window.XLSX);
+        if (spreadsheetParserPromise) return spreadsheetParserPromise;
+        spreadsheetParserPromise = new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+          script.async = true;
+          script.onload = () => window.XLSX
+            ? resolve(window.XLSX)
+            : reject(new Error('The spreadsheet parser did not initialize'));
+          script.onerror = () => {
+            spreadsheetParserPromise = null;
+            reject(new Error('Could not load the Excel parser. Check your connection and try again.'));
+          };
+          document.head.appendChild(script);
+        });
+        return spreadsheetParserPromise;
+      }
+
+      function readImportSheet(wizard) {
+        const worksheet = wizard.workbook?.Sheets?.[wizard.sheetName];
+        if (!worksheet) throw new Error('Choose a worksheet to continue');
+        const matrix = window.XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false, defval: '' });
+        if (!matrix.length || !Array.isArray(matrix[0])) throw new Error('The worksheet is empty');
+        wizard.headers = matrix[0].map((value, index) => String(value || '').trim() || `Column ${index + 1}`);
+        wizard.rows = matrix.slice(1).filter(row => row.some(value => String(value ?? '').trim() !== ''));
+        if (!wizard.headers.length) throw new Error('The first row must contain column headings');
+        if (wizard.rows.length > 2000) throw new Error('Import up to 2,000 players at a time');
+        wizard.mapping = Object.fromEntries(PLAYER_IMPORT_FIELDS.map(field => {
+          const accepted = new Set([field.key, ...field.headers].map(normalizeImportHeader));
+          const index = wizard.headers.findIndex(header => accepted.has(normalizeImportHeader(header)));
+          return [field.key, index < 0 ? -1 : index];
+        }));
+      }
+
+      function parseImportRows(wizard) {
+        const entries = [];
+        const errors = [];
+        wizard.rows.forEach((row, index) => {
+          const value = key => {
+            const column = wizard.mapping[key];
+            return column === undefined || column < 0 ? '' : String(row[column] ?? '').trim();
+          };
+          const sourceName = value('name');
+          const hasData = PLAYER_IMPORT_FIELDS.some(field => value(field.key));
+          if (!hasData) return;
+          const rowNumber = index + 2;
+          if (!sourceName) {
+            errors.push({ rowNumber, sourceName: '', error: 'Player name is required' });
+            return;
+          }
+
+          const sourcePlayerId = value('playerId');
+          if (sourcePlayerId && !isValidPlayerId(sourcePlayerId)) {
+            errors.push({ rowNumber, sourceName, error: 'Player ID must be a UUID' });
+            return;
+          }
+          const sourcePlayerCode = value('playerCode');
+          if (sourcePlayerCode && !/^\d{6}$/.test(sourcePlayerCode)) {
+            errors.push({ rowNumber, sourceName, error: 'Player code must be a six-digit number' });
+            return;
+          }
+          const rawAge = value('age');
+          const age = rawAge ? Number(rawAge) : null;
+          if (age !== null && (!Number.isInteger(age) || age < 1 || age > 120)) {
+            errors.push({ rowNumber, sourceName, error: 'Age must be a whole number from 1 to 120' });
+            return;
+          }
+          const email = value('email').toLowerCase();
+          if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            errors.push({ rowNumber, sourceName, error: 'Email address is invalid' });
+            return;
+          }
+          const photoUrl = value('photoUrl');
+          if (photoUrl) {
+            try {
+              if (!['http:', 'https:'].includes(new URL(photoUrl).protocol)) throw new Error();
+            } catch (_err) {
+              errors.push({ rowNumber, sourceName, error: 'Photo URL must use HTTP or HTTPS' });
+              return;
+            }
+          }
+          const rawHand = normalizeImportHeader(value('playingHand'));
+          const playingHand = !rawHand ? '' :
+            ['r', 'right', 'righthand', 'righthanded'].includes(rawHand) ? 'Right' :
+              ['l', 'left', 'lefthand', 'lefthanded'].includes(rawHand) ? 'Left' : null;
+          if (playingHand === null) {
+            errors.push({ rowNumber, sourceName, error: 'Playing hand must be Right or Left' });
+            return;
+          }
+          const preferredEvents = [];
+          const eventError = value('preferredEvents').split(/[,;|/]/).map(event => event.trim()).filter(Boolean).some(event => {
+            const normalized = normalizeImportName(event);
+            const match = normalized === 'single' || normalized === 'singles' ? 'Singles' :
+              normalized === 'double' || normalized === 'doubles' ? 'Doubles' :
+                normalized === 'mixed' || normalized === 'mixed doubles' ? 'Mixed' : '';
+            if (!match) return true;
+            if (!preferredEvents.includes(match)) preferredEvents.push(match);
+            return false;
+          });
+          if (eventError) {
+            errors.push({ rowNumber, sourceName, error: 'Preferred events must be Singles, Doubles, or Mixed' });
+            return;
+          }
+          const aliases = value('aliases').split(/[;,|]/).map(alias => alias.trim()).filter(Boolean);
+          if (aliases.some(alias => alias.length > 120) || aliases.length > 30) {
+            errors.push({ rowNumber, sourceName, error: 'Use up to 30 aliases, each 120 characters or fewer' });
+            return;
+          }
+          entries.push({
+            rowNumber,
+            sourceName,
+            profile: {
+              name: sourceName,
+              playerId: sourcePlayerId,
+              playerCode: sourcePlayerCode,
+              nickname: value('nickname'),
+              email,
+              club: value('club'),
+              gender: value('gender'),
+              country: value('country'),
+              state: value('state'),
+              city: value('city'),
+              emergencyContact: value('emergencyContact'),
+              playingHand,
+              preferredEvents,
+              photoUrl,
+              age,
+              ranking: value('ranking'),
+              aliases
+            }
+          });
+        });
+        return { entries, errors };
+      }
+
+      function matchImportedPlayer(entry, directory) {
+        const profile = entry.profile;
+        const nameKeys = new Set([profile.name, ...(profile.aliases || [])].map(normalizeImportName).filter(Boolean));
+        const signals = [];
+        const addSignal = (matches, label) => {
+          const unique = new Map(matches.map(item => [item.playerId || item.name, item]));
+          if (unique.size > 1) throw new Error(`${label} matches more than one existing player`);
+          if (unique.size) signals.push([...unique.values()][0]);
+        };
+        if (profile.playerId) {
+          addSignal(directory.profiles.filter(item => String(item.playerId || '').toLowerCase() === profile.playerId.toLowerCase()), 'Player ID');
+        }
+        if (profile.playerCode) {
+          addSignal(directory.profiles.filter(item => String(item.playerCode || '') === profile.playerCode), 'Player code');
+        }
+        addSignal(directory.profiles.filter(item => [
+          item.name,
+          item.nickname,
+          ...(Array.isArray(item.aliases) ? item.aliases : [])
+        ].some(name => nameKeys.has(normalizeImportName(name)))), 'Name or alias');
+        const email = profile.email.toLocaleLowerCase();
+        if (email) addSignal(directory.profiles.filter(item => String(item.email || '').trim().toLocaleLowerCase() === email), 'Email');
+        const distinctProfiles = new Map(signals.map(item => [item.playerId || item.name, item]));
+        if (distinctProfiles.size > 1) throw new Error('Name, email, or ID point to different existing players');
+        const existingProfile = distinctProfiles.values().next().value || null;
+        if (existingProfile) {
+          return { existingProfile, canonicalName: existingProfile.name, existingRosterPlayer: true };
+        }
+        const rosterMatches = [...new Set(directory.rosterNames.filter(name => nameKeys.has(normalizeImportName(name))))];
+        if (rosterMatches.length > 1) throw new Error('This name is ambiguous in existing tournament rosters');
+        return {
+          existingProfile: null,
+          canonicalName: rosterMatches[0] || profile.name,
+          existingRosterPlayer: rosterMatches.length > 0
+        };
+      }
+
+      function prepareImportPreview(wizard) {
+        const { entries, errors } = parseImportRows(wizard);
+        const seen = new Set();
+        const importRows = [];
+        const previewRows = [];
+        let duplicateRows = 0;
+        entries.forEach(entry => {
+          try {
+            const match = matchImportedPlayer(entry, wizard.directory);
+            const keys = [
+              match.existingProfile?.playerId ? `id:${match.existingProfile.playerId.toLowerCase()}` : '',
+              entry.profile.playerId ? `id:${entry.profile.playerId.toLowerCase()}` : '',
+              entry.profile.playerCode ? `code:${entry.profile.playerCode}` : '',
+              entry.profile.email ? `email:${entry.profile.email.toLocaleLowerCase()}` : '',
+              `name:${normalizeImportName(match.canonicalName)}`
+            ].filter(Boolean);
+            if (keys.some(key => seen.has(key))) {
+              duplicateRows++;
+              previewRows.push({ ...entry, ...match, status: 'Duplicate row · skipped', duplicate: true });
+              return;
+            }
+            keys.forEach(key => seen.add(key));
+            const aliases = [...new Set([
+              ...(entry.profile.aliases || []),
+              normalizeImportName(entry.sourceName) !== normalizeImportName(match.canonicalName) ? entry.sourceName : ''
+            ].filter(Boolean))];
+            const profile = { ...entry.profile, name: match.canonicalName, aliases };
+            const importEntry = { ...entry, ...match, profile };
+            importRows.push(importEntry);
+            previewRows.push({
+              ...importEntry,
+              status: match.existingProfile
+                ? `Existing profile · code ${match.existingProfile.playerCode || 'will be assigned'}`
+                : match.existingRosterPlayer
+                  ? 'Existing tournament player · profile will be created'
+                  : 'New player profile'
+            });
+          } catch (err) {
+            errors.push({ rowNumber: entry.rowNumber, sourceName: entry.sourceName, error: err.message });
+            previewRows.push({ ...entry, status: 'Needs attention' });
+          }
+        });
+        errors.forEach(error => previewRows.push({ ...error, status: error.error }));
+        wizard.importRows = importRows;
+        wizard.previewRows = previewRows;
+        wizard.validationErrors = errors;
+        wizard.duplicateRows = duplicateRows;
+      }
+
+      function mergeImportedLocalProfile(entry) {
+        const current = entry.existingProfile;
+        const incoming = entry.profile;
+        const aliases = [...new Set([
+          ...(current?.aliases || []),
+          ...(incoming.aliases || []),
+          normalizeImportName(entry.sourceName) !== normalizeImportName(entry.canonicalName) ? entry.sourceName : ''
+        ].filter(Boolean))];
+        const savedProfile = current ? {
+          ...current,
+          name: current.name,
+          playerId: current.playerId || incoming.playerId || createPlayerId(),
+          playerCode: current.playerCode || incoming.playerCode,
+          photoUrl: current.photoUrl || incoming.photoUrl,
+          age: current.age ?? incoming.age,
+          nickname: current.nickname || incoming.nickname,
+          gender: current.gender || incoming.gender,
+          club: current.club || incoming.club,
+          country: current.country || incoming.country,
+          state: current.state || incoming.state,
+          city: current.city || incoming.city,
+          emergencyContact: current.emergencyContact || incoming.emergencyContact,
+          playingHand: current.playingHand || incoming.playingHand,
+          preferredEvents: current.preferredEvents?.length ? current.preferredEvents : incoming.preferredEvents,
+          email: current.email || incoming.email,
+          ranking: current.ranking || incoming.ranking,
+          aliases
+        } : {
+          ...incoming,
+          name: entry.canonicalName,
+          playerId: incoming.playerId || createPlayerId(),
+          playerCode: incoming.playerCode || createPlayerCode(
+            new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean))
+          ),
+          aliases
+        };
+        return cachePlayerProfile(savedProfile);
+      }
+
+      async function completePlayerImport(wizard, button) {
+        button.disabled = true;
+        button.textContent = 'Importing…';
+        const closeButton = document.getElementById('player-import-close');
+        if (closeButton) closeButton.disabled = true;
+        try {
+          let result;
+          const apiUrl = getSyncApiUrl();
+          if (apiUrl) {
+            const response = await fetch(`${apiUrl}/api/player-import`, {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: getSyncHeaders(),
+              body: JSON.stringify({ players: wizard.importRows.map(entry => entry.profile) })
+            });
+            let responseBody;
+            try { responseBody = await response.json(); } catch (_err) {
+              throw new Error(`Unexpected response from player import (HTTP ${response.status})`);
+            }
+            if (!response.ok) throw new Error(responseBody.error || `Player import failed (HTTP ${response.status})`);
+            result = responseBody;
+            (result.players || []).forEach(item => {
+              if (item.profile) cachePlayerProfile(item.profile);
+            });
+          } else {
+            const imported = wizard.importRows.map(entry => {
+              const profile = mergeImportedLocalProfile(entry);
+              return {
+                name: profile.name,
+                playerId: profile.playerId,
+                status: entry.existingProfile ? 'matched' : entry.existingRosterPlayer ? 'existing-roster' : 'created',
+                profile
+              };
+            });
+            result = {
+              players: imported,
+              createdProfiles: imported.filter(item => item.status !== 'matched').length,
+              matchedProfiles: imported.filter(item => item.status === 'matched').length,
+              identifiedRosterPlayers: imported.filter(item => item.status === 'existing-roster').length,
+              duplicateRows: wizard.duplicateRows
+            };
+          }
+          const uniquePlayers = [];
+          const identities = new Set();
+          (result.players || []).forEach(player => {
+            const identity = player.playerId || `name:${normalizeImportName(player.name)}`;
+            if (!identities.has(identity)) {
+              identities.add(identity);
+              uniquePlayers.push(player);
+            }
+          });
+          if (uniquePlayers.length < state.groups.length) {
+            throw new Error(`Only ${uniquePlayers.length} unique players remain after duplicate matching. Import at least ${state.groups.length} to fill every group.`);
+          }
+          state.groups.forEach(group => { group.players = []; group.leader = ''; });
+          uniquePlayers.forEach((player, index) => {
+            const group = state.groups[index % state.groups.length];
+            group.players.push(player.name);
+            if (!group.leader) group.leader = player.name;
+          });
+          saveState();
+          if (apiUrl) {
+            clearTimeout(syncTimer);
+            syncTimer = null;
+            await pushToTurso(false);
+            await loadPlayerData(true);
+          }
+          wizard.closed = true;
+          closeModal();
+          render();
+          const skippedDuplicates = wizard.duplicateRows + (result.duplicateRows || 0);
+          showToast(
+            `Imported ${uniquePlayers.length} unique players · ${result.createdProfiles || 0} profiles created · ${result.matchedProfiles || 0} existing profiles matched${skippedDuplicates ? ` · ${skippedDuplicates} duplicate rows skipped` : ''}`,
+            'success'
+          );
+        } catch (err) {
+          if (wizard.closed) return;
+          wizard.error = err.message;
+          renderImportWizard(wizard);
+        }
+      }
+
+      function renderImportWizard(wizard) {
+        if (wizard.closed) return;
+        const stepLabels = ['Choose file', 'Match columns', 'Review import'];
+        const directoryStatus = wizard.directoryLoading
+          ? '<p class="text-xs text-stone-500">Checking existing players and tournament rosters…</p>'
+          : wizard.directoryError
+            ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(wizard.directoryError)}</p>`
+            : `<p class="text-xs text-stone-500">${wizard.directory.profiles.length} profiles and ${wizard.directory.rosterNames.length} roster names will be checked for duplicates.</p>`;
+        let content = '';
+        if (wizard.step === 1) {
+          content = `
+            <div class="space-y-4">
+              <label class="block text-xs font-semibold text-stone-600 dark:text-stone-300">
+                Excel or CSV file
+                <input id="player-import-file" type="file" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv" class="mt-1 block w-full rounded-lg border border-stone-300 dark:border-stone-700 bg-cream-50 dark:bg-[#111214] p-3 text-xs" />
+              </label>
+              <p class="text-[11px] text-stone-500">The first worksheet row must contain column headings. Files are read in this browser; only mapped player details are sent to the app when you confirm.</p>
+              ${wizard.fileName ? `<p class="text-xs font-medium">${esc(wizard.fileName)}</p>` : ''}
+              ${wizard.sheetNames.length > 1 ? `
+                <label class="block text-xs font-semibold text-stone-600 dark:text-stone-300">
+                  Worksheet
+                  <select id="player-import-sheet" class="mt-1 w-full rounded-lg border border-stone-300 dark:border-stone-700 bg-cream-50 dark:bg-[#111214] p-2.5 text-sm">
+                    ${wizard.sheetNames.map(name => `<option value="${esc(name)}" ${name === wizard.sheetName ? 'selected' : ''}>${esc(name)}</option>`).join('')}
+                  </select>
+                </label>` : ''}
+              ${directoryStatus}
+            </div>`;
+        } else if (wizard.step === 2) {
+          content = `
+            <div class="space-y-3">
+              <p class="text-xs text-stone-500">Match the spreadsheet headings to player profile fields. Player name is required; unmapped fields are left unchanged.</p>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[48vh] overflow-y-auto pr-1">
+                ${PLAYER_IMPORT_FIELDS.map(field => `
+                  <label class="block text-xs font-semibold text-stone-600 dark:text-stone-300">
+                    ${field.label}${field.required ? ' *' : ''}
+                    <select data-player-import-field="${field.key}" class="mt-1 w-full rounded-lg border border-stone-300 dark:border-stone-700 bg-cream-50 dark:bg-[#111214] p-2.5 text-sm">
+                      <option value="-1">Do not import</option>
+                      ${wizard.headers.map((header, index) => `<option value="${index}" ${wizard.mapping[field.key] === index ? 'selected' : ''}>${esc(header)}</option>`).join('')}
+                    </select>
+                  </label>
+                `).join('')}
+              </div>
+            </div>`;
+        } else {
+          const newCount = wizard.importRows.filter(entry => !entry.existingProfile && !entry.existingRosterPlayer).length;
+          const matchedCount = wizard.importRows.filter(entry => entry.existingProfile).length;
+          const rosterCount = wizard.importRows.filter(entry => !entry.existingProfile && entry.existingRosterPlayer).length;
+          const invalidCount = wizard.validationErrors.length;
+          content = `
+            <div class="space-y-4">
+              <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+                Import replaces this tournament’s roster. Existing player profiles and historical results are kept. Matching uses player ID, email, full name, and known aliases; repeated players are included only once.
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                <div class="rounded-lg bg-cream-50 dark:bg-[#111214] p-3"><b class="block text-lg">${wizard.importRows.length}</b><span class="text-[10px] text-stone-500">Unique roster players</span></div>
+                <div class="rounded-lg bg-cream-50 dark:bg-[#111214] p-3"><b class="block text-lg">${newCount}</b><span class="text-[10px] text-stone-500">New profiles</span></div>
+                <div class="rounded-lg bg-cream-50 dark:bg-[#111214] p-3"><b class="block text-lg">${matchedCount}</b><span class="text-[10px] text-stone-500">Existing profiles</span></div>
+                <div class="rounded-lg bg-cream-50 dark:bg-[#111214] p-3"><b class="block text-lg">${rosterCount}</b><span class="text-[10px] text-stone-500">Roster-only players</span></div>
+              </div>
+              ${wizard.duplicateRows ? `<p class="text-xs text-amber-700 dark:text-amber-300">${wizard.duplicateRows} duplicate spreadsheet row(s) will be skipped.</p>` : ''}
+              ${invalidCount ? `<div role="alert" class="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-700 dark:text-red-300">${invalidCount} row(s) need correction before import: ${wizard.validationErrors.slice(0, 5).map(error => `Row ${error.rowNumber}: ${error.error}`).join('; ')}</div>` : ''}
+              ${wizard.importRows.length < state.groups.length ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">At least ${state.groups.length} unique players are required to fill all groups.</p>` : ''}
+              <div class="max-h-60 overflow-auto rounded-lg border border-stone-200 dark:border-stone-800">
+                <table class="w-full text-left text-xs">
+                  <thead class="sticky top-0 bg-cream-100 dark:bg-stone-800"><tr><th class="p-2">Row</th><th class="p-2">Spreadsheet name</th><th class="p-2">Matched player</th><th class="p-2">Result</th></tr></thead>
+                  <tbody>
+                    ${wizard.previewRows.slice(0, 40).map(entry => `
+                      <tr class="border-t border-stone-200 dark:border-stone-800">
+                        <td class="p-2 tabular-nums">${entry.rowNumber}</td>
+                        <td class="p-2">${esc(entry.sourceName || '—')}</td>
+                        <td class="p-2">${esc(entry.canonicalName || '—')}</td>
+                        <td class="p-2">${esc(entry.status || '')}</td>
+                      </tr>`).join('')}
+                  </tbody>
+                </table>
+              </div>
+              ${wizard.previewRows.length > 40 ? `<p class="text-[11px] text-stone-500">Showing 40 of ${wizard.previewRows.length} rows.</p>` : ''}
+            </div>`;
+        }
+
+        const stepButtons = wizard.step === 1
+          ? `<button id="player-import-next" type="button" ${!wizard.workbook || wizard.directoryLoading || wizard.directoryError ? 'disabled' : ''} class="min-h-11 rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-stone-950 disabled:opacity-50">Match columns</button>`
+          : wizard.step === 2
+            ? `<button id="player-import-back" type="button" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-4 py-2 text-sm font-semibold">Back</button><button id="player-import-preview" type="button" class="min-h-11 rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-stone-950">Review matches</button>`
+            : `<button id="player-import-back" type="button" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-4 py-2 text-sm font-semibold">Back</button><button id="player-import-confirm" type="button" ${wizard.validationErrors.length || wizard.importRows.length < state.groups.length ? 'disabled' : ''} class="min-h-11 rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-stone-950 disabled:opacity-50">Import &amp; create profiles</button>`;
+        openModal(`
+          <div class="w-full max-w-4xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-6 space-y-5">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <h3 class="text-base font-bold">Import players from Excel</h3>
+                <p class="mt-1 text-xs text-stone-500">Match players to existing profiles and tournament rosters before adding anyone.</p>
+              </div>
+              <button id="player-import-close" type="button" aria-label="Close import wizard" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-3 text-sm">Close</button>
+            </div>
+            <ol class="grid grid-cols-3 gap-2">
+              ${stepLabels.map((label, index) => `
+                <li class="rounded-lg p-2 text-center text-[11px] font-semibold ${wizard.step === index + 1 ? 'bg-gold-500/15 text-gold-700 dark:text-gold-300' : wizard.step > index + 1 ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-cream-100 dark:bg-stone-800 text-stone-500'}">${index + 1}. ${label}</li>
+              `).join('')}
+            </ol>
+            ${wizard.error ? `<p role="alert" class="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-700 dark:text-red-300">${esc(wizard.error)}</p>` : ''}
+            ${content}
+            <div class="flex flex-wrap justify-end gap-2 border-t border-stone-200 dark:border-stone-800 pt-4">
+              ${stepButtons}
+            </div>
+          </div>
+        `);
+
+        document.getElementById('player-import-close').addEventListener('click', () => {
+          wizard.closed = true;
+          closeModal();
+        });
+        document.getElementById('player-import-file')?.addEventListener('change', async event => {
+          const file = event.currentTarget.files?.[0];
+          if (!file) return;
+          if (file.size > 10 * 1024 * 1024) {
+            wizard.error = 'Choose a file smaller than 10 MB';
+            renderImportWizard(wizard);
+            return;
+          }
+          wizard.fileName = file.name;
+          wizard.error = '';
+          try {
+            const XLSX = await loadSpreadsheetParser();
+            wizard.workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', raw: false });
+            wizard.sheetNames = wizard.workbook.SheetNames || [];
+            if (!wizard.sheetNames.length) throw new Error('The workbook contains no worksheets');
+            wizard.sheetName = wizard.sheetNames[0];
+            readImportSheet(wizard);
+          } catch (err) {
+            wizard.workbook = null;
+            wizard.error = err.message;
+          }
+          if (!wizard.closed) renderImportWizard(wizard);
+        });
+        document.getElementById('player-import-sheet')?.addEventListener('change', event => {
+          wizard.sheetName = event.currentTarget.value;
+          wizard.error = '';
+          try { readImportSheet(wizard); } catch (err) { wizard.error = err.message; }
+          renderImportWizard(wizard);
+        });
+        document.getElementById('player-import-next')?.addEventListener('click', () => {
+          wizard.step = 2;
+          wizard.error = '';
+          renderImportWizard(wizard);
+        });
+        document.getElementById('player-import-back')?.addEventListener('click', () => {
+          wizard.step--;
+          wizard.error = '';
+          renderImportWizard(wizard);
+        });
+        document.getElementById('player-import-preview')?.addEventListener('click', () => {
+          wizard.mapping = Object.fromEntries([...document.querySelectorAll('[data-player-import-field]')].map(select => [
+            select.getAttribute('data-player-import-field'),
+            Number(select.value)
+          ]));
+          if (wizard.mapping.name === undefined || wizard.mapping.name < 0) {
+            wizard.error = 'Map a spreadsheet column to Player name to continue';
+            renderImportWizard(wizard);
+            return;
+          }
+          try {
+            prepareImportPreview(wizard);
+            wizard.step = 3;
+            wizard.error = '';
+          } catch (err) {
+            wizard.error = err.message;
+          }
+          renderImportWizard(wizard);
+        });
+        document.getElementById('player-import-confirm')?.addEventListener('click', event => {
+          completePlayerImport(wizard, event.currentTarget);
+        });
+      }
+
+      function openImportRosterModal() {
+        const wizard = {
+          step: 1,
+          fileName: '',
+          workbook: null,
+          sheetNames: [],
+          sheetName: '',
+          headers: [],
+          rows: [],
+          mapping: {},
+          directory: { profiles: [], rosterNames: [] },
+          directoryLoading: true,
+          directoryError: '',
+          importRows: [],
+          previewRows: [],
+          validationErrors: [],
+          duplicateRows: 0,
+          error: ''
+        };
+        renderImportWizard(wizard);
+        getPlayerImportDirectory().then(directory => {
+          wizard.directory = directory;
+        }).catch(err => {
+          wizard.directoryError = err.message;
+        }).finally(() => {
+          wizard.directoryLoading = false;
+          if (!wizard.closed) renderImportWizard(wizard);
+        });
+      }
+
+      function movePlayerToGroup(fromGi, pi, toGi) {
+        const from = state.groups[fromGi];
+        const to = state.groups[toGi];
+        const moved = from?.players?.[pi];
+        if (!moved || !to || fromGi === toGi) return false;
+        if (to.players.some(name => normalizeImportName(name) === normalizeImportName(moved))) {
+          showToast(`${moved} is already in ${to.name}`, 'error');
+          return false;
+        }
+        from.players.splice(pi, 1);
+        if (from.leader === moved) from.leader = from.players[0] || '';
+        to.players.push(moved);
+        if (!to.leader) to.leader = moved;
+        saveState();
+        render();
+        showToast(`Moved ${moved} to ${to.name}`, 'success');
+        return true;
+      }
+
+      function bindPlayerDragAndDrop() {
+        if (state.auth.role !== 'admin') return;
+        document.querySelectorAll('[data-player-drag]').forEach(handle => {
+          handle.addEventListener('dragstart', event => {
+            const row = handle.closest('[data-player-row]');
+            if (!event.dataTransfer || !row) {
+              event.preventDefault();
+              return;
+            }
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', handle.getAttribute('data-player-drag'));
+            handle.setAttribute('aria-grabbed', 'true');
+            row.classList.add('is-dragging');
+          });
+          handle.addEventListener('dragend', () => {
+            handle.setAttribute('aria-grabbed', 'false');
+            handle.closest('[data-player-row]')?.classList.remove('is-dragging');
+            document.querySelectorAll('.player-drop-active').forEach(group => group.classList.remove('player-drop-active'));
+          });
+        });
+        document.querySelectorAll('[data-player-drop-group]').forEach(group => {
+          group.addEventListener('dragenter', event => {
+            event.preventDefault();
+            group.classList.add('player-drop-active');
+          });
+          group.addEventListener('dragover', event => {
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+            group.classList.add('player-drop-active');
+          });
+          group.addEventListener('dragleave', event => {
+            if (!group.contains(event.relatedTarget)) group.classList.remove('player-drop-active');
+          });
+          group.addEventListener('drop', event => {
+            event.preventDefault();
+            document.querySelectorAll('.player-drop-active').forEach(target => target.classList.remove('player-drop-active'));
+            const match = /^(\d+):(\d+)$/.exec(event.dataTransfer?.getData('text/plain') || '');
+            if (!match) return;
+            movePlayerToGroup(Number(match[1]), Number(match[2]), Number(group.getAttribute('data-player-drop-group')));
+          });
+        });
+      }
+
+      function bindAppEvents() {
+        bindThemeButtons();
+        bindSetupWizardEvents();
+        bindPlayerDragAndDrop();
+        bindPageLinks();
+        document.getElementById('logout-btn')?.addEventListener('click', logout);
+        document.getElementById('tournament-switcher')?.addEventListener('change', (e) => {
+          switchTournament(e.target.value);
+        });
+        document.querySelectorAll('[data-open-tournament]').forEach(button => {
+          button.addEventListener('click', () => openTournamentFromCatalog(button.getAttribute('data-open-tournament')));
+        });
+        document.getElementById('tournament-history-refresh')?.addEventListener('click', async event => {
+          event.currentTarget.disabled = true;
+          await loadTournamentCatalog(true);
+          render();
+        });
+        document.getElementById('new-tournament-btn')?.addEventListener('click', () => {
+          openModal(`
+            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 class="text-base font-bold">Create New Tournament</h3>
+              <div class="space-y-3 text-xs">
+                <div>
+                  <label class="block font-semibold text-stone-500 mb-1">Tournament Name</label>
+                  <input id="new-t-name" type="text" placeholder="Spring Open Badminton Tournament" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block font-semibold text-stone-500 mb-1">Date</label>
+                    <input id="new-t-date" type="date" value="${esc(state.config.date)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  </div>
+                  <div>
+                    <label class="block font-semibold text-stone-500 mb-1">Venue</label>
+                    <input id="new-t-venue" type="text" value="${esc(state.config.venue)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  </div>
+                </div>
+              </div>
+              <div class="flex justify-end gap-2 pt-1">
+                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+                <button id="new-t-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create</button>
+              </div>
+            </div>
+          `);
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          document.getElementById('new-t-confirm').addEventListener('click', () => {
+            const name = document.getElementById('new-t-name').value.trim() || 'New Badminton Tournament';
+            const date = document.getElementById('new-t-date').value;
+            const venue = document.getElementById('new-t-venue').value.trim();
+            closeModal();
+            createNewTournament(name, date, venue);
+            showToast(`Created "${name}"`, 'success');
+          });
+        });
+        document.getElementById('delete-tournament-btn')?.addEventListener('click', () => {
+          openModal(`
+            <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 class="text-base font-bold">Delete Tournament?</h3>
+              <p class="text-xs text-stone-500">Remove "${esc(state.config.name)}" from local storage and Turso DB?</p>
+              <div class="flex justify-end gap-2">
+                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+                <button id="del-t-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Delete</button>
+              </div>
+            </div>
+          `);
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          document.getElementById('del-t-confirm').addEventListener('click', () => {
+            closeModal();
+            deleteTournament(state.tournamentId);
+          });
+        });
+        document.getElementById('open-sync-modal-btn')?.addEventListener('click', () => {
+          openModal(`
+            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 class="text-base font-bold">SQLite Cloud Sync</h3>
+              <p class="text-xs text-stone-500 dark:text-stone-400">This Vercel deployment uses its own API by default. Connect a different hosted SQLite-compatible backend only if needed.</p>
+              <div class="space-y-3 text-xs">
+                <div>
+                  <label class="block font-semibold text-stone-500 mb-1">Backend API URL (optional)</label>
+                  <input id="sync-api-url" type="url" value="${esc(state.sync?.apiUrl || '')}" placeholder="Leave blank to use this Vercel deployment" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                </div>
+                <div>
+                  <label class="block font-semibold text-stone-500 mb-1">Admin Sync Key</label>
+                  <input id="sync-api-key" type="password" value="${esc(state.sync?.syncKey || '')}" placeholder="Required when ADMIN_SYNC_KEY is set on the backend" autocomplete="off" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  <p class="mt-1 text-[11px] text-stone-500">Enter the same value configured in the backend’s <code>.env</code> file or Vercel environment. For local use, open the app on port 3001; the 8080 preview now connects to that backend.</p>
+                </div>
+              </div>
+              <div class="flex flex-wrap justify-between gap-2 pt-1">
+                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Close</button>
+                <div class="flex gap-2">
+                  <button id="sync-pull-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Pull from DB</button>
+                  <button id="sync-save-push-btn" class="px-3.5 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Save &amp; Push</button>
+                </div>
+              </div>
+            </div>
+          `);
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          const saveInputs = () => {
+            if (!state.sync) state.sync = { apiUrl: '', syncKey: '', status: 'local', lastSynced: null };
+            state.sync.apiUrl = (document.getElementById('sync-api-url').value || '').trim().replace(/\/+$/, '');
+            state.sync.syncKey = (document.getElementById('sync-api-key').value || '').trim();
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+          };
+          document.getElementById('sync-pull-btn').addEventListener('click', async () => {
+            saveInputs();
+            closeModal();
+            await pullFromTurso(false);
+          });
+          document.getElementById('sync-save-push-btn').addEventListener('click', async () => {
+            saveInputs();
+            closeModal();
+            await pushToTurso(false);
+            render();
+          });
+        });
+        document.getElementById('launch-kiosk-btn')?.addEventListener('click', () => {
+          state.ui.playerCheckInMode = true;
+          render();
+        });
+        document.getElementById('show-qr-modal-btn')?.addEventListener('click', () => {
+          const checkinUrl = new URL(PAGE_FILES.checkin, window.location.href);
+          checkinUrl.searchParams.set('t', state.tournamentId || 'default');
+          if (state.sync?.apiUrl) checkinUrl.searchParams.set('api', state.sync.apiUrl);
+          checkinUrl.hash = 'checkin';
+          const checkinLink = checkinUrl.toString();
+          openModal(`
+            <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4 text-center">
+              <h3 class="text-base font-bold">Player Check-In QR Code</h3>
+              <p class="text-xs text-stone-500 dark:text-stone-400">Players can scan this QR code to open the sign-in screen.</p>
+              <div id="qr-code-box" class="mx-auto w-48 h-48 bg-white p-3 rounded-xl flex items-center justify-center border border-stone-200"></div>
+              <div class="text-[11px] font-mono text-stone-500 break-all">${esc(checkinLink)}</div>
+              <div class="flex justify-center gap-2">
+                <button id="copy-qr-url-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Copy Link</button>
+                <button id="modal-cancel" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Done</button>
+              </div>
+            </div>
+          `);
+          const box = document.getElementById('qr-code-box');
+          if (typeof QRCode !== 'undefined' && box) {
+            new QRCode(box, { text: checkinLink, width: 168, height: 168 });
+          } else if (box) {
+            box.innerHTML = '<span class="text-xs text-stone-500">QR library loading...</span>';
+          }
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          document.getElementById('copy-qr-url-btn').addEventListener('click', () => {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(checkinLink).then(() => showToast('Check-in link copied', 'success'));
+            } else {
+              showToast(checkinLink);
+            }
+          });
+        });
+        document.querySelectorAll('[data-checkin-filter]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            state.ui.checkInFilter = btn.getAttribute('data-checkin-filter');
+            render();
+          });
+        });
+        document.getElementById('checkin-table-search')?.addEventListener('input', (e) => {
+          state.ui.checkInSearch = e.target.value;
+          render();
+          const inp = document.getElementById('checkin-table-search');
+          if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+        });
+        document.getElementById('checkin-group-filter')?.addEventListener('change', (e) => {
+          state.ui.checkInGroupFilter = e.target.value;
+          render();
+        });
+        document.getElementById('checkin-skill-min')?.addEventListener('change', (e) => {
+          state.ui.checkInSkillMin = e.target.value;
+          render();
+        });
+        document.getElementById('checkin-skill-max')?.addEventListener('change', (e) => {
+          state.ui.checkInSkillMax = e.target.value;
+          render();
+        });
+        document.getElementById('checkin-clear-filters')?.addEventListener('click', () => {
+          state.ui.checkInFilter = 'ALL';
+          state.ui.checkInSearch = '';
+          state.ui.checkInGroupFilter = 'ALL';
+          state.ui.checkInSkillMin = '';
+          state.ui.checkInSkillMax = '';
+          render();
+        });
+        document.getElementById('ci-import-btn')?.addEventListener('click', () => {
+          openImportRosterModal();
+        });
+        document.getElementById('ci-add-btn')?.addEventListener('click', () => {
+          const name = document.getElementById('ci-add-name')?.value.trim();
+          const gi = Number(document.getElementById('ci-add-group')?.value || 0);
+          const skill = document.getElementById('ci-add-skill')?.value || 5;
+          const autoSignIn = document.getElementById('ci-add-signedin')?.checked;
+          if (!name) { showToast('Enter a player name', 'error'); return; }
+          state.groups[gi].players.push(name);
+          if (!state.groups[gi].leader) state.groups[gi].leader = name;
+          setPlayerSkill(name, skill);
+          if (autoSignIn) markPlayerCheckedIn(name, 'desk');
+          else saveState();
+          render();
+          showToast(`Added ${name} to ${state.groups[gi].name}`, 'success');
+        });
+        document.querySelectorAll('[data-ci-leader]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const [gi, pi] = btn.getAttribute('data-ci-leader').split(':').map(Number);
+            state.groups[gi].leader = state.groups[gi].players[pi];
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-ci-edit-name]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const [gi, pi] = inp.getAttribute('data-ci-edit-name').split(':').map(Number);
+            renamePlayerEverywhere(gi, pi, inp.value);
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-ci-move-group]').forEach(sel => {
+          sel.addEventListener('change', () => {
+            const [fromGi, pi] = sel.getAttribute('data-ci-move-group').split(':').map(Number);
+            const toGi = Number(sel.value);
+            if (fromGi === toGi) return;
+            const moved = state.groups[fromGi].players.splice(pi, 1)[0];
+            if (state.groups[fromGi].leader === moved) state.groups[fromGi].leader = state.groups[fromGi].players[0] || '';
+            state.groups[toGi].players.push(moved);
+            if (!state.groups[toGi].leader) state.groups[toGi].leader = moved;
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-ci-edit-skill]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            setPlayerSkill(inp.getAttribute('data-ci-edit-skill'), inp.value);
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-ci-edit-time]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const name = inp.getAttribute('data-ci-edit-time');
+            if (state.checkIns?.[name]) {
+              state.checkIns[name].time = inp.value.trim();
+              saveState();
+              render();
+            }
+          });
+        });
+        document.querySelectorAll('[data-ci-remove]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const [gi, pi] = btn.getAttribute('data-ci-remove').split(':').map(Number);
+            const removed = state.groups[gi].players.splice(pi, 1)[0];
+            if (state.groups[gi].leader === removed) state.groups[gi].leader = state.groups[gi].players[0] || '';
+            saveState();
+            render();
+            showToast(`Removed ${removed}`);
+          });
+        });
+        document.querySelectorAll('[data-toggle-checkin]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const name = btn.getAttribute('data-toggle-checkin');
+            if (!state.checkIns) state.checkIns = {};
+            if (state.checkIns[name]?.checkedIn) {
+              delete state.checkIns[name];
+              showToast(`Removed check-in for ${name}`);
+            } else {
+              markPlayerCheckedIn(name, 'desk');
+              showToast(`Checked in ${name}`, 'success');
+            }
+            saveState();
+            render();
+          });
+        });
+
+        document.getElementById('player-directory-search')?.addEventListener('input', (event) => {
+          state.ui.playerSearch = event.target.value;
+          const query = state.ui.playerSearch.toLocaleLowerCase().trim();
+          document.querySelectorAll('[data-player-directory-name]').forEach(button => {
+            button.classList.toggle('hidden', Boolean(query && !button.getAttribute('data-player-directory-name').includes(query)));
+          });
+        });
+        document.querySelectorAll('[data-player-select]').forEach(button => {
+          button.addEventListener('click', () => {
+            state.ui.selectedPlayerName = button.getAttribute('data-player-select');
+            if (window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent) === window.PlayerAnalytics.normalizeName(state.ui.selectedPlayerName)) {
+              state.ui.headToHeadOpponent = '';
+            }
+            saveRegistry();
+            render();
+          });
+        });
+        document.getElementById('head-to-head-opponent')?.addEventListener('change', event => {
+          state.ui.headToHeadOpponent = event.target.value;
+          saveRegistry();
+          render();
+        });
+        document.querySelectorAll('[data-player-photo]').forEach(image => {
+          image.addEventListener('error', () => image.remove(), { once: true });
+        });
+        document.getElementById('player-refresh-btn')?.addEventListener('click', async event => {
+          event.currentTarget.disabled = true;
+          await loadPlayerData(true);
+          render();
+        });
+        document.getElementById('player-add-profile-btn')?.addEventListener('click', () => renderPlayerProfileEditor(null));
+        document.getElementById('player-invites-btn')?.addEventListener('click', () => {
+          openPlayerInvitesModal().catch(err => showToast(`Could not open player invitations: ${err.message}`, 'error'));
+        });
+        document.getElementById('player-edit-profile-btn')?.addEventListener('click', event => {
+          const selectedName = event.currentTarget.getAttribute('data-player-edit-name') || state.ui.selectedPlayerName;
+          const profile = playerData.profiles.find(item =>
+            window.PlayerAnalytics.normalizeName(item.name) === window.PlayerAnalytics.normalizeName(selectedName)
+          );
+          renderPlayerProfileEditor(profile || { name: selectedName });
+        });
+        document.getElementById('player-share-btn')?.addEventListener('click', () => {
+          const shareUrl = new URL(window.location.href);
+          shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(shareUrl.toString())
+              .then(() => showToast('Player card link copied', 'success'))
+              .catch(() => showToast(shareUrl.toString()));
+          } else {
+            showToast(shareUrl.toString());
+          }
+        });
+        // Header Admin Actions
+        document.getElementById('export-btn')?.addEventListener('click', () => {
+          const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'badminton-tournament.json';
+          a.click();
+          URL.revokeObjectURL(url);
+          showToast('Exported tournament JSON', 'success');
+        });
+
+        document.getElementById('share-btn')?.addEventListener('click', () => {
+          const summary = `${state.config.name} (${state.config.date}) — Phase: ${state.phase.toUpperCase()}`;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(summary).then(() => showToast('Copied tournament summary', 'success')).catch(() => showToast(summary));
+          } else {
+            showToast(summary);
+          }
+        });
+
+        document.getElementById('import-roster-btn')?.addEventListener('click', openImportRosterModal);
+
+        document.getElementById('reset-btn')?.addEventListener('click', () => {
+          openModal(`
+            <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 class="text-base font-bold">Reset Tournament?</h3>
+              <p class="text-xs text-stone-500">This clears all schedules and scores and restores the default 30-player setup.</p>
+              <div class="flex justify-end gap-2">
+                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+                <button id="modal-reset-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Reset All</button>
+              </div>
+            </div>
+          `);
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          document.getElementById('modal-reset-confirm').addEventListener('click', () => {
+            const role = state.auth.role;
+            state = createDefaultState();
+            state.auth.loggedIn = true;
+            state.auth.role = role;
+            closeModal();
+            saveState();
+            render();
+            showToast('Tournament reset', 'success');
+          });
+        });
+
+        // Setup bindings
+        document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5, false));
+        document.getElementById('cfg-total-players')?.addEventListener('change', (e) => {
+          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 3, false);
+        });
+        document.getElementById('cfg-players-per-group')?.addEventListener('change', (e) => {
+          const ppg = Math.max(3, Math.min(12, parseInt(e.target.value, 10) || 6));
+          state.config.playersPerGroup = ppg;
+          resizeTotalPlayers(ppg * state.groups.length, false);
+        });
+        document.querySelectorAll('[data-rk-num]').forEach(el => {
+          el.addEventListener('change', () => {
+            if (!state.config.ranking) state.config.ranking = { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
+            state.config.ranking[el.getAttribute('data-rk-num')] = parseFloat(el.value) || 0;
+            saveState();
+          });
+        });
+        document.querySelectorAll('[data-rk-tb]').forEach(sel => {
+          sel.addEventListener('change', () => {
+            if (!state.config.ranking) state.config.ranking = { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
+            const idx = Number(sel.getAttribute('data-rk-tb'));
+            state.config.ranking.tiebreakers[idx] = sel.value;
+            saveState();
+          });
+        });
+        document.getElementById('sort-groups-btn')?.addEventListener('click', () => {
+          sortGroupsByName();
+          saveState();
+          render();
+          showToast('Groups sorted by name', 'success');
+        });
+        document.getElementById('add-group-btn')?.addEventListener('click', () => {
+          if (state.groups.length >= 8) { showToast('Maximum 8 groups supported', 'error'); return; }
+          syncGroupCount(state.groups.length + 1);
+        });
+        document.querySelectorAll('[data-remove-group]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            if (state.groups.length <= 2) return;
+            const gi = Number(btn.getAttribute('data-remove-group'));
+            state.groups.splice(gi, 1);
+            state.config.numGroups = state.groups.length;
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-group-name]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const gi = Number(inp.getAttribute('data-group-name'));
+            const candidate = inp.value.trim();
+            if (!candidate) { inp.value = state.groups[gi].name; return; }
+            const duplicate = state.groups.some((g, idx) => idx !== gi && g.name.trim().toLowerCase() === candidate.toLowerCase());
+            if (duplicate) {
+              showToast(`Group name "${candidate}" already exists`, 'error');
+              inp.value = state.groups[gi].name;
+              return;
+            }
+            state.groups[gi].name = candidate;
+            saveState();
+          });
+        });
+        document.querySelectorAll('[data-move-player]').forEach(sel => {
+          sel.addEventListener('change', () => {
+            const [fromGi, pi] = sel.getAttribute('data-move-player').split(':').map(Number);
+            movePlayerToGroup(fromGi, pi, Number(sel.value));
+          });
+        });
+        document.querySelectorAll('[data-cfg]').forEach(el => {
+          el.addEventListener('change', () => {
+            state.config[el.getAttribute('data-cfg')] = el.value;
+            saveState();
+          });
+        });
+        document.querySelectorAll('[data-cfg-num]').forEach(el => {
+          el.addEventListener('change', () => {
+            state.config[el.getAttribute('data-cfg-num')] = parseInt(el.value, 10) || 1;
+            saveState();
+          });
+        });
+        document.querySelectorAll('[data-set-leader]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const [gi, pi] = btn.getAttribute('data-set-leader').split(':').map(Number);
+            state.groups[gi].leader = state.groups[gi].players[pi];
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-player-edit]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const [gi, pi] = inp.getAttribute('data-player-edit').split(':').map(Number);
+            if (renamePlayerEverywhere(gi, pi, inp.value)) saveState();
+            else inp.value = state.groups[gi].players[pi] || '';
+          });
+        });
+        document.querySelectorAll('[data-remove-player]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const [gi, pi] = btn.getAttribute('data-remove-player').split(':').map(Number);
+            const removed = state.groups[gi].players.splice(pi, 1)[0];
+            if (state.groups[gi].leader === removed) state.groups[gi].leader = state.groups[gi].players[0] || '';
+            saveState();
+            render();
+          });
+        });
+        document.querySelectorAll('[data-player-skill]').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const [gi, pi] = inp.getAttribute('data-player-skill').split(':').map(Number);
+            const name = state.groups[gi]?.players[pi];
+            if (!name) return;
+            setPlayerSkill(name, inp.value);
+            saveState();
+          });
+        });
+        document.querySelectorAll('[data-add-player-btn]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const gi = Number(btn.getAttribute('data-add-player-btn'));
+            openGroupPlayerPicker(gi);
+          });
+        });
+        document.getElementById('start-tournament-btn')?.addEventListener('click', startTournament);
+
+        // QR1, QR2, Semis, Finals bindings
+        document.querySelectorAll('[data-qr1-filter]').forEach(btn => {
+          btn.addEventListener('click', () => { state.ui.qr1GroupFilter = btn.getAttribute('data-qr1-filter'); render(); });
+        });
+        document.getElementById('sim-qr1-btn')?.addEventListener('click', () => simulateMatches(state.qr1Matches));
+        document.getElementById('advance-qr2-btn')?.addEventListener('click', advanceToQR2);
+        document.getElementById('sim-qr2-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.qr2Matches || {}).flat()));
+        document.getElementById('advance-semis-btn')?.addEventListener('click', advanceToSemis);
+        document.getElementById('sim-semis-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.semis || {}).flat()));
+        document.getElementById('advance-finals-btn')?.addEventListener('click', advanceToFinals);
+
+        document.getElementById('add-qr2-pool-btn')?.addEventListener('click', () => {
+          const existing = Object.keys(state.qr2Pools || {});
+          const nextLetter = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').find(l => !existing.includes(l));
+          if (!nextLetter) { showToast('Maximum pool limit reached', 'error'); return; }
+          openModal(`
+            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 class="text-base font-bold">Add Round 2 Pool ${nextLetter}</h3>
+              <div class="space-y-3 text-xs">
+                <div>
+                  <label class="block font-semibold text-stone-500 mb-1">How to populate Pool ${nextLetter}</label>
+                  <select id="add-pool-mode" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                    <option value="rebalance">Rebalance bottom players from existing pools</option>
+                    <option value="custom">Enter custom player names</option>
+                  </select>
+                </div>
+                <div id="custom-pool-players-wrap" class="hidden">
+                  <label class="block font-semibold text-stone-500 mb-1">Players (one per line or comma-separated)</label>
+                  <textarea id="custom-pool-players" rows="4" placeholder="Player 1&#10;Player 2&#10;Player 3" class="w-full p-2.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs"></textarea>
+                </div>
+              </div>
+              <div class="flex justify-end gap-2">
+                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+                <button id="modal-add-pool-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create Pool ${nextLetter}</button>
+              </div>
+            </div>
+          `);
+          document.getElementById('modal-cancel').addEventListener('click', closeModal);
+          const modeSel = document.getElementById('add-pool-mode');
+          const customWrap = document.getElementById('custom-pool-players-wrap');
+          modeSel.addEventListener('change', () => {
+            customWrap.classList.toggle('hidden', modeSel.value !== 'custom');
+          });
+          document.getElementById('modal-add-pool-confirm').addEventListener('click', () => {
+            if (modeSel.value === 'custom') {
+              const names = document.getElementById('custom-pool-players').value.split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+              if (names.length < 2) { showToast('Enter at least 2 players', 'error'); return; }
+              closeModal();
+              addQR2Pool(nextLetter, names, []);
+              showToast(`Added Pool ${nextLetter} (${names.length} players)`, 'success');
+            } else {
+              const nonA = existing.filter(k => k !== 'A');
+              const poolPlayers = nonA.flatMap(k => state.qr2Pools[k] || []);
+              if (poolPlayers.length < 4) { showToast('Not enough players outside Pool A to split', 'error'); return; }
+              const newKeys = [...nonA, nextLetter];
+              const chunk = Math.ceil(poolPlayers.length / newKeys.length);
+              newKeys.forEach((k, idx) => {
+                state.qr2Pools[k] = poolPlayers.slice(idx * chunk, (idx + 1) * chunk);
+              });
+              closeModal();
+              addQR2Pool(nextLetter, state.qr2Pools[nextLetter], nonA);
+              showToast(`Added Pool ${nextLetter} and rebalanced ${newKeys.join(', ')}`, 'success');
+            }
+          });
+        });
+
+        document.querySelectorAll('[data-regen-pool]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const k = btn.getAttribute('data-regen-pool');
+            const players = state.qr2Pools[k] || [];
+            state.qr2Matches[k] = players.length >= 2
+              ? generateGroupSchedule(players, state.config.matchesPerPlayer, `Pool${k}`, `QR2${k}`)
+              : [];
+            saveState();
+            render();
+            showToast(`Regenerated Pool ${k} schedule`, 'success');
+          });
+        });
+
+        document.querySelectorAll('[data-remove-pool]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const k = btn.getAttribute('data-remove-pool');
+            delete state.qr2Pools[k];
+            delete state.qr2Matches[k];
+            saveState();
+            render();
+            showToast(`Removed Pool ${k}`, 'success');
+          });
+        });
+
+        document.querySelectorAll('[data-save-match]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const [listKey, id] = btn.getAttribute('data-save-match').split(':');
+            const s1El = document.querySelector(`[data-score-input="${listKey}:${id}:1"]`);
+            const s2El = document.querySelector(`[data-score-input="${listKey}:${id}:2"]`);
+            const s1 = parseInt(s1El.value, 10);
+            const s2 = parseInt(s2El.value, 10);
+            if (!isValidSingleScore(s1, s2, state.config.pointsToWin, state.config.deuceCap)) {
+              showToast(`Invalid score (game to ${state.config.pointsToWin}, cap ${state.config.deuceCap}, win by 2)`, 'error');
+              return;
+            }
+            let m = null;
+            if (listKey === 'qr1') m = state.qr1Matches.find(x => x.id === id);
+            else if (listKey.startsWith('qr2_')) m = (state.qr2Matches[listKey.slice(4)] || []).find(x => x.id === id);
+            else if (listKey.startsWith('semi_')) m = (state.semis[listKey.slice(5)] || []).find(x => x.id === id);
+            if (m) {
+              m.s1 = s1; m.s2 = s2; m.completed = true; m.completedAt = new Date().toISOString();
+              saveState();
+              render();
+              showToast('Score saved', 'success');
+            }
+          });
+        });
+
+        document.querySelectorAll('[data-save-final]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const poolKey = btn.getAttribute('data-save-final');
+            const f = state.finals[poolKey];
+            let t1Wins = 0, t2Wins = 0;
+            for (let gi = 0; gi < f.games.length; gi++) {
+              const v1 = document.querySelector(`[data-final-input="${poolKey}:${gi}:1"]`).value;
+              const v2 = document.querySelector(`[data-final-input="${poolKey}:${gi}:2"]`).value;
+              if (v1 === '' && v2 === '') continue;
+              const s1 = parseInt(v1, 10), s2 = parseInt(v2, 10);
+              if (!isValidSingleScore(s1, s2, state.config.pointsToWin, state.config.deuceCap)) {
+                showToast(`Invalid score in Game ${gi + 1}`, 'error');
+                return;
+              }
+              f.games[gi] = { s1, s2 };
+              if (s1 > s2) t1Wins++; else t2Wins++;
+            }
+            const needed = f.format === 'bo3' ? 2 : 1;
+            if (t1Wins >= needed || t2Wins >= needed) {
+              f.completed = true;
+              f.winner = t1Wins > t2Wins ? f.t1 : f.t2;
+              f.completedAt = new Date().toISOString();
+              if (Object.values(state.finals || {}).filter(Boolean).every(x => x.completed)) state.phase = 'completed';
+              showToast(`Pool ${poolKey} Champion: ${f.winner}!`, 'success');
+            } else {
+              f.completed = false;
+              f.winner = null;
+              delete f.completedAt;
+              showToast('Final game scores saved', 'success');
+            }
+            saveState();
+            render();
+          });
+        });
+      }
+
+      window.addEventListener('storage', event => {
+        if (event.key === REGISTRY_KEY && event.newValue) {
+          try {
+            const latestRegistry = JSON.parse(event.newValue);
+            registry = latestRegistry;
+            const latestTournament = latestRegistry.items?.[state.tournamentId];
+            if (latestTournament && state.ui.activeTab === 'players') {
+              const currentUi = state.ui;
+              state = normalizeTournamentState({
+                ...latestTournament,
+                auth: state.auth,
+                sync: { ...state.sync, ...(latestTournament.sync || {}) },
+                ui: { ...(latestTournament.ui || {}), ...currentUi }
+              }, state.tournamentId);
+              if (playerData.loaded) {
+                const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
+                tournaments.set(String(state.tournamentId), { id: String(state.tournamentId), data: latestTournament });
+                playerData.tournaments = [...tournaments.values()];
+              }
+              render();
+            }
+          } catch (err) {
+            console.error('Could not refresh player match history from another tab:', err);
+          }
+        } else if (event.key === PLAYER_PROFILES_KEY && event.newValue) {
+          try {
+            const profiles = JSON.parse(event.newValue);
+            if (!Array.isArray(profiles)) throw new Error('Stored profiles are not a list');
+            playerData.profiles = playerAccountProfile
+              ? [...profiles.filter(profile => !samePlayerIdentity(profile, playerAccountProfile)), playerAccountProfile]
+              : profiles;
+            if (state.ui.activeTab === 'players') render();
+          } catch (err) {
+            console.error('Could not refresh player profiles from another tab:', err);
+          }
+        }
+      });
+
+      window.addEventListener('focus', () => {
+        if (!playerData.loaded || playerData.loading || state.ui.activeTab !== 'players' || !getSyncApiUrl()) return;
+        loadPlayerData(true).then(() => {
+          if (state.ui.activeTab === 'players') render();
+        });
+      });
+
+      (async () => {
+        if (playerInviteToken) {
+          await loadPlayerInvite();
+        } else if (state.auth.role === 'player' || !state.auth.loggedIn) {
+          await restorePlayerSession();
+        }
+        if (state.auth.loggedIn && state.auth.role === 'guest' && state.ui.activeTab !== getRequestedPage()) {
+          window.location.replace(getPageUrl(state.ui.activeTab));
+          return;
+        }
+        render();
+        if (getSyncApiUrl()) await pullFromTurso(true);
+      })();
+    })();

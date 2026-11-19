@@ -5,7 +5,8 @@
   "description": "Vercel-hosted badminton tournament app with a Turso SQLite-compatible backend",
   "main": "index.js",
   "scripts": {
-    "start": "node badminton-backend/server.js"
+    "start": "node badminton-backend/server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@libsql/client": "^0.14.0",

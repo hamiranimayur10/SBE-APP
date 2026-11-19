@@ -55,4 +55,6 @@ Tournament setup uses a five-step flow for event details, format and scoring, pl
 
 For semi-finals with eight qualifiers in a group, the top four seeds are each randomly paired with a distinct player from the bottom four to form doubles teams. The resulting draw is saved with the tournament.
 
+The dashboard shows the active tournament phase, current player and match counts, per-round completion, configured Round 2 groups, scoring settings, and each group's final format. It refreshes when settings or match scores are synced.
+
 Admins can permanently delete a tournament from its card in the **Tournaments** library. Deletion removes the tournament, all match results, check-ins, and tournament-derived player match history and statistics. Shared player profiles are retained. The app requires at least one tournament to remain.

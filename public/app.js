@@ -3126,6 +3126,31 @@
       function renderDashboardView() {
         const s = getStatsSummary();
         const c = state.config;
+        const phaseLabels = {
+          setup: 'Setup',
+          qr1: 'Qualifier Round 1',
+          qr2: 'Qualifier Round 2',
+          semis: 'Semi-Finals',
+          finals: 'Finals',
+          completed: 'Completed'
+        };
+        const configuredGroupKeys = getConfiguredPoolKeys();
+        const activeGroupKeys = Object.keys(state.qr2Pools || {}).filter(key =>
+          (state.qr2Pools[key] || []).length > 0 || (state.qr2Matches[key] || []).length > 0
+        );
+        const dashboardGroupKeys = activeGroupKeys.length ? activeGroupKeys : configuredGroupKeys;
+        const semifinalGroupKeys = Object.keys(state.semis || {}).filter(key => (state.semis[key] || []).length > 0);
+        const existingFinalKeys = Object.keys(state.finals || {}).filter(key => Boolean(state.finals[key]));
+        const finalsFormatKeys = existingFinalKeys.length ? existingFinalKeys : dashboardGroupKeys;
+        const round2Summary = activeGroupKeys.length
+          ? `${activeGroupKeys.length} groups · ${activeGroupKeys.map(key => `Group ${key}: ${(state.qr2Pools[key] || []).length} players`).join(' · ')}`
+          : `${configuredGroupKeys.length} groups configured · awaiting Round 1 results`;
+        const semifinalSummary = semifinalGroupKeys.length
+          ? `${semifinalGroupKeys.length} groups · ${s.semiTotal} matches`
+          : `${dashboardGroupKeys.length} groups · top 8 qualify per group`;
+        const finalsSummary = finalsFormatKeys
+          .map(key => `Group ${key}: ${getPoolFinalFormat(key) === 'bo3' ? '3 sets' : '1 set'}`)
+          .join(' · ');
         const roundStatus = (done, total, activePhase) => {
           if (total > 0 && done === total) return '<span class="px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">Completed</span>';
           if (state.phase === activePhase || total > 0) return '<span class="px-2 py-0.5 rounded-full text-[11px] bg-gold-500/15 text-gold-600 dark:text-gold-400 font-medium">In Progress</span>';
@@ -3134,13 +3159,22 @@
 
         return `
           <div class="space-y-6">
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div>
+                <p class="text-[10px] font-bold uppercase tracking-[0.16em] text-gold-600 dark:text-gold-400">Live tournament dashboard</p>
+                <h1 class="mt-1 text-xl sm:text-2xl font-extrabold">${esc(c.name || 'Tournament')}</h1>
+                <p class="mt-1 text-xs text-stone-500 dark:text-stone-400">${[c.date, c.venue].filter(Boolean).map(esc).join(' · ') || 'Date and venue not set'}</p>
+              </div>
+              <span class="self-start sm:self-auto px-3 py-1 rounded-full text-xs font-semibold ${state.phase === 'completed' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-gold-500/15 text-gold-600 dark:text-gold-400'}">${esc(phaseLabels[state.phase] || state.phase)}</span>
+            </div>
+
             <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
                 <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Players</div>
                 <div class="text-2xl font-extrabold mt-1 tabular-nums">${s.totalPlayers}</div>
               </div>
               <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
-                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Groups</div>
+                <div class="text-xs font-semibold uppercase tracking-wider text-stone-500">Round 1 Groups</div>
                 <div class="text-2xl font-extrabold mt-1 tabular-nums">${state.groups.length}</div>
               </div>
               <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4">
@@ -3161,31 +3195,31 @@
                 </div>
                 <div class="divide-y divide-stone-100 dark:divide-stone-800 text-sm">
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Qualifier Round 1</div><div class="text-xs text-stone-500">${state.groups.length} groups of ${c.playersPerGroup}</div></div>
+                    <div><div class="font-semibold">Qualifier Round 1</div><div class="text-xs text-stone-500">${state.groups.length} groups · ${s.totalPlayers} rostered · ${c.playersPerGroup} target/group</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr1Done}/${s.qr1Total}</span>${roundStatus(s.qr1Done, s.qr1Total, 'qr1')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => 'Group ' + k).join(' + ')}</div></div>
+                    <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${round2Summary}</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr2Done}/${s.qr2Total}</span>${roundStatus(s.qr2Done, s.qr2Total, 'qr2')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">2 matches per Round 2 group</div></div>
+                    <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">${semifinalSummary}</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.semiDone}/${s.semiTotal}</span>${roundStatus(s.semiDone, s.semiTotal, 'semis')}</div>
                   </div>
                   <div class="py-3 flex items-center justify-between">
-                    <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">${getActiveQR2PoolKeys().map(k => `Group ${k} (${getPoolFinalFormat(k) === 'bo3' ? 'Bo3' : 'Single'})`).join(' · ')}</div></div>
+                    <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">${finalsSummary}</div></div>
                     <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.finalDone}/${s.finalTotal}</span>${roundStatus(s.finalDone, s.finalTotal, 'finals')}</div>
                   </div>
                 </div>
               </div>
 
               <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
-                <h2 class="font-bold text-base">Ranking Rules &amp; Parameters</h2>
+                <h2 class="font-bold text-base">Tournament Settings &amp; Ranking Rules</h2>
                 <div class="p-3.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 space-y-1.5 text-xs sm:text-sm">
                   <div class="font-mono font-semibold text-gold-600 dark:text-gold-400">${esc(getRankingFormulaText())}</div>
                   <p class="text-xs text-stone-500 dark:text-stone-400">Order: ${esc(getTiebreakerText())} · still tied → flagged for the officiating table.</p>
                 </div>
-                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+                <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-1">
                   <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
                     <div class="text-[11px] text-stone-500 uppercase">Game To</div>
                     <div class="font-bold text-sm mt-0.5">${c.pointsToWin} pts</div>
@@ -3196,7 +3230,11 @@
                   </div>
                   <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
                     <div class="text-[11px] text-stone-500 uppercase">Round 2 Groups</div>
-                    <div class="font-bold text-sm mt-0.5">${c.qr2PoolsCount || 2} groups</div>
+                    <div class="font-bold text-sm mt-0.5">${configuredGroupKeys.length} groups</div>
+                  </div>
+                  <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
+                    <div class="text-[11px] text-stone-500 uppercase">Matches / Player</div>
+                    <div class="font-bold text-sm mt-0.5">${c.matchesPerPlayer}</div>
                   </div>
                   <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800">
                     <div class="text-[11px] text-stone-500 uppercase">Semi-Finals</div>

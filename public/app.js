@@ -2117,6 +2117,138 @@
         saveRegistry();
       }
 
+      async function openBulkPlayerDeletion() {
+        if (state.auth.role !== 'admin') return;
+        const directory = await requestAdminApi('/api/player-import/directory');
+        const profiles = directory.profiles.filter(profile => !isAnonymizedPlayerName(profile.name));
+        if (!profiles.length) {
+          showToast('No player profiles to delete');
+          return;
+        }
+        openModal(`
+          <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <div>
+              <h3 class="text-base font-bold">Select players to delete</h3>
+              <p class="mt-1 text-xs text-stone-500">Select individual saved profiles or all ${profiles.length} saved profiles. Local-only roster entries are not included.</p>
+            </div>
+            <label class="flex items-center gap-2 text-xs font-bold">
+              <input id="bulk-player-select-all" type="checkbox" class="rounded border-stone-300" /> Select all saved profiles
+            </label>
+            <div class="max-h-64 overflow-y-auto space-y-1 border border-stone-200 dark:border-stone-800 rounded-lg p-2">
+              ${profiles.map((profile, index) => `
+                <label class="flex items-center gap-2 p-2 text-xs">
+                  <input type="checkbox" data-bulk-player-index="${index}" class="rounded border-stone-300" />
+                  <span>${esc(profile.name)}${profile.playerCode ? ` <span class="text-stone-500">(${esc(profile.playerCode)})</span>` : ''}</span>
+                </label>
+              `).join('')}
+            </div>
+            <div class="flex justify-end gap-2">
+              <button id="bulk-player-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="bulk-player-next" type="button" disabled class="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-bold disabled:opacity-50">Delete selected (0)</button>
+            </div>
+          </div>
+        `);
+        const selectAll = document.getElementById('bulk-player-select-all');
+        const checkboxes = [...document.querySelectorAll('[data-bulk-player-index]')];
+        const next = document.getElementById('bulk-player-next');
+        const updateSelection = () => {
+          const count = checkboxes.filter(checkbox => checkbox.checked).length;
+          selectAll.checked = count === checkboxes.length;
+          selectAll.indeterminate = count > 0 && count < checkboxes.length;
+          next.disabled = count === 0;
+          next.textContent = `Delete selected (${count})`;
+        };
+        selectAll.addEventListener('change', () => {
+          checkboxes.forEach(checkbox => { checkbox.checked = selectAll.checked; });
+          updateSelection();
+        });
+        checkboxes.forEach(checkbox => checkbox.addEventListener('change', updateSelection));
+        document.getElementById('bulk-player-cancel').addEventListener('click', closeModal);
+        next.addEventListener('click', () => {
+          const selected = checkboxes.filter(checkbox => checkbox.checked)
+            .map(checkbox => profiles[Number(checkbox.dataset.bulkPlayerIndex)]);
+          confirmBulkPlayerDeletion(selected);
+        });
+      }
+
+      function confirmBulkPlayerDeletion(profiles) {
+        if (state.auth.role !== 'admin' || !profiles.length) return;
+        openModal(`
+          <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+            <h3 class="text-base font-bold text-red-600 dark:text-red-400">Delete ${profiles.length} player profile${profiles.length === 1 ? '' : 's'}?</h3>
+            <p class="text-xs text-stone-500">This permanently deletes the selected profiles, logins, sessions, invitations, and check-ins. Scores remain, but the players' names are anonymized. This cannot be undone.</p>
+            <div class="max-h-32 overflow-y-auto text-xs text-stone-500">${profiles.map(profile => `<div>${esc(profile.name)}</div>`).join('')}</div>
+            <div class="flex justify-end gap-2">
+              <button id="bulk-player-confirm-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="bulk-player-confirm" type="button" class="px-4 py-2 rounded-lg bg-red-600 text-white text-xs font-bold">Delete profiles</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('bulk-player-confirm-cancel').addEventListener('click', closeModal);
+        document.getElementById('bulk-player-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          document.getElementById('bulk-player-confirm-cancel').disabled = true;
+          const updatedIds = new Set();
+          let deletedCount = 0;
+          let failure = '';
+          let cacheError = false;
+          for (const profile of profiles) {
+            button.textContent = `Deleting ${deletedCount + 1} of ${profiles.length}...`;
+            let result;
+            try {
+              result = await requestAdminApi(`/api/players/${encodeURIComponent(profile.name)}?playerId=${encodeURIComponent(profile.playerId)}`, { method: 'DELETE' });
+            } catch (err) {
+              failure = `${profile.name}: ${err.message}`;
+              break;
+            }
+            deletedCount++;
+            (result.updatedTournamentIds || []).forEach(id => updatedIds.add(id));
+            try {
+              cacheError = !removeCachedPlayerProfile(result.deletedPlayer) || cacheError;
+              refreshLocalTournamentStates(result.updatedTournamentIds, result.deletedPlayer, result.anonymizedName);
+            } catch (err) {
+              console.error('Player was deleted, but local history could not be updated:', err);
+              cacheError = true;
+              failure = `local history update after deleting ${profile.name}: ${err.message}`;
+              break;
+            }
+          }
+          let refreshError = '';
+          if (deletedCount) {
+            try {
+              await refreshAnonymizedTournaments([...updatedIds]);
+            } catch (err) {
+              refreshError = err.message;
+              console.error('Players were deleted, but anonymized tournaments could not be reloaded:', err);
+            }
+            playerData.loaded = false;
+            await loadPlayerData(true);
+            state.ui.selectedPlayerName = '';
+            state.ui.headToHeadOpponent = '';
+            const currentUrl = new URL(window.location.href);
+            currentUrl.searchParams.delete('player');
+            history.replaceState(null, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+            saveRegistry();
+            render();
+          }
+          if (failure || refreshError || cacheError || playerData.error) {
+            openModal(`
+              <div role="alert" class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
+                <h3 class="text-base font-bold">Deleted ${deletedCount} of ${profiles.length} profiles</h3>
+                ${failure ? `<p class="text-xs text-red-600 dark:text-red-400">Deletion stopped at ${esc(failure)}. Remaining players were not deleted.</p>` : ''}
+                ${refreshError || cacheError || playerData.error ? `<p class="text-xs text-red-600 dark:text-red-400">Local history refresh needs attention${refreshError ? `: ${esc(refreshError)}` : ''}${playerData.error ? `: ${esc(playerData.error)}` : ''}.</p>` : ''}
+                <div class="flex justify-end"><button id="bulk-player-result-close" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Close</button></div>
+              </div>
+            `);
+            document.getElementById('bulk-player-result-close').addEventListener('click', closeModal);
+          } else {
+            closeModal();
+            showToast(`Deleted ${deletedCount} player profile${deletedCount === 1 ? '' : 's'}; scores were anonymized`, 'success');
+          }
+        });
+      }
+
       function confirmAdminDeletePlayerProfile(playerName) {
         openModal(`
           <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
@@ -3789,7 +3921,7 @@
               </div>
               <div class="flex gap-2">
                 <button id="player-refresh-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-stone-100 dark:hover:bg-stone-800">Refresh Stats</button>
-                ${state.auth.role === 'admin' ? '<button id="player-invites-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Player Invites</button><button id="player-add-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">+ Add Profile</button>' : ''}
+                ${state.auth.role === 'admin' ? '<button id="player-bulk-delete-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete Players</button><button id="player-invites-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Player Invites</button><button id="player-add-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">+ Add Profile</button>' : ''}
               </div>
             </div>
             ${playerData.error ? `<div role="status" class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-700 dark:text-amber-300">${esc(playerData.error)}. Showing locally available results.</div>` : ''}
@@ -5688,6 +5820,9 @@
           render();
         });
         document.getElementById('player-add-profile-btn')?.addEventListener('click', () => renderPlayerProfileEditor(null));
+        document.getElementById('player-bulk-delete-btn')?.addEventListener('click', () => {
+          openBulkPlayerDeletion().catch(err => showToast(`Could not load players for deletion: ${err.message}`, 'error'));
+        });
         document.getElementById('player-invites-btn')?.addEventListener('click', () => {
           openPlayerInvitesModal().catch(err => showToast(`Could not open player invitations: ${err.message}`, 'error'));
         });

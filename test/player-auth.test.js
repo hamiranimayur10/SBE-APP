@@ -687,12 +687,22 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const deleteProfileWithoutKey = await api('/api/players/History%20Target%20Renamed', { method: 'DELETE' });
     assert.equal(deleteProfileWithoutKey.response.status, 401);
-    const deleteProfileAsPlayer = await api('/api/players/History%20Target%20Renamed', {
+    const deleteProfileAsPlayer = await api(`/api/players/History%20Target%20Renamed?playerId=${renamedTarget.body.player.playerId}`, {
       method: 'DELETE',
       headers: { ...adminHeaders, cookie: deleteTargetCookie }
     });
     assert.equal(deleteProfileAsPlayer.response.status, 403);
-    const deletedProfile = await api('/api/players/History%20Target%20Renamed', {
+    const deleteWithStaleId = await api('/api/players/History%20Target%20Renamed?playerId=00000000-0000-4000-8000-000000000000', {
+      method: 'DELETE',
+      headers: adminHeaders
+    });
+    assert.equal(deleteWithStaleId.response.status, 409);
+    const deleteWithInvalidId = await api('/api/players/History%20Target%20Renamed?playerId=invalid', {
+      method: 'DELETE',
+      headers: adminHeaders
+    });
+    assert.equal(deleteWithInvalidId.response.status, 400);
+    const deletedProfile = await api(`/api/players/History%20Target%20Renamed?playerId=${renamedTarget.body.player.playerId}`, {
       method: 'DELETE',
       headers: adminHeaders
     });

@@ -1433,6 +1433,10 @@ app.delete('/api/players/:name', requireAdminKey, async (req, res) => {
   try {
     const requestedName = String(req.params.name || '').trim();
     if (!requestedName) throw new ValidationError('Player name is required');
+    const expectedPlayerId = req.query.playerId;
+    if (expectedPlayerId !== undefined && (typeof expectedPlayerId !== 'string' || !isPlayerId(expectedPlayerId))) {
+      throw new ValidationError('Player ID must be a UUID');
+    }
 
     transaction = await getDb().transaction('write');
     const profileResult = await transaction.execute({
@@ -1443,6 +1447,10 @@ app.delete('/api/players/:name', requireAdminKey, async (req, res) => {
     if (!profile) {
       await transaction.rollback();
       return res.status(404).json({ error: 'Player profile not found' });
+    }
+    if (expectedPlayerId && expectedPlayerId.toLowerCase() !== String(profile.player_id || '').toLowerCase()) {
+      await transaction.rollback();
+      return res.status(409).json({ error: 'Player profile changed; refresh the directory and try again' });
     }
 
     const accountResult = await transaction.execute({

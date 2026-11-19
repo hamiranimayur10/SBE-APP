@@ -1289,10 +1289,16 @@
         const keys = Object.keys(state.qr2Pools || {}).filter(k => (state.qr2Pools[k] && state.qr2Pools[k].length > 0) || (state.qr2Matches[k] && state.qr2Matches[k].length > 0));
         return keys.length > 0 ? keys : Object.keys(state.qr2Pools || { A: [], B: [] });
       }
+
       function getPoolFinalFormat(poolKey) {
-        if (state.config.poolFinalFormats && state.config.poolFinalFormats[poolKey]) return state.config.poolFinalFormats[poolKey];
-        if (poolKey === 'A') return state.config.poolAFinalFormat || 'bo3';
-        if (poolKey === 'B') return state.config.poolBFinalFormat || 'single';
+        if (poolKey === 'A' && (state.config.poolAFinalFormat === 'bo3' || state.config.poolAFinalFormat === 'single')) {
+          return state.config.poolAFinalFormat;
+        }
+        if (poolKey === 'B' && (state.config.poolBFinalFormat === 'bo3' || state.config.poolBFinalFormat === 'single')) {
+          return state.config.poolBFinalFormat;
+        }
+        const configuredFormat = state.config.poolFinalFormats?.[poolKey];
+        if (configuredFormat === 'bo3' || configuredFormat === 'single') return configuredFormat;
         return 'single';
       }
 
@@ -2612,25 +2618,20 @@
                     <input data-cfg-num="deuceCap" type="number" min="15" max="35" value="${c.deuceCap}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                 </div>
-                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 pt-1">
                   <div>
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Round 2 Groups</label>
                     <input data-cfg-num="qr2PoolsCount" type="number" min="2" max="${Math.max(2, maxRound2GroupCount)}" value="${c.qr2PoolsCount || 2}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
-                  <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Group A Final</label>
-                    <select data-cfg="poolAFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
-                      <option value="bo3" ${c.poolAFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
-                      <option value="single" ${c.poolAFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Group B Final</label>
-                    <select data-cfg="poolBFinalFormat" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
-                      <option value="single" ${c.poolBFinalFormat === 'single' ? 'selected' : ''}>Single Game</option>
-                      <option value="bo3" ${c.poolBFinalFormat === 'bo3' ? 'selected' : ''}>Best of 3</option>
-                    </select>
-                  </div>
+                  ${round2GroupKeys.map(key => `
+                    <div>
+                      <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Group ${key} Final</label>
+                      <select data-pool-final-format="${key}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                        <option value="bo3" ${getPoolFinalFormat(key) === 'bo3' ? 'selected' : ''}>3 sets (Best of 3)</option>
+                        <option value="single" ${getPoolFinalFormat(key) === 'single' ? 'selected' : ''}>1 set (Single Game)</option>
+                      </select>
+                    </div>
+                  `).join('')}
                 </div>
                 <p class="text-xs ${totalPlayers < round2GroupKeys.length * 8 ? 'text-amber-600 dark:text-amber-400' : 'text-stone-500'}">${totalPlayers < round2GroupKeys.length * 8 ? 'Each Round 2 group needs at least 8 players so its top 8 can advance to semi-finals.' : "All Round 1 players are ranked by Win Points and tie-breakers, then assigned in consecutive rank blocks; the top 8 from each Round 2 group advance to that group's semi-finals."}</p>
               </section>
@@ -2769,6 +2770,7 @@
                   <p class="text-xs">Games to ${c.pointsToWin}, win by two until ${c.deuceCap}</p>
                   <p class="text-xs">${round2GroupKeys.length} Round 2 groups · all players seeded by global WP rank</p>
                   <p class="text-xs">Top 8 from each Round 2 group advance to its semi-finals</p>
+                  <p class="text-xs">${round2GroupKeys.map(key => `Group ${key}: ${getPoolFinalFormat(key) === 'bo3' ? '3 sets' : '1 set'}`).join(' · ')}</p>
                 </article>
                 <article class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2 sm:col-span-2">
                   <h3 class="text-xs font-bold uppercase tracking-wide text-stone-500">Ranking &amp; tiebreakers</h3>
@@ -5759,7 +5761,22 @@
         });
         document.querySelectorAll('[data-cfg-num]').forEach(el => {
           el.addEventListener('change', () => {
-            state.config[el.getAttribute('data-cfg-num')] = parseInt(el.value, 10) || 1;
+            const field = el.getAttribute('data-cfg-num');
+            state.config[field] = parseInt(el.value, 10) || 1;
+            saveState();
+            if (field === 'qr2PoolsCount') render();
+          });
+        });
+        document.querySelectorAll('[data-pool-final-format]').forEach(el => {
+          el.addEventListener('change', () => {
+            const groupKey = el.getAttribute('data-pool-final-format');
+            const format = el.value === 'bo3' ? 'bo3' : 'single';
+            if (!state.config.poolFinalFormats || typeof state.config.poolFinalFormats !== 'object') {
+              state.config.poolFinalFormats = {};
+            }
+            state.config.poolFinalFormats[groupKey] = format;
+            if (groupKey === 'A') state.config.poolAFinalFormat = format;
+            if (groupKey === 'B') state.config.poolBFinalFormat = format;
             saveState();
           });
         });

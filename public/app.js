@@ -194,7 +194,7 @@
 
       async function navigateToPage(page) {
         if (!PAGE_FILES[page] || page === getRequestedPage()) return;
-        if (state.auth.role === 'guest' && page === 'setup') return;
+        if (state.auth.role !== 'admin' && page === 'setup') return;
         state.ui.activeTab = page;
         saveRegistry();
         if (state.auth.role === 'admin' && syncTimer && getSyncApiUrl()) {
@@ -210,7 +210,16 @@
           link.addEventListener('click', event => {
             if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
             event.preventDefault();
-            navigateToPage(link.getAttribute('data-tab'));
+            const page = link.getAttribute('data-tab');
+            const ownPlayerCard = state.auth.role === 'player' && page === 'players' && playerAccountProfile;
+            if (ownPlayerCard) {
+              state.ui.selectedPlayerName = playerAccountProfile.name;
+            }
+            if (page === getRequestedPage()) {
+              if (ownPlayerCard) render();
+              return;
+            }
+            navigateToPage(page);
           });
         });
       }
@@ -427,14 +436,14 @@
         return result;
       }
 
-      function applyPlayerAccount(profile, mustChangePassword) {
+      function applyPlayerAccount(profile, mustChangePassword, activeTab) {
         playerAccountProfile = profile;
         playerMustChangePassword = Boolean(mustChangePassword);
         playerAuthError = '';
         playerInviteError = '';
         state.auth.loggedIn = true;
         state.auth.role = 'player';
-        state.ui.activeTab = 'players';
+        state.ui.activeTab = activeTab || (state.ui.activeTab === 'setup' ? 'tournaments' : state.ui.activeTab);
         state.ui.selectedPlayerName = profile.name;
         playerData.profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
         playerData.profiles.push(profile);
@@ -2452,7 +2461,7 @@
                 <span class="${categoryLabel}">Tournament</span>
                 <div class="grid grid-cols-2 gap-1">
                   ${navButton('tournaments', 'Tournaments')}
-                  ${isAdmin || isPlayer ? navButton('setup', 'Setup') : ''}
+                  ${isAdmin ? navButton('setup', 'Setup') : ''}
                 </div>
               </div>
               <details class="relative min-w-[8rem]">
@@ -2478,7 +2487,7 @@
                 </summary>
                 <div class="absolute left-0 top-full mt-1 w-52 rounded-xl border border-stone-200 dark:border-stone-700 bg-white dark:bg-[#191B1F] p-2 shadow-xl">
                   <span class="${categoryLabel}">Participants</span>
-                  ${navButton('players', 'Players & Performance')}
+                  ${navButton('players', isPlayer ? 'My Player Card' : 'Players & Performance')}
                   ${navButton('checkin', 'Attendance', `${checkIns.filter(player => state.checkIns?.[player.name]?.checkedIn).length}/${checkIns.length}`)}
                 </div>
               </details>
@@ -3330,9 +3339,10 @@
               <div>
                 <p class="text-[11px] font-bold uppercase tracking-[0.16em] text-gold-600 dark:text-gold-400">Tournament library</p>
                 <h1 class="mt-1 text-xl sm:text-2xl font-extrabold tracking-tight">Current &amp; Past Tournaments</h1>
-                <p class="mt-1 text-sm text-stone-500 dark:text-stone-400">Open an event to view its schedule, standings, results, bracket, and rules.</p>
+                <p class="mt-1 text-sm text-stone-500 dark:text-stone-400">${state.auth.role === 'player' ? 'Browse current, ongoing, and past tournaments. Your profile controls are available on My Player Card.' : 'Open an event to view its schedule, standings, results, bracket, and rules.'}</p>
               </div>
               <div class="flex flex-wrap gap-2">
+                ${state.auth.role === 'player' ? '<button id="player-profile-shortcut" class="px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">My Player Card</button>' : ''}
                 <button id="tournament-history-refresh" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-stone-100 dark:hover:bg-stone-800">Refresh list</button>
                 ${state.auth.role === 'admin' ? '<button id="new-tournament-btn" class="px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">+ New Tournament</button>' : ''}
               </div>
@@ -4349,7 +4359,11 @@
                 password: document.getElementById('player-login-password').value
               })
             });
-            applyPlayerAccount(result.player, result.mustChangePassword);
+            applyPlayerAccount(result.player, result.mustChangePassword, 'tournaments');
+            if (getRequestedPage() !== 'tournaments') {
+              await navigateToPage('tournaments');
+              return;
+            }
             render();
             showToast('Signed in as Player', 'success');
           } catch (err) {
@@ -4399,10 +4413,14 @@
               method: 'POST',
               body: JSON.stringify(body)
             });
-            applyPlayerAccount(result.player);
+            applyPlayerAccount(result.player, false, 'tournaments');
             const url = new URL(window.location.href);
             url.searchParams.delete('playerInvite');
             history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+            if (getRequestedPage() !== 'tournaments') {
+              await navigateToPage('tournaments');
+              return;
+            }
             render();
             showToast('Player account created', 'success');
           } catch (err) {
@@ -4437,8 +4455,8 @@
           '[data-tab]', '[data-player-select]', '#open-bracket-btn', '#player-refresh-btn',
           '#player-directory-search', '#head-to-head-opponent', '#player-share-btn',
           '#player-edit-own-profile-btn', '#player-change-password-btn', '#player-delete-own-account-btn',
-          '#player-self-checkin-btn', '[data-open-tournament]', '#tournament-history-refresh',
-          '[data-setup-step-nav]'
+          '#player-self-checkin-btn', '#player-profile-shortcut', '[data-open-tournament]',
+          '#tournament-history-refresh'
         ].join(',');
         document.querySelectorAll('main input, main select, main textarea, main button').forEach(control => {
           if (control.matches(safeSelectors)) return;
@@ -4464,6 +4482,10 @@
           render();
         });
         document.getElementById('tournament-switcher')?.addEventListener('change', event => switchTournament(event.target.value));
+        document.getElementById('player-profile-shortcut')?.addEventListener('click', () => {
+          if (playerAccountProfile) state.ui.selectedPlayerName = playerAccountProfile.name;
+          navigateToPage('players');
+        });
         document.querySelectorAll('[data-open-tournament]').forEach(button => {
           button.addEventListener('click', () => openTournamentFromCatalog(button.getAttribute('data-open-tournament')));
         });

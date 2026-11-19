@@ -104,6 +104,10 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(savedTournament.response.status, 200);
     assert.match(savedTournament.body.playerProfileIds['roster alice'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(savedTournament.body.playerProfileIds['roster bob'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    const publicTournamentHistory = await api('/api/tournament-history');
+    assert.equal(publicTournamentHistory.response.status, 200);
+    assert.ok(publicTournamentHistory.body.tournaments.some(tournament => tournament.id === 'auth-test'));
+
     const unchangedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
     assert.equal(unchangedTournament.response.status, 200);
     assert.equal(unchangedTournament.body.unchanged, true);

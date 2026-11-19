@@ -46,7 +46,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       ...process.env,
       ADMIN_SYNC_KEY: 'player-auth-test-admin-key',
       PORT: String(port),
-      TURSO_DATABASE_URL: databaseUrl,
+      SBE_TURSO_DATABASE_URL: databaseUrl,
+      SBE_TURSO_AUTH_TOKEN: '',
+      TURSO_DATABASE_URL: '',
       TURSO_AUTH_TOKEN: '',
       VERCEL: ''
     },

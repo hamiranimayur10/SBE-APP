@@ -26,7 +26,7 @@ Page navigation keeps the selected tournament and configured API URL in the quer
    turso db create badminton-tournament
    turso db show badminton-tournament --url
    ```
-3. Add `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, and a strong random `ADMIN_SYNC_KEY` as Vercel project environment variables, then deploy. The API creates its tables automatically on first request. Enter the same admin key in the app's Cloud Sync settings. Player invitation management is disabled until this key is configured.
+3. Add `SBE_TURSO_DATABASE_URL`, `SBE_TURSO_AUTH_TOKEN`, and a strong random `ADMIN_SYNC_KEY` to the Vercel project's **Production** environment variables, then deploy. The API also accepts the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` names. The API creates its tables automatically on first request. Enter the same admin key in the app's Cloud Sync settings. Player invitation management is disabled until this key is configured.
 4. Open the Vercel URL. Cloud Sync uses the app's same-origin `/api` endpoints by default; no backend URL is needed.
 
 ## Run locally
@@ -35,7 +35,7 @@ Page navigation keeps the selected tournament and configured API URL in the quer
    npm install
    npm start
    ```
-Without Turso environment variables, local development uses `badminton-backend/local.db`. To use Turso locally instead, copy `badminton-backend/.env.example` to `badminton-backend/.env` and set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`. Set `ADMIN_SYNC_KEY` in that backend `.env` file and enter the exact same value in the app's Cloud Sync settings; the example file contains placeholders only. The app and API are available at `http://localhost:3001`. If using a local static preview on port 8080, the app routes API requests to port 3001.
+Without Turso environment variables, local development uses `badminton-backend/local.db`. To use Turso locally instead, copy `badminton-backend/.env.example` to `badminton-backend/.env` and set `SBE_TURSO_DATABASE_URL` and `SBE_TURSO_AUTH_TOKEN` (or the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`). Set `ADMIN_SYNC_KEY` in that backend `.env` file and enter the exact same value in the app's Cloud Sync settings; the example file contains placeholders only. The app and API are available at `http://localhost:3001`. If using a local static preview on port 8080, the app routes API requests to port 3001.
 
 ## Player accounts and profiles
 Admins can create a player-specific one-use invitation or a reusable invitation in the **Players** section. Share the generated link manually; the app does not send email or SMS. Email invitations require registration with the matching email address. Generic invitations can claim an unclaimed roster player or create a new profile.

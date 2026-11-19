@@ -20,13 +20,18 @@ const PROFILE_VISIBILITY_FIELDS = [
 class ValidationError extends Error {}
 
 let db;
+function getDatabaseUrl() {
+  return process.env.SBE_TURSO_DATABASE_URL
+    || process.env.TURSO_DATABASE_URL
+    || (!process.env.VERCEL ? 'file:./badminton-backend/local.db' : '');
+}
+
 function getDb() {
   if (!db) {
-    const databaseUrl = process.env.TURSO_DATABASE_URL
-      || (!process.env.VERCEL ? 'file:./badminton-backend/local.db' : '');
-    const authToken = process.env.TURSO_AUTH_TOKEN;
+    const databaseUrl = getDatabaseUrl();
+    const authToken = process.env.SBE_TURSO_AUTH_TOKEN || process.env.TURSO_AUTH_TOKEN;
     if (!databaseUrl || (databaseUrl.startsWith('file:') && process.env.VERCEL) || (!databaseUrl.startsWith('file:') && !authToken)) {
-      throw new Error('Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN environment variables.');
+      throw new Error('Configure SBE_TURSO_DATABASE_URL (or TURSO_DATABASE_URL) and SBE_TURSO_AUTH_TOKEN (or TURSO_AUTH_TOKEN) environment variables.');
     }
     const options = { url: databaseUrl };
     if (authToken) options.authToken = authToken;
@@ -690,9 +695,10 @@ async function persistPlayerProfile(profile, options) {
 app.get('/api/health', async (_req, res) => {
   try {
     await getDb().execute('SELECT 1');
+    const databaseUrl = getDatabaseUrl();
     res.json({
       ok: true,
-      db: process.env.TURSO_DATABASE_URL && !process.env.TURSO_DATABASE_URL.startsWith('file:') ? 'turso' : 'sqlite'
+      db: databaseUrl.startsWith('file:') ? 'sqlite' : 'turso'
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

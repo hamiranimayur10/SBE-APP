@@ -1431,46 +1431,8 @@
       }
 
       // Ranking formula: WP = Wins * 20 + sum(win margins) - sum(loss margins)
-      function computeStandings(players, matches) {
-        const stats = window.PlayerAnalytics.accumulateStandings(players, matches);
-
-        const rk = state.config.ranking || { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
-        const wPts = Number(rk.winPointsWeight ?? 20);
-        const wWinM = Number(rk.winMarginWeight ?? 1);
-        const wLossM = Number(rk.lossMarginWeight ?? 1);
-        const order = Array.isArray(rk.tiebreakers) && rk.tiebreakers.length ? rk.tiebreakers : ['wp', 'wins', 'pf', 'pa'];
-
-        const rows = stats.map(r => ({
-          ...r,
-          diff: r.pf - r.pa,
-          wp: r.wins * wPts + r.winMargins * wWinM - r.lossMargins * wLossM
-        }));
-
-        const metricVal = (r, key) => {
-          if (key === 'wp') return r.wp;
-          if (key === 'wins') return r.wins;
-          if (key === 'pf') return r.pf;
-          if (key === 'pa') return -r.pa; // fewer points against is better
-          if (key === 'diff') return r.diff;
-          return 0;
-        };
-
-        rows.sort((a, b) => {
-          for (const key of order) {
-            const diff = metricVal(b, key) - metricVal(a, key);
-            if (diff !== 0) return diff;
-          }
-          return a.player.localeCompare(b.player);
-        });
-
-        for (let i = 0; i < rows.length - 1; i++) {
-          const x = rows[i], y = rows[i + 1];
-          if (x.played > 0 && order.every(k => metricVal(x, k) === metricVal(y, k))) {
-            x.tiedFlag = true;
-            y.tiedFlag = true;
-          }
-        }
-        return rows;
+      function computeStandings(players, matches, wpFirst = false) {
+        return window.PlayerAnalytics.computeStandings(players, matches, state.config.ranking, wpFirst);
       }
 
       function randomValidScore() {
@@ -1573,10 +1535,15 @@
           }
         }
         const qr1 = [];
-        state.groups.forEach(g => {
-          const sched = TournamentDraw.generateGroupSchedule(g.players, state.config.matchesPerPlayer, g.id, 'QR1');
-          qr1.push(...sched);
-        });
+        for (const g of state.groups) {
+          try {
+            qr1.push(...TournamentDraw.generateGroupSchedule(g.players, state.config.matchesPerPlayer, g.id, 'QR1'));
+          } catch (err) {
+            if (!(err instanceof RangeError)) throw err;
+            showToast(`Round 1 ${g.name}: ${err.message}`, 'error');
+            return;
+          }
+        }
         state.qr1Matches = qr1;
         state.qr2Pools = { A: [], B: [] };
         state.qr2Matches = { A: [], B: [] };
@@ -2862,7 +2829,7 @@
                     </div>
                   `).join('')}
                 </div>
-                <p class="text-xs text-stone-500">Qualifying matches are doubles: four different players per match, with partners rotated where possible. Each player plays exactly the selected number of matches. Group size multiplied by matches per player must be divisible by 4. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 count for Round 2 until this setting is changed.' : ''}</p>
+                <p class="text-xs text-stone-500">Qualifying matches are doubles: four different players per match, and no partnership repeats within a group stage. Each player plays exactly the selected number of matches, which must be less than the group size. Group size multiplied by matches per player must be divisible by 4. Changes apply when schedules are generated or regenerated.${c.qr2MatchesPerPlayer === undefined ? ' This older tournament uses the Round 1 count for Round 2 until this setting is changed.' : ''}</p>
                 ${round1Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round1Error)}</p>` : ''}
                 ${round2Error ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(round2Error)}</p>` : ''}
                 <p class="text-xs ${totalPlayers < round2GroupKeys.length * 8 ? 'text-amber-600 dark:text-amber-400' : 'text-stone-500'}">${totalPlayers < round2GroupKeys.length * 8 ? 'Each Round 2 group needs at least 8 players so its top 8 can advance to semi-finals.' : "All Round 1 players are ranked by Win Points and tie-breakers, then assigned in consecutive rank blocks; the top 8 from each Round 2 group advance to that group's semi-finals."}</p>
@@ -3053,8 +3020,8 @@
         `;
       }
 
-      function renderStandingsTable(title, players, matches, highlightTopN, accentClass) {
-        const rows = computeStandings(players, matches);
+      function renderStandingsTable(title, players, matches, highlightTopN, accentClass, wpFirst = false) {
+        const rows = computeStandings(players, matches, wpFirst);
         return `
           <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
             <div class="px-4 py-3 border-b border-stone-200 dark:border-stone-800 flex items-center justify-between">
@@ -3209,6 +3176,11 @@
               ` : ''}
             </div>
 
+            <section class="space-y-2" aria-label="Overall Round 1 standings">
+              <p class="text-xs text-stone-500">All Round 1 groups combined, ranked by WP first. Round 2 assignment uses the configured ranking order.</p>
+              ${renderStandingsTable('Overall Round 1 Standings', state.groups.flatMap(group => group.players), state.qr1Matches, 0, 'text-gold-600 dark:text-gold-400', true)}
+            </section>
+
             ${visibleGroups.map(g => {
               const gMatches = state.qr1Matches.filter(m => m.groupId === g.id);
               return `
@@ -3265,6 +3237,18 @@
                       </div>
                     ` : ''}
                   </div>
+                  <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 space-y-2" aria-label="Group ${esc(k)} Round 2 qualifiers">
+                    <h3 class="font-bold text-sm ${getPoolAccent(k)}">Group ${esc(k)} Semi-Final Qualifiers</h3>
+                    ${players.length < 8 ? '<p class="text-xs text-stone-500">At least 8 players are needed to qualify for the semi-finals.</p>' :
+                      !matches.length || matches.some(match => !match.completed) ? '<p class="text-xs text-stone-500">Qualifiers will appear when all matches in this group are complete.</p>' : `
+                        <p class="text-xs text-stone-500">Top 8 by the configured group ranking. Ties are flagged for the officiating table.</p>
+                        <ol class="grid grid-cols-1 sm:grid-cols-2 gap-1 text-xs">
+                          ${computeStandings(players, matches).slice(0, 8).map((row, index) => `
+                            <li class="flex justify-between gap-3"><span>${index + 1}. ${esc(row.player)}${row.tiedFlag ? ' <span class="text-amber-500 font-semibold">TIE</span>' : ''}</span><span class="tabular-nums">${esc(row.wp)} WP</span></li>
+                          `).join('')}
+                        </ol>
+                      `}
+                  </section>
                   ${renderStandingsTable(`Round 2 Group ${k} Standings (Top 8 → Group ${k} Semi-Finals)`, players, matches, 8, getPoolAccent(k))}
                   ${renderScheduledMatchCards(matches, `qr2_${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${k} (needs at least 4 players).</div>`)}
                 </div>
@@ -3357,9 +3341,19 @@
           `;
         };
 
+        const readyToComplete = isAdmin && TournamentDraw.isTournamentReadyToComplete(state);
         return `
-          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            ${finalKeys.map(k => renderFinalCard(state.finals[k], k, getPoolAccent(k))).join('')}
+          <div class="space-y-5">
+            ${isAdmin && state.phase !== 'completed' ? `
+              <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 flex flex-wrap items-center justify-between gap-3">
+                <p class="text-xs text-stone-500">${readyToComplete ? 'All matches are complete. Mark the tournament done to move it to Past Tournaments and close player check-in.' : 'Complete all qualifying matches, semi-finals, and finals before marking the tournament done.'}</p>
+                <button id="complete-tournament-btn" type="button" ${readyToComplete ? '' : 'disabled'} class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed">Mark Tournament Done</button>
+              </div>
+            ` : ''}
+            ${state.phase === 'completed' ? '<p class="text-sm font-semibold text-emerald-600 dark:text-emerald-400">Tournament marked done. Find it under Past Tournaments.</p>' : ''}
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              ${finalKeys.map(k => renderFinalCard(state.finals[k], k, getPoolAccent(k))).join('')}
+            </div>
           </div>
         `;
       }
@@ -3621,7 +3615,7 @@
               <section class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-5 space-y-3">
                 <h2 class="font-bold text-sm">Tournament progression</h2>
                 <ul class="space-y-2 text-sm text-stone-600 dark:text-stone-300">
-                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; ${esc(config.matchesPerPlayer)} doubles matches per player when newly scheduled, with partners rotated where possible.</li>
+                  <li><b>Qualifier 1:</b> ${config.numGroups} groups, up to ${config.playersPerGroup} players per group; ${esc(config.matchesPerPlayer)} doubles matches per player when newly scheduled, without repeated partners within a group.</li>
                   <li><b>Qualifier 2:</b> all players are ranked by WP and tie-breakers, then assigned to ${poolKeys.length} groups in consecutive rank blocks; ${esc(config.qr2MatchesPerPlayer ?? config.matchesPerPlayer)} matches per player when newly scheduled.</li>
                   <li><b>Semi-finals:</b> the top 8 players from each Round 2 group advance to that group's semi-finals.</li>
                   <li><b>Finals:</b> ${poolKeys.map(key => `Group ${key} ${getPoolFinalFormat(key) === 'bo3' ? 'best of three' : 'single game'}`).join('; ')}.</li>
@@ -6284,6 +6278,22 @@
           });
         });
 
+        document.getElementById('complete-tournament-btn')?.addEventListener('click', () => {
+          if (state.auth.role !== 'admin') return;
+          if (hasUnsavedScoreEntry()) {
+            showToast('Save or discard score changes before marking the tournament done', 'error');
+            return;
+          }
+          if (!TournamentDraw.isTournamentReadyToComplete(state)) {
+            showToast('Complete all tournament matches before marking it done', 'error');
+            return;
+          }
+          state.phase = 'completed';
+          saveState();
+          render();
+          showToast('Tournament marked done', 'success');
+        });
+
         document.querySelectorAll('[data-save-final]').forEach(btn => {
           btn.addEventListener('click', () => {
             const poolKey = btn.getAttribute('data-save-final');
@@ -6306,8 +6316,6 @@
               f.completed = true;
               f.winner = t1Wins > t2Wins ? f.t1 : f.t2;
               f.completedAt = new Date().toISOString();
-              const poolKeys = getActiveQR2PoolKeys().filter(key => (state.qr2Pools[key] || []).length);
-              if (poolKeys.length && poolKeys.every(key => state.finals[key]?.completed)) state.phase = 'completed';
               showToast(`Group ${poolKey} Champion: ${f.winner}!`, 'success');
             } else {
               f.completed = false;

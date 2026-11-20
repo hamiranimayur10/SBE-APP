@@ -21,6 +21,24 @@ const TournamentDraw = (() => {
     return groups;
   }
 
+  function isTournamentReadyToComplete(tournament) {
+    if (!tournament || tournament.phase !== 'finals') return false;
+    const qr1 = tournament.qr1Matches || [];
+    if (!qr1.length || qr1.some(match => !match.completed)) return false;
+    const pools = Object.keys(tournament.qr2Pools || {}).filter(key => (tournament.qr2Pools[key] || []).length);
+    if (!pools.length) return false;
+    if (pools.some(key =>
+      !(tournament.qr2Matches?.[key] || []).length ||
+      (tournament.semis?.[key] || []).length < 2 ||
+      !tournament.finals?.[key]?.completed
+    )) return false;
+    return [
+      ...Object.values(tournament.qr2Matches || {}).flat(),
+      ...Object.values(tournament.semis || {}).flat(),
+      ...Object.values(tournament.finals || {}).filter(Boolean)
+    ].every(match => match.completed);
+  }
+
   function normalizePlayerName(name) {
     return String(name || '')
       .normalize('NFKD')
@@ -43,6 +61,9 @@ const TournamentDraw = (() => {
     }
     if (!Number.isInteger(playerCount) || playerCount < 4) {
       throw new RangeError('Doubles groups need at least 4 players');
+    }
+    if (matchesPerPlayer >= playerCount) {
+      throw new RangeError('Matches per player must be less than the group size to avoid repeated partners');
     }
     if ((playerCount * matchesPerPlayer) % 4 !== 0) {
       throw new RangeError('Players multiplied by matches per player must be divisible by 4 for doubles');
@@ -68,34 +89,45 @@ const TournamentDraw = (() => {
       const swap = Math.floor(random() * (index + 1));
       [shuffled[index], shuffled[swap]] = [shuffled[swap], shuffled[index]];
     }
-    const partnerships = new Map();
-    const pairKey = (a, b) => [a, b].sort((x, y) => x - y).join(':');
-    const matches = [];
-    // Consecutive appearances ensure equal counts; whole-cycle shifts mix groups of four.
-    for (let offset = 0; offset < players.length * matchesPerPlayer; offset += 4) {
-      const indices = Array.from({ length: 4 }, (_, i) => {
-        const position = offset + i;
-        const cycle = Math.floor(position / players.length);
-        const shift = players.length % 4 === 0 ? cycle : 0;
-        return (position + shift) % players.length;
-      });
-      const options = [
-        [[indices[0], indices[1]], [indices[2], indices[3]]],
-        [[indices[0], indices[2]], [indices[1], indices[3]]],
-        [[indices[0], indices[3]], [indices[1], indices[2]]]
-      ];
-      options.sort((a, b) =>
-        a.reduce((sum, pair) => sum + (partnerships.get(pairKey(...pair)) || 0), 0) -
-        b.reduce((sum, pair) => sum + (partnerships.get(pairKey(...pair)) || 0), 0)
-      );
-      const teams = options[0];
-      teams.forEach(pair => {
-        const key = pairKey(...pair);
-        partnerships.set(key, (partnerships.get(key) || 0) + 1);
-      });
-      matches.push(teams.map(team => team.map(index => shuffled[index])));
+    const partnerships = [];
+    for (let distance = 1; distance <= Math.floor(matchesPerPlayer / 2); distance++) {
+      for (let index = 0; index < players.length; index++) {
+        partnerships.push([index, (index + distance) % players.length]);
+      }
     }
-    return matches;
+    if (matchesPerPlayer % 2) {
+      for (let index = 0; index < players.length / 2; index++) {
+        partnerships.push([index, index + players.length / 2]);
+      }
+    }
+    const disjoint = (a, b) => !a.some(player => b.includes(player));
+    const matches = [];
+    while (partnerships.length) {
+      const first = partnerships.pop();
+      const opponentIndex = partnerships.findIndex(team => disjoint(first, team));
+      if (opponentIndex !== -1) {
+        matches.push([first, partnerships.splice(opponentIndex, 1)[0]]);
+        continue;
+      }
+
+      // Reassign a previous match when the remaining partnerships overlap.
+      let repaired = false;
+      for (let index = 0; index < partnerships.length && !repaired; index++) {
+        const second = partnerships[index];
+        for (let previous = 0; previous < matches.length; previous++) {
+          let [a, b] = matches[previous];
+          if (!disjoint(first, a) || !disjoint(second, b)) [a, b] = [b, a];
+          if (!disjoint(first, a) || !disjoint(second, b)) continue;
+          matches[previous] = [first, a];
+          matches.push([second, b]);
+          partnerships.splice(index, 1);
+          repaired = true;
+          break;
+        }
+      }
+      if (!repaired) throw new RangeError('Could not generate a schedule with unique partners for this group');
+    }
+    return matches.map(match => match.map(team => team.map(index => shuffled[index])));
   }
 
   function scheduleMatchesForCourts(matches, courtCount = 2) {
@@ -173,7 +205,7 @@ const TournamentDraw = (() => {
     return topFour.map((player, index) => [player, bottomFour[index]]);
   }
 
-  return { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, scheduleMatchesForCourts, validateGroupMatchCount, validateGroupPlayers };
+  return { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, scheduleMatchesForCourts, validateGroupMatchCount, validateGroupPlayers };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = TournamentDraw;

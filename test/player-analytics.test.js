@@ -2,7 +2,23 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { accumulateStandings, buildAnalytics, getBadges } = require('../public/player-analytics');
+const { accumulateStandings, buildAnalytics, computeStandings, getBadges } = require('../public/player-analytics');
+
+test('overall round 1 standings rank WP first without changing configured qualification order', () => {
+  const players = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+  const matches = [
+    { p1: 'A & B', p2: 'E & F', s1: 21, s2: 19, completed: true },
+    { p1: 'A & B', p2: 'E & F', s1: 21, s2: 19, completed: true },
+    { p1: 'C & D', p2: 'G & H', s1: 21, s2: 0, completed: true }
+  ];
+  const ranking = { winPointsWeight: 1, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wins', 'wp', 'pf', 'pa'] };
+  const overall = computeStandings(players, matches, ranking, true);
+  const qualification = computeStandings(players, matches, ranking);
+  assert.deepEqual(overall.slice(0, 4).map(row => row.player), ['C', 'D', 'A', 'B']);
+  assert.deepEqual(overall.slice(0, 4).map(row => row.wp), [22, 22, 6, 6]);
+  assert.deepEqual(qualification.slice(0, 4).map(row => row.player), ['A', 'B', 'C', 'D']);
+  assert.ok(overall[0].tiedFlag);
+});
 
 test('qualifying doubles credit both players on each side and preserve legacy singles', () => {
   const players = ['Alex', 'Blair', 'Casey', 'Drew'];

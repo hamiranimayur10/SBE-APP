@@ -2,22 +2,58 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, scheduleMatchesForCourts } = require('../public/tournament-draw');
+const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, scheduleMatchesForCourts } = require('../public/tournament-draw');
+
+test('completion requires every stage and every group final to be finished', () => {
+  const done = () => ({ completed: true });
+  const tournament = {
+    phase: 'finals',
+    qr1Matches: [done()],
+    qr2Pools: { A: ['A'], B: ['B'] },
+    qr2Matches: { A: [done()], B: [done()] },
+    semis: { A: [done(), done()], B: [done(), done()] },
+    finals: { A: done(), B: done() }
+  };
+  assert.equal(isTournamentReadyToComplete(tournament), true);
+  tournament.finals.B.completed = false;
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+  tournament.finals.B.completed = true;
+  tournament.qr1Matches[0].completed = false;
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+  tournament.qr1Matches[0].completed = true;
+  tournament.qr2Matches.B = [];
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+  tournament.qr2Matches.B = [done()];
+  tournament.semis.B = [done()];
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+  tournament.semis.B.push(done());
+  tournament.semis.C = [{ completed: false }];
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+  delete tournament.semis.C;
+  tournament.phase = 'completed';
+  assert.equal(isTournamentReadyToComplete(tournament), false);
+});
 
 test('generated qualifying schedules give every player exactly the requested matches', () => {
   for (const size of [4, 5, 6, 8, 9, 10, 15, 30]) {
     const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
     for (const count of [1, 2, 3, 4, 5, 8]) {
-      if (size * count % 4) continue;
+      if (count >= size || size * count % 4) continue;
       const schedule = generateGroupSchedule(players, count, 'A', 'QR1');
       const counts = Object.fromEntries(players.map(player => [player, 0]));
       const rounds = new Map();
+      const partnerships = new Set();
       assert.equal(schedule.length, size * count / 4);
       for (const match of schedule) {
         const team1 = match.p1.split(' & ');
         const team2 = match.p2.split(' & ');
         assert.equal(team1.length, 2);
         assert.equal(team2.length, 2);
+        for (const team of [team1, team2]) {
+          const key = [...team].sort().join('|');
+          assert.ok(!partnerships.has(key), `Repeated partnership in ${size}-player group`);
+          partnerships.add(key);
+        }
         const matchPlayers = [...team1, ...team2];
         assert.equal(new Set(matchPlayers).size, 4);
         matchPlayers.forEach(player => counts[player]++);
@@ -34,15 +70,32 @@ test('generated qualifying schedules give every player exactly the requested mat
   }
 });
 
-test('rotates partners when four players play three matches', () => {
-  const matches = generateGroupPairings(['A', 'B', 'C', 'D'], 3, () => 0);
-  const partners = matches.flat().filter(team => team.includes('A')).map(team => team.find(player => player !== 'A'));
-  assert.equal(new Set(partners).size, 3);
+test('representative group sizes can draw feasible unique partnerships', () => {
+  for (const size of [4, 5, 6, 7, 8, 9, 10, 12, 15, 16, 24, 30, 40, 80]) {
+    const players = Array.from({ length: size }, (_, index) => `Player ${index}`);
+    for (let count = 1; count < size; count++) {
+      if (size * count % 4) continue;
+      const matches = generateGroupPairings(players, count, () => 0);
+      const partners = new Map(players.map(player => [player, new Set()]));
+      assert.equal(matches.length, size * count / 4);
+      matches.forEach(match => {
+        assert.equal(new Set(match.flat()).size, 4);
+        match.forEach(([a, b]) => {
+          assert.ok(!partners.get(a).has(b), `${a} and ${b} paired twice for ${size}/${count}`);
+          partners.get(a).add(b);
+          partners.get(b).add(a);
+        });
+      });
+      players.forEach(player => assert.equal(partners.get(player).size, count));
+    }
+  }
 });
 
 test('rejects impossible or invalid per-player match counts', () => {
   const players = Array.from({ length: 9 }, (_, index) => `Player ${index}`);
   assert.throws(() => generateGroupPairings(players, 3), /divisible by 4/);
+  assert.throws(() => generateGroupPairings(['A', 'B', 'C', 'D'], 4), /less than the group size/);
+  assert.throws(() => generateGroupPairings(players, 12), /less than the group size/);
   assert.throws(() => generateGroupPairings(['A', 'B', 'C'], 4), /at least 4/);
   assert.throws(() => generateGroupPairings(players, 0), /positive whole number/);
   assert.throws(() => generateGroupPairings(players, 2.5), /positive whole number/);

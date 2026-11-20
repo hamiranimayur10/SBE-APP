@@ -56,6 +56,44 @@ const PlayerAnalytics = (() => {
     return Object.values(stats);
   }
 
+  function computeStandings(players, matches, ranking, wpFirst = false) {
+    const stats = accumulateStandings(players, matches);
+    const rk = ranking || { winPointsWeight: 20, winMarginWeight: 1, lossMarginWeight: 1, tiebreakers: ['wp', 'wins', 'pf', 'pa'] };
+    const wPts = Number(rk.winPointsWeight ?? 20);
+    const wWinM = Number(rk.winMarginWeight ?? 1);
+    const wLossM = Number(rk.lossMarginWeight ?? 1);
+    const configuredOrder = Array.isArray(rk.tiebreakers) && rk.tiebreakers.length ? rk.tiebreakers : ['wp', 'wins', 'pf', 'pa'];
+    const order = wpFirst ? ['wp', ...configuredOrder.filter(key => key !== 'wp')] : configuredOrder;
+    const rows = stats.map(row => ({
+      ...row,
+      diff: row.pf - row.pa,
+      wp: row.wins * wPts + row.winMargins * wWinM - row.lossMargins * wLossM
+    }));
+    const metricVal = (row, key) => {
+      if (key === 'wp') return row.wp;
+      if (key === 'wins') return row.wins;
+      if (key === 'pf') return row.pf;
+      if (key === 'pa') return -row.pa;
+      if (key === 'diff') return row.diff;
+      return 0;
+    };
+    rows.sort((a, b) => {
+      for (const key of order) {
+        const diff = metricVal(b, key) - metricVal(a, key);
+        if (diff !== 0) return diff;
+      }
+      return a.player.localeCompare(b.player);
+    });
+    for (let index = 0; index < rows.length - 1; index++) {
+      const current = rows[index], next = rows[index + 1];
+      if (current.played > 0 && order.every(key => metricVal(current, key) === metricVal(next, key))) {
+        current.tiedFlag = true;
+        next.tiedFlag = true;
+      }
+    }
+    return rows;
+  }
+
   function validScore(value) {
     return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
   }
@@ -535,7 +573,7 @@ const PlayerAnalytics = (() => {
     return badges;
   }
 
-  return { accumulateStandings, buildAnalytics, extractMatchRecords, getBadges, normalizeName };
+  return { accumulateStandings, buildAnalytics, computeStandings, extractMatchRecords, getBadges, normalizeName };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = PlayerAnalytics;

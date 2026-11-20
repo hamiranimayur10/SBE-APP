@@ -93,7 +93,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const savedTournament = await api('/api/tournaments/auth-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
       body: JSON.stringify({
         tournamentId: 'auth-test',
         phase: 'setup',
@@ -117,13 +117,176 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     updatedTournamentData.body.data.config.name = 'Auth Test Updated';
     const updatedTournament = await api('/api/tournaments/auth-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': updatedTournamentData.body.revision },
       body: JSON.stringify(updatedTournamentData.body.data)
     });
     const changedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
     assert.equal(updatedTournament.response.status, 200);
     assert.equal(changedTournament.body.unchanged, undefined);
     assert.equal(changedTournament.body.data.config.name, 'Auth Test Updated');
+
+    const closedAuthFixture = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': changedTournament.body.revision },
+      body: JSON.stringify({ ...changedTournament.body.data, phase: 'completed' })
+    });
+    assert.equal(closedAuthFixture.response.status, 200);
+    const matches = [
+      { id: 'm1', p1: 'Roster Alice', p2: 'Roster Bob', s1: null, s2: null, completed: false },
+      { id: 'm2', p1: 'Legacy Player', p2: 'Roster Bob', s1: null, s2: null, completed: false }
+    ];
+    const scoreFixture = {
+      tournamentId: 'score-test', phase: 'qr1',
+      config: { name: 'Score Test', pointsToWin: 21, deuceCap: 25 },
+      groups: [], qr1Matches: matches, qr2Pools: { A: [], B: [] },
+      qr2Matches: { A: [], B: [] }, semis: { A: [], B: [] }, finals: { A: null, B: null }
+    };
+    const createdScoreFixture = await api('/api/tournaments/score-test', {
+      method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
+      body: JSON.stringify(scoreFixture)
+    });
+    assert.equal(createdScoreFixture.response.status, 200);
+    const blockedFixture = await api('/api/tournaments/another-open', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
+      body: JSON.stringify({ config: { name: 'Another open tournament' }, phase: 'setup', groups: [] })
+    });
+    assert.equal(blockedFixture.response.status, 409);
+    const blockedReopen = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': closedAuthFixture.body.revision },
+      body: JSON.stringify({ ...changedTournament.body.data, phase: 'setup' })
+    });
+    assert.equal(blockedReopen.response.status, 409);
+    const patchScore = (id, body, headers = adminHeaders) => api(`/api/tournaments/score-test/matches/${id}/score`, {
+      method: 'PATCH', headers, body: JSON.stringify(body)
+    });
+    const deniedScore = await patchScore('m1', { listKey: 'qr1', expectedMatch: matches[0], s1: 21, s2: 12 }, { 'content-type': 'application/json' });
+    assert.equal(deniedScore.response.status, 401);
+    const scoreResults = await Promise.all(matches.map((match, index) => patchScore(match.id, {
+      listKey: 'qr1', expectedMatch: match, s1: 21, s2: 10 + index
+    })));
+    assert.deepEqual(scoreResults.map(result => result.response.status), [200, 200]);
+    const bothScores = await api('/api/tournaments/score-test');
+    assert.deepEqual(bothScores.body.data.qr1Matches.map(match => match.s2), [10, 11]);
+    const staleSnapshot = await api('/api/tournaments/score-test', {
+      method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': createdScoreFixture.body.revision },
+      body: JSON.stringify(scoreFixture)
+    });
+    assert.equal(staleSnapshot.response.status, 409);
+    const missingRevision = await api('/api/tournaments/score-test', {
+      method: 'PUT', headers: adminHeaders, body: JSON.stringify(scoreFixture)
+    });
+    assert.equal(missingRevision.response.status, 428);
+    const sameMatch = bothScores.body.data.qr1Matches[0];
+    const competing = await Promise.all([12, 13].map(score => patchScore('m1', {
+      listKey: 'qr1', expectedMatch: sameMatch, s1: 21, s2: score
+    })));
+    assert.deepEqual(competing.map(result => result.response.status).sort(), [200, 409]);
+    let afterCompeting = await api('/api/tournaments/score-test');
+    const [concurrentScore, concurrentCheckIn] = await Promise.all([
+      patchScore('m2', { listKey: 'qr1', expectedMatch: afterCompeting.body.data.qr1Matches[1], s1: 21, s2: 12 }),
+      api('/api/tournaments/score-test/checkin', {
+        method: 'POST', headers: adminHeaders, body: JSON.stringify({ playerName: 'Roster Alice' })
+      })
+    ]);
+    assert.equal(concurrentScore.response.status, 200);
+    assert.equal(concurrentCheckIn.response.status, 200);
+    afterCompeting = await api('/api/tournaments/score-test');
+    assert.equal(afterCompeting.body.data.qr1Matches[1].s2, 12);
+    assert.equal(afterCompeting.body.data.checkIns['Roster Alice'].checkedIn, true);
+    const invalidScore = await patchScore('m2', {
+      listKey: 'qr1', expectedMatch: afterCompeting.body.data.qr1Matches[1], s1: 21, s2: 20
+    });
+    assert.equal(invalidScore.response.status, 400);
+    afterCompeting.body.data.qr2Pools.A = ['Roster Alice', 'Roster Bob'];
+    afterCompeting.body.data.finals.A = {
+      id: 'final-a', format: 'bo3', t1: 'Roster Alice', t2: 'Roster Bob',
+      games: [{ s1: null, s2: null }, { s1: null, s2: null }, { s1: null, s2: null }],
+      completed: false, winner: null
+    };
+    const advanced = await api('/api/tournaments/score-test', {
+      method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': afterCompeting.body.revision },
+      body: JSON.stringify(afterCompeting.body.data)
+    });
+    assert.equal(advanced.response.status, 200);
+    const finalResult = await patchScore('final-a', {
+      listKey: 'final_A', expectedMatch: afterCompeting.body.data.finals.A,
+      games: [{ s1: 21, s2: 15 }, { s1: 21, s2: 17 }, { s1: null, s2: null }]
+    });
+    assert.equal(finalResult.response.status, 200);
+    assert.equal(finalResult.body.data.finals.A.winner, 'Roster Alice');
+    const invalidFinal = await patchScore('final-a', {
+      listKey: 'final_A', expectedMatch: finalResult.body.data.finals.A,
+      games: [{ s1: 21, s2: null }, { s1: null, s2: null }, { s1: null, s2: null }]
+    });
+    assert.equal(invalidFinal.response.status, 400);
+    const clearedFinal = await patchScore('final-a', {
+      listKey: 'final_A', expectedMatch: finalResult.body.data.finals.A,
+      games: [{ s1: 21, s2: 15 }, { s1: null, s2: null }, { s1: null, s2: null }]
+    });
+    assert.equal(clearedFinal.response.status, 200);
+    assert.equal(clearedFinal.body.data.finals.A.completed, false);
+    assert.equal(clearedFinal.body.data.finals.A.winner, null);
+    const staleCorrection = await patchScore('m2', {
+      listKey: 'qr1', expectedMatch: afterCompeting.body.data.qr1Matches[1],
+      s1: 21, s2: 14, confirmedRevision: advanced.body.revision
+    });
+    assert.equal(staleCorrection.response.status, 409);
+    const beforeCorrection = await api('/api/tournaments/score-test');
+    const correction = await patchScore('m2', {
+      listKey: 'qr1', expectedMatch: beforeCorrection.body.data.qr1Matches[1],
+      s1: 21, s2: 14, confirmedRevision: beforeCorrection.body.revision
+    });
+    assert.equal(correction.response.status, 200);
+    assert.equal(correction.body.data.finals.A, null);
+    assert.deepEqual(correction.body.data.qr2Pools.A, []);
+    const removeScoreFixture = await api('/api/tournaments/score-test', { method: 'DELETE', headers: adminHeaders });
+    assert.equal(removeScoreFixture.response.status, 200);
+    const newTournament = (id, phase = 'setup', extra = {}) => api(`/api/tournaments/${id}`, {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
+      body: JSON.stringify({ tournamentId: id, phase, config: { name: id, pointsToWin: 21, deuceCap: 25 }, groups: [], ...extra })
+    });
+    const concurrentCreates = await Promise.all(['open-a', 'open-b'].map(id => newTournament(id)));
+    assert.deepEqual(concurrentCreates.map(result => result.response.status).sort(), [200, 409]);
+    const winnerId = concurrentCreates[0].response.status === 200 ? 'open-a' : 'open-b';
+    const loserId = winnerId === 'open-a' ? 'open-b' : 'open-a';
+    const duplicateId = await newTournament(winnerId);
+    assert.equal(duplicateId.response.status, 409);
+    const mismatchedId = await api('/api/tournaments/mismatched-id', {
+      method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
+      body: JSON.stringify({ tournamentId: 'other-id', phase: 'completed', config: { name: 'Mismatch' }, groups: [] })
+    });
+    assert.equal(mismatchedId.response.status, 400);
+    const winnerState = await api(`/api/tournaments/${winnerId}`);
+    const closedWinner = await api(`/api/tournaments/${winnerId}`, {
+      method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': winnerState.body.revision },
+      body: JSON.stringify({ ...winnerState.body.data, phase: 'completed', closedEarly: true })
+    });
+    assert.equal(closedWinner.response.status, 200);
+    assert.equal((await api(`/api/tournaments/${winnerId}`)).body.data.closedEarly, true);
+    assert.equal((await newTournament(loserId)).response.status, 200);
+    const archivedFinal = {
+      id: 'archived-final', format: 'single', t1: 'Roster Alice', t2: 'Roster Bob',
+      games: [{ s1: 21, s2: 15 }], completed: true, winner: 'Roster Alice'
+    };
+    assert.equal((await newTournament('archived-final-test', 'completed', { finals: { A: archivedFinal } })).response.status, 200);
+    const blockedScoreReopen = await api('/api/tournaments/archived-final-test/matches/archived-final/score', {
+      method: 'PATCH', headers: adminHeaders,
+      body: JSON.stringify({ listKey: 'final_A', expectedMatch: archivedFinal, games: [{ s1: null, s2: null }] })
+    });
+    assert.equal(blockedScoreReopen.response.status, 409);
+    assert.equal((await api('/api/tournaments/archived-final-test')).body.data.phase, 'completed');
+    for (const id of [winnerId, loserId, 'archived-final-test']) {
+      assert.equal((await api(`/api/tournaments/${id}`, { method: 'DELETE', headers: adminHeaders })).response.status, 200);
+    }
+    const reopenedAuthFixture = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': closedAuthFixture.body.revision },
+      body: JSON.stringify({ ...changedTournament.body.data, phase: 'setup' })
+    });
+    assert.equal(reopenedAuthFixture.response.status, 200);
 
     const rosterProfiles = await api('/api/players');
     assert.equal(rosterProfiles.response.status, 200);
@@ -378,6 +541,22 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       body: JSON.stringify({ config: { name: 'Player changed this' }, groups: [] })
     });
     assert.equal(tournamentWrite.response.status, 403);
+    const playerScoreWrite = await api('/api/tournaments/auth-test/matches/m1/score', {
+      method: 'PATCH',
+      headers: { ...adminHeaders, cookie: changedPasswordCookie },
+      body: JSON.stringify({ listKey: 'qr1', expectedMatch: {}, s1: 21, s2: 12 })
+    });
+    assert.equal(playerScoreWrite.response.status, 403);
+
+    const guestTournamentRead = await api('/api/tournaments/auth-test');
+    assert.equal(guestTournamentRead.response.status, 200);
+    assert.equal(guestTournamentRead.body.exists, true);
+    const guestTournamentWrite = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ config: { name: 'Guest changed this' }, groups: [] })
+    });
+    assert.equal(guestTournamentWrite.response.status, 401);
 
     const guestCheckIn = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
@@ -444,7 +623,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     completedTournamentState.body.data.phase = 'completed';
     const saveCompletedTournament = await api('/api/tournaments/auth-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': completedTournamentState.body.revision },
       body: JSON.stringify(completedTournamentState.body.data)
     });
     assert.equal(saveCompletedTournament.response.status, 200);
@@ -553,7 +732,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(playerDeleteOwnAccount.response.status, 403);
     const deleteFixture = await api('/api/tournaments/delete-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
       body: JSON.stringify({
         tournamentId: 'delete-test',
         phase: 'completed',
@@ -611,7 +790,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const profileDeleteFixture = await api('/api/tournaments/profile-delete-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
       body: JSON.stringify({
         tournamentId: 'profile-delete-test',
         phase: 'completed',
@@ -651,7 +830,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     const savedAliasMatch = await api('/api/tournaments/profile-delete-test', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-tournament-revision': tournamentWithAlias.body.revision },
       body: JSON.stringify(tournamentWithAlias.body.data)
     });
     assert.equal(savedAliasMatch.response.status, 200);

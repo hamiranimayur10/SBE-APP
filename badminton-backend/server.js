@@ -4,6 +4,7 @@ const cors = require('cors');
 const { createClient } = require('@libsql/client');
 const crypto = require('crypto');
 const { promisify } = require('util');
+const { isDeepStrictEqual } = require('util');
 
 const app = express();
 app.use(cors());
@@ -203,16 +204,6 @@ app.use(async (_req, res, next) => {
     res.status(500).json({ error: 'Database is unavailable' });
   }
 });
-
-function checkAdminKey(req, res, next) {
-  const requiredKey = process.env.ADMIN_SYNC_KEY;
-  if (!requiredKey) return next();
-  const provided = req.headers['x-sync-key'];
-  if (provided !== requiredKey) {
-    return res.status(401).json({ error: 'Invalid sync key' });
-  }
-  next();
-}
 
 function validAdminKey(req) {
   const requiredKey = process.env.ADMIN_SYNC_KEY;
@@ -1701,58 +1692,208 @@ app.post('/api/player-invites/:id/revoke', requireAdminKey, async (req, res) => 
   }
 });
 
+function tournamentRevision(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function isValidMatchScore(s1, s2, config) {
+  const win = config?.pointsToWin;
+  const cap = config?.deuceCap;
+  if (!Number.isInteger(s1) || !Number.isInteger(s2) || s1 < 0 || s2 < 0 ||
+      !Number.isInteger(win) || !Number.isInteger(cap) || s1 === s2) return false;
+  const hi = Math.max(s1, s2), lo = Math.min(s1, s2);
+  return hi >= win && hi <= cap &&
+    ((hi === win && hi - lo >= 2) || (hi > win && hi < cap && hi - lo === 2) ||
+      (hi === cap && hi - lo >= 1));
+}
+
+function laterScoreImpact(state, listKey) {
+  if (listKey === 'qr1') {
+    return Object.values(state.qr2Pools || {}).some(players => players.length > 0);
+  }
+  if (listKey.startsWith('qr2_')) {
+    const key = listKey.slice(4);
+    return Boolean((state.semis?.[key] || []).length || state.finals?.[key]);
+  }
+  if (listKey.startsWith('semi_')) return Boolean(state.finals?.[listKey.slice(5)]);
+  return false;
+}
+
+function clearLaterScoreImpact(state, listKey) {
+  if (listKey === 'qr1') {
+    state.qr2Pools = { A: [], B: [] };
+    state.qr2Matches = { A: [], B: [] };
+    state.semis = { A: [], B: [] };
+    state.finals = { A: null, B: null };
+    state.phase = 'qr1';
+  } else if (listKey.startsWith('qr2_')) {
+    const key = listKey.slice(4);
+    if (state.semis) delete state.semis[key];
+    if (state.finals) delete state.finals[key];
+    state.phase = 'qr2';
+  } else {
+    if (state.finals) delete state.finals[listKey.slice(5)];
+    state.phase = 'semis';
+  }
+}
+
+function findScoreMatch(state, listKey, matchId) {
+  let matches;
+  if (listKey === 'qr1') matches = state.qr1Matches;
+  else if (listKey.startsWith('qr2_')) matches = state.qr2Matches?.[listKey.slice(4)];
+  else if (listKey.startsWith('semi_')) matches = state.semis?.[listKey.slice(5)];
+  else if (listKey.startsWith('final_')) {
+    const key = listKey.slice(6);
+    const match = state.finals?.[key];
+    return match && String(match.id || key) === matchId ? match : null;
+  }
+  return Array.isArray(matches) ? matches.find(match => String(match.id) === matchId) : null;
+}
+
 // Get one tournament
 app.get('/api/tournaments/:id', async (req, res) => {
   try {
     const since = String(req.query.since || '');
     res.set('Cache-Control', 'no-store');
     const result = await getDb().execute({
-      sql: 'SELECT updated_at FROM tournaments WHERE id = ?',
+      sql: 'SELECT data, updated_at FROM tournaments WHERE id = ?',
       args: [req.params.id]
     });
     if (result.rows.length === 0) {
       return res.json({ exists: false, data: null });
     }
     const row = result.rows[0];
-    if (since && since === row.updated_at) {
-      return res.json({ exists: true, unchanged: true, updatedAt: row.updated_at });
+    const revision = tournamentRevision(row.data);
+    if ((req.query.revision && req.query.revision === revision) ||
+        (!req.query.revision && since && since === row.updated_at)) {
+      return res.json({ exists: true, unchanged: true, updatedAt: row.updated_at, revision });
     }
-    const dataResult = await getDb().execute({
-      sql: 'SELECT data FROM tournaments WHERE id = ?',
-      args: [req.params.id]
-    });
-    res.json({ exists: true, data: JSON.parse(dataResult.rows[0].data), updatedAt: row.updated_at });
+    res.json({ exists: true, data: JSON.parse(row.data), updatedAt: row.updated_at, revision });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+app.patch('/api/tournaments/:id/matches/:matchId/score', requireAdminKey, async (req, res) => {
+  try {
+    const { listKey, expectedMatch, s1, s2, games, confirmedRevision } = req.body || {};
+    if (typeof listKey !== 'string' || !expectedMatch || typeof expectedMatch !== 'object' || Array.isArray(expectedMatch)) {
+      return res.status(400).json({ error: 'Match and expected state are required' });
+    }
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const current = await getDb().execute({ sql: 'SELECT data, phase FROM tournaments WHERE id = ?', args: [req.params.id] });
+      if (!current.rows.length) return res.status(404).json({ error: 'Tournament not found' });
+      const original = current.rows[0].data;
+      const tournament = JSON.parse(original);
+      const match = findScoreMatch(tournament, listKey, req.params.matchId);
+      if (!match || !isDeepStrictEqual(match, expectedMatch)) {
+        return res.status(409).json({ error: 'Match changed; refresh and review the score' });
+      }
+      if (listKey.startsWith('final_')) {
+        if (!Array.isArray(games) || !Array.isArray(match.games) || games.length !== match.games.length ||
+            games.some(game => !game || !((game.s1 === null && game.s2 === null) ||
+              isValidMatchScore(game.s1, game.s2, tournament.config)))) {
+          return res.status(400).json({ error: 'Invalid final game scores' });
+        }
+        match.games = games.map(game => ({ s1: game.s1, s2: game.s2 }));
+        const wins1 = match.games.filter(game => game.s1 !== null && game.s1 > game.s2).length;
+        const wins2 = match.games.filter(game => game.s2 !== null && game.s2 > game.s1).length;
+        const needed = match.format === 'bo3' ? 2 : 1;
+        match.completed = wins1 >= needed || wins2 >= needed;
+        match.winner = match.completed ? (wins1 > wins2 ? match.t1 : match.t2) : null;
+        if (match.completed) match.completedAt = new Date().toISOString();
+        else {
+          delete match.completedAt;
+          if (tournament.phase === 'completed') tournament.phase = 'finals';
+        }
+      } else {
+        if (!isValidMatchScore(s1, s2, tournament.config)) return res.status(400).json({ error: 'Invalid match score' });
+        if (laterScoreImpact(tournament, listKey)) {
+          if (!confirmedRevision || confirmedRevision !== tournamentRevision(original)) {
+            return res.status(409).json({ error: 'Later schedules exist or changed; refresh and confirm the correction again' });
+          }
+          clearLaterScoreImpact(tournament, listKey);
+        }
+        Object.assign(match, { s1, s2, completed: true, completedAt: new Date().toISOString() });
+      }
+      if (current.rows[0].phase === 'completed' && tournament.phase !== 'completed') delete tournament.closedEarly;
+      const data = JSON.stringify(tournament);
+      const updatedAt = new Date().toISOString();
+      const result = await getDb().execute({
+        sql: `UPDATE tournaments SET data = ?, phase = ?, updated_at = ?
+              WHERE id = ? AND data = ?
+                AND (? = 'completed' OR COALESCE(phase, '') != 'completed'
+                     OR NOT EXISTS (SELECT 1 FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed'))`,
+        args: [data, tournament.phase || 'setup', updatedAt, req.params.id, original, tournament.phase || 'setup', req.params.id]
+      });
+      if (Number(result.rowsAffected)) {
+        return res.json({ ok: true, data: tournament, updatedAt, revision: tournamentRevision(data) });
+      }
+      if (current.rows[0].phase === 'completed' && tournament.phase !== 'completed') {
+        const open = await getDb().execute({
+          sql: "SELECT id FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed' LIMIT 1",
+          args: [req.params.id]
+        });
+        if (open.rows.length) return res.status(409).json({ error: 'Close or delete the open tournament before reopening this tournament' });
+      }
+    }
+    res.status(409).json({ error: 'Tournament is changing; retry the score' });
+  } catch (err) {
+    console.error('Match score save failed:', err);
+    res.status(500).json({ error: 'Match score could not be saved' });
+  }
+});
+
 // Upsert one tournament
-app.put('/api/tournaments/:id', denyPlayerWrite, checkAdminKey, async (req, res) => {
+app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
   try {
     const payload = req.body && req.body.data ? req.body.data : req.body;
     if (!payload || typeof payload !== 'object') {
       return res.status(400).json({ error: 'Invalid tournament state payload' });
     }
     const id = req.params.id;
+    if (payload.tournamentId !== undefined && String(payload.tournamentId) !== id) {
+      return res.status(400).json({ error: 'Tournament ID must match the request URL' });
+    }
+    payload.tournamentId = id;
+    const revision = req.get('x-tournament-revision');
+    if (!revision) return res.status(428).json({ error: 'Tournament revision is required; reload before saving' });
+    const existing = await getDb().execute({ sql: 'SELECT data, phase FROM tournaments WHERE id = ?', args: [id] });
+    const original = existing.rows[0]?.data;
+    if ((original && revision !== tournamentRevision(original)) || (!original && revision !== 'new')) {
+      return res.status(409).json({ error: 'Tournament changed; reload before saving' });
+    }
+    const phase = payload.phase || 'setup';
+    const opening = phase !== 'completed' && (!original || existing.rows[0].phase === 'completed');
+    if (opening) delete payload.closedEarly;
+    if (opening) {
+      const open = await getDb().execute({
+        sql: "SELECT id, name FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed' LIMIT 1",
+        args: [id]
+      });
+      if (open.rows.length) return res.status(409).json({ error: 'Close or delete the open tournament before creating or reopening another', openTournament: open.rows[0] });
+    }
     await ensurePlayerProfiles(getTournamentRosterNames(payload));
     const profilesResult = await getDb().execute('SELECT player_id, player_name, aliases FROM player_profiles');
     payload.playerProfileIds = getTournamentPlayerProfileIds(payload, profilesResult.rows);
     const cfg = payload.config || {};
     const now = new Date().toISOString();
-    await getDb().execute({
+    const data = JSON.stringify(payload);
+    const result = original ? await getDb().execute({
+      sql: `UPDATE tournaments SET name = ?, date = ?, venue = ?, phase = ?, data = ?, updated_at = ?
+            WHERE id = ? AND data = ?
+              AND (? = 'completed' OR COALESCE(phase, '') != 'completed'
+                   OR NOT EXISTS (SELECT 1 FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed'))`,
+      args: [cfg.name || 'Untitled Tournament', cfg.date || null, cfg.venue || null, phase, data, now, id, original, phase, id]
+    }) : await getDb().execute({
       sql: `INSERT INTO tournaments (id, name, date, venue, phase, data, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              name = excluded.name,
-              date = excluded.date,
-              venue = excluded.venue,
-              phase = excluded.phase,
-              data = excluded.data,
-              updated_at = excluded.updated_at`,
-      args: [id, cfg.name || 'Untitled Tournament', cfg.date || null, cfg.venue || null, payload.phase || 'setup', JSON.stringify(payload), now]
+            SELECT ?, ?, ?, ?, ?, ?, ?
+            WHERE ? = 'completed' OR NOT EXISTS (SELECT 1 FROM tournaments WHERE COALESCE(phase, '') != 'completed')
+            ON CONFLICT(id) DO NOTHING`,
+      args: [id, cfg.name || 'Untitled Tournament', cfg.date || null, cfg.venue || null, phase, data, now, phase]
     });
-    res.json({ ok: true, id, updatedAt: now, playerProfileIds: payload.playerProfileIds });
+    if (!Number(result.rowsAffected)) return res.status(409).json({ error: 'Tournament changed or another tournament is open; reload and close or delete it before saving' });
+    res.json({ ok: true, id, updatedAt: now, revision: tournamentRevision(data), playerProfileIds: payload.playerProfileIds });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1803,12 +1944,18 @@ async function persistTournamentCheckIn(tournamentId, playerName, groupName, ski
     });
   }
 
-  const existing = await getDb().execute({
-    sql: 'SELECT data FROM tournaments WHERE id = ?',
-    args: [tournamentId]
-  });
-  if (existing.rows.length > 0) {
-    const state = JSON.parse(existing.rows[0].data);
+  let saved = false;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const existing = await getDb().execute({
+      sql: 'SELECT data FROM tournaments WHERE id = ?',
+      args: [tournamentId]
+    });
+    if (!existing.rows.length) {
+      saved = true;
+      break;
+    }
+    const original = existing.rows[0].data;
+    const state = JSON.parse(original);
     if (!state.checkIns) state.checkIns = {};
     if (!state.playerSkills) state.playerSkills = {};
     if (checkedIn === false) {
@@ -1827,11 +1974,16 @@ async function persistTournamentCheckIn(tournamentId, playerName, groupName, ski
         state.groups[targetIdx].players.push(playerName);
       }
     }
-    await getDb().execute({
-      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
-      args: [JSON.stringify(state), new Date().toISOString(), tournamentId]
+    const result = await getDb().execute({
+      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ? AND data = ?',
+      args: [JSON.stringify(state), new Date().toISOString(), tournamentId, original]
     });
+    if (Number(result.rowsAffected)) {
+      saved = true;
+      break;
+    }
   }
+  if (!saved) throw new Error('Tournament changed repeatedly during check-in; please retry');
 
   if (checkedIn !== false) await ensurePlayerProfiles([playerName]);
   return { ok: true, tournamentId, playerName, checkedIn: checkedIn !== false, time: nowTime };

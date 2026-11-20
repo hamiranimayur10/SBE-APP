@@ -46,9 +46,10 @@
       function getPageUrl(page) {
         const url = new URL(PAGE_FILES[page] || PAGE_FILES.dashboard, window.location.href);
         const params = new URLSearchParams(window.location.search);
-        ['t', 'api', 'playerInvite'].forEach(key => {
+        ['api', 'playerInvite'].forEach(key => {
           if (params.has(key)) url.searchParams.set(key, params.get(key));
         });
+        if (state?.tournamentId) url.searchParams.set('t', state.tournamentId);
         if (page === 'players' && params.has('player')) url.searchParams.set('player', params.get('player'));
         return `${url.pathname}${url.search}`;
       }
@@ -62,7 +63,7 @@
         return PAGE_FILES[page] ? page : 'dashboard';
       }
 
-      function createPlayerId() {
+      function createUniqueId() {
         if (window.crypto?.randomUUID) return window.crypto.randomUUID();
         const bytes = new Uint8Array(16);
         window.crypto.getRandomValues(bytes);
@@ -195,13 +196,18 @@
       async function navigateToPage(page) {
         if (!PAGE_FILES[page] || page === getRequestedPage()) return;
         if (state.auth.role !== 'admin' && page === 'setup') return;
-        state.ui.activeTab = page;
-        saveRegistry();
-        if (state.auth.role === 'admin' && syncTimer && getSyncApiUrl()) {
+        if (state.auth.role === 'admin' && getSyncApiUrl() &&
+            (syncTimer || syncInFlight || state.sync.status === 'pending')) {
           clearTimeout(syncTimer);
           syncTimer = null;
-          await pushToTurso(true);
+          do {
+            if (!await pushToTurso(true)) return;
+            clearTimeout(syncTimer);
+            syncTimer = null;
+          } while (state.sync.status === 'pending');
         }
+        state.ui.activeTab = page;
+        saveRegistry();
         window.location.assign(getPageUrl(page));
       }
 
@@ -379,6 +385,9 @@
       }
 
       let syncTimer = null;
+      let syncInFlight = null;
+      let syncGeneration = 0;
+      let scoreSaveInProgress = false;
       let playerData = { loaded: false, loading: false, error: '', tournaments: [], profiles: [] };
       let playerDataPromise = null;
       let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
@@ -521,7 +530,7 @@
         const usedCodes = new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean));
         const savedProfile = {
           ...profile,
-          playerId: profile.playerId || createPlayerId(),
+          playerId: profile.playerId || createUniqueId(),
           playerCode: profile.playerCode || createPlayerCode(usedCodes)
         };
         const profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
@@ -546,7 +555,7 @@
           const localProfiles = storedProfiles.map(profile => {
             let playerId = String(profile.playerId || '').toLowerCase();
             if (!isValidPlayerId(playerId) || usedIds.has(playerId)) {
-              playerId = createPlayerId();
+              playerId = createUniqueId();
               changed = true;
             }
             if (playerId !== profile.playerId) changed = true;
@@ -568,8 +577,8 @@
             const cleanName = String(name || '').trim();
             const key = normalizeImportName(cleanName);
             if (!key || /^(TBD|Seed\s+\d+)$/i.test(cleanName) || isAnonymizedPlayerName(cleanName) || knownNames.has(key)) return;
-            let playerId = createPlayerId();
-            while (usedIds.has(playerId)) playerId = createPlayerId();
+            let playerId = createUniqueId();
+            while (usedIds.has(playerId)) playerId = createUniqueId();
             usedIds.add(playerId);
             const playerCode = createPlayerCode(usedCodes);
             usedCodes.add(playerCode);
@@ -692,7 +701,7 @@
       }
 
       function getLocalTournamentCatalog() {
-        return Object.values(registry.items || {}).map(tournament => ({
+        return Object.values(registry.items || {}).filter(tournament => !tournament.ui?.emptyTournament).map(tournament => ({
           id: String(tournament.tournamentId),
           name: tournament.config?.name || 'Tournament',
           date: tournament.config?.date || '',
@@ -754,12 +763,18 @@
         }
         try {
           let data = tournament.data;
+          let remoteRevision = null;
+          let remoteUpdatedAt = null;
           const apiUrl = getSyncApiUrl();
           if (apiUrl) {
             const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`);
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Tournament request failed (HTTP ${response.status})`);
-            if (result.exists && result.data) data = result.data;
+            if (result.exists && result.data) {
+              data = result.data;
+              remoteRevision = result.revision;
+              remoteUpdatedAt = result.updatedAt;
+            }
           }
           if (!data || !data.config) throw new Error('Tournament data is incomplete');
           const previous = registry.items[id];
@@ -769,11 +784,15 @@
             tournamentId: id,
             phase: data.phase || tournament.phase || 'setup',
             auth: { ...state.auth },
-            sync: { ...state.sync, ...(previous?.sync || {}) },
+            sync: {
+              ...state.sync, ...(previous?.sync || {}),
+              ...(remoteRevision ? { revision: remoteRevision, lastSynced: remoteUpdatedAt, status: 'synced' } : {})
+            },
             ui: { ...fresh.ui, activeTab: 'dashboard' }
           }, id);
           registry.items[id] = restored;
           state = restored;
+          window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
           saveRegistry();
           if (apiUrl) await pullFromTurso(true);
           state.ui.activeTab = 'dashboard';
@@ -788,7 +807,7 @@
         const existing = playerData.profiles.find(item => samePlayerIdentity(item, profile));
         let savedProfile = {
           ...profile,
-          playerId: profile.playerId || existing?.playerId || createPlayerId(),
+          playerId: profile.playerId || existing?.playerId || createUniqueId(),
           playerCode: profile.playerCode || existing?.playerCode || createPlayerCode(
             new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean))
           )
@@ -895,47 +914,73 @@
         }));
       }
 
-      async function pushToTurso(silent) {
+      async function pushToTurso(silent, localFallback = true) {
         const apiUrl = getSyncApiUrl();
-        if (!apiUrl) return;
+        if (!apiUrl) return true;
+        if (syncInFlight) {
+          await syncInFlight;
+          if (state.sync.status === 'error') return false;
+          if (state.sync.status === 'synced') return true;
+        }
+        const target = state;
+        const generation = syncGeneration;
+        const operation = (async () => {
         try {
           state.sync.status = 'syncing';
           const tid = encodeURIComponent(state.tournamentId || 'default');
           const payload = { ...state, auth: { ...state.auth, loggedIn: false }, ui: { ...state.ui, bracketOpen: false } };
           delete payload.sync;
+          if (!state.sync.revision) throw new Error('Reload the tournament before saving');
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, {
             method: 'PUT',
-            headers: getSyncHeaders(),
+            headers: { ...getSyncHeaders(), 'x-tournament-revision': state.sync.revision },
             body: JSON.stringify({ data: payload })
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          if (state !== target) return true;
           if (data.playerProfileIds && typeof data.playerProfileIds === 'object' && !Array.isArray(data.playerProfileIds)) {
-            state.playerProfileIds = data.playerProfileIds;
+            state.playerProfileIds = generation === syncGeneration ? data.playerProfileIds :
+              { ...data.playerProfileIds, ...state.playerProfileIds };
           }
-          state.sync.status = 'synced';
+          state.sync.revision = data.revision;
+          state.sync.status = generation === syncGeneration ? 'synced' : 'pending';
           state.sync.lastSynced = data.updatedAt || new Date().toISOString();
           saveRegistry();
           const badge = document.getElementById('sync-status-pill');
-          if (badge) badge.textContent = 'Cloud Synced';
+          if (badge) badge.textContent = state.sync.status === 'synced' ? 'Cloud Synced' : 'Sync Pending';
           if (!silent) showToast('Saved to Turso DB', 'success');
+          return true;
         } catch (err) {
-          state.sync.status = 'error';
+          target.sync.status = 'error';
+          saveRegistry();
           const badge = document.getElementById('sync-status-pill');
           if (badge) badge.textContent = 'Sync Error';
           console.error('Cloud sync failed:', err);
-          if (!silent) {
-            const message = /invalid sync key/i.test(err.message)
+          const message = /invalid (?:admin )?sync key/i.test(err.message)
               ? 'Admin sync key rejected. Enter the same ADMIN_SYNC_KEY configured in the backend Cloud Sync settings.'
-              : `Cloud sync failed (${err.message}) — saved locally`;
-            showToast(message, 'error');
-          }
+              : localFallback
+                ? `Cloud sync failed (${err.message}) — saved locally. Note your changes before using Cloud Sync → Pull from DB.`
+                : `Tournament was not created: ${err.message}`;
+          showToast(message, 'error');
+          return false;
         }
+        })();
+        syncInFlight = operation;
+        try { return await operation; } finally { syncInFlight = null; }
       }
 
       async function pullFromTurso(silent) {
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return;
+        if (silent && (scoreSaveInProgress || hasUnsavedScoreEntry() ||
+            ['pending', 'syncing', 'error'].includes(state.sync.status))) {
+          showToast('Local changes are not synced. Review Cloud Sync before reloading.', 'error');
+          return;
+        }
+        const target = state;
+        const generation = syncGeneration;
+        const startingRevision = state.sync.revision;
         try {
           // Also fetch tournament list from Turso so switcher shows all DB tournaments
           try {
@@ -948,7 +993,7 @@
                   registry.items[t.id].config.date = t.date || registry.items[t.id].config.date;
                   registry.items[t.id].config.venue = t.venue || registry.items[t.id].config.venue;
                   registry.items[t.id].phase = t.phase || 'setup';
-                  registry.items[t.id].sync = { ...state.sync };
+                  registry.items[t.id].sync = { ...state.sync, revision: null, lastSynced: null };
                 }
               });
             }
@@ -958,17 +1003,20 @@
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`);
           const json = await res.json();
           if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+          if (state !== target || syncGeneration !== generation || state.sync.revision !== startingRevision || scoreSaveInProgress ||
+              (silent && hasUnsavedScoreEntry())) return;
           if (json && json.exists && json.data) {
             const keepAuth = state.auth;
             const keepUi = state.ui;
             const keepSync = state.sync;
-            state = normalizeTournamentState({ ...json.data, tournamentId: state.tournamentId, auth: keepAuth, ui: keepUi, sync: { ...keepSync, status: 'synced', lastSynced: json.updatedAt || new Date().toISOString() } }, state.tournamentId);
+            state = normalizeTournamentState({ ...json.data, tournamentId: state.tournamentId, auth: keepAuth, ui: keepUi, sync: { ...keepSync, status: 'synced', revision: json.revision, lastSynced: json.updatedAt || new Date().toISOString() } }, state.tournamentId);
             upsertPlayerDataTournament(state.tournamentId, state, json.updatedAt);
             saveRegistry();
             render();
             if (!silent) showToast('Loaded tournament from Turso DB', 'success');
           } else {
             state.sync.status = 'synced';
+            state.sync.revision = 'new';
             saveRegistry();
             if (!silent) showToast('Connected to Turso DB (new tournament — push to save)', 'success');
           }
@@ -1006,7 +1054,7 @@
       }
 
       async function refreshLiveScores() {
-        if (liveScoreRefreshInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
+        if (liveScoreRefreshInProgress || scoreSaveInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
           state.sync?.status !== 'synced' || !state.sync.lastSynced) return;
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return;
@@ -1014,18 +1062,20 @@
         liveScoreRefreshInProgress = true;
         try {
           const tournamentId = String(state.tournamentId || 'default');
-          const since = state.sync.lastSynced || '';
-          const query = since ? `?since=${encodeURIComponent(since)}` : '';
+          const revision = state.sync.revision;
+          const query = revision ? `?revision=${encodeURIComponent(revision)}` : '';
           const response = await fetch(
             `${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}${query}`,
             { cache: 'no-store' }
           );
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Tournament refresh failed (HTTP ${response.status})`);
+          if (state.tournamentId !== tournamentId || state.sync.revision !== revision || scoreSaveInProgress ||
+              state.sync.status !== 'synced' || isEditingFormField() || hasUnsavedScoreEntry()) return;
           liveScoreRefreshErrorLogged = false;
           const badge = document.getElementById('sync-status-pill');
           if (badge) badge.textContent = 'Cloud Synced';
-          if (!result.exists || result.unchanged || !result.data || (since && result.updatedAt === since)) return;
+          if (!result.exists || result.unchanged || !result.data) return;
 
           const keepAuth = state.auth;
           const keepUi = state.ui;
@@ -1038,6 +1088,7 @@
             sync: {
               ...keepSync,
               status: 'synced',
+              revision: result.revision,
               lastSynced: result.updatedAt || new Date().toISOString()
             }
           }, tournamentId);
@@ -1062,6 +1113,11 @@
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return;
         try {
+          clearTimeout(syncTimer);
+          syncTimer = null;
+          if (!await pushToTurso(true)) return;
+          const target = state;
+          const generation = syncGeneration;
           const tid = encodeURIComponent(state.tournamentId || 'default');
           const response = await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
             method: 'POST',
@@ -1070,14 +1126,29 @@
           });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Check-in sync failed (HTTP ${response.status})`);
+          if (state === target && generation === syncGeneration && !scoreSaveInProgress) {
+            await pullFromTurso(true);
+          }
         } catch (err) {
           console.error('Check-in saved locally but server sync failed:', err);
           showToast(`Check-in saved locally, but server sync failed: ${err.message}`, 'error');
         }
       }
 
-      function switchTournament(id) {
+      async function switchTournament(id) {
         tournamentCatalog.loaded = false;
+        if (state.auth.role === 'admin' && getSyncApiUrl() &&
+            (syncTimer || syncInFlight || state.sync.status === 'pending')) {
+          do {
+            clearTimeout(syncTimer);
+            syncTimer = null;
+            if (!await pushToTurso(true)) {
+              const switcher = document.getElementById('tournament-switcher');
+              if (switcher) switcher.value = state.tournamentId;
+              return;
+            }
+          } while (state.sync.status === 'pending');
+        }
         saveRegistry();
         const next = registry.items[id];
         if (!next) return;
@@ -1086,6 +1157,7 @@
         state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey } }, id);
         state.ui.activeTab = getRequestedPage();
         if (state.auth.role === 'guest' && state.ui.activeTab === 'setup') state.ui.activeTab = 'dashboard';
+        window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
         saveRegistry();
         render();
         if (getSyncApiUrl()) {
@@ -1093,21 +1165,115 @@
         }
       }
 
+      async function getOpenTournaments() {
+        const apiUrl = getSyncApiUrl();
+        const local = getLocalTournamentCatalog();
+        if (!apiUrl) return local.filter(tournament => tournament.phase !== 'completed');
+        const response = await fetch(`${apiUrl}/api/tournaments`, { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        if (!Array.isArray(result.tournaments)) throw new Error('Invalid tournament list from backend');
+        const remote = new Map(result.tournaments.map(tournament => [String(tournament.id), tournament]));
+        const open = new Map([...remote.values()]
+          .filter(tournament => tournament.phase !== 'completed')
+          .map(tournament => [String(tournament.id), tournament]));
+        local.forEach(tournament => {
+          const localState = tournament.data;
+          if (tournament.phase !== 'completed' &&
+              ['pending', 'syncing', 'error'].includes(localState.sync?.status)) {
+            open.set(tournament.id, tournament);
+          }
+        });
+        return [...open.values()];
+      }
+
+      async function closeTournament(id) {
+        const local = registry.items[id];
+        const isCurrent = String(state.tournamentId) === String(id);
+        if (local && ['pending', 'syncing'].includes(local.sync?.status)) {
+          if (!isCurrent) throw new Error('Open this tournament and sync its local changes before closing it');
+          clearTimeout(syncTimer);
+          syncTimer = null;
+          if (!await pushToTurso(true)) throw new Error('Sync local changes before closing this tournament');
+          if (state.sync.status !== 'synced') throw new Error('Wait for local changes to sync before closing this tournament');
+        }
+        if (local?.sync?.status === 'error') throw new Error('Resolve the tournament sync error before closing it');
+        const apiUrl = getSyncApiUrl();
+        let data = local;
+        let sync = local?.sync || state.sync;
+        if (apiUrl) {
+          const url = `${apiUrl}/api/tournaments/${encodeURIComponent(id)}`;
+          const response = await fetch(url, { cache: 'no-store' });
+          const current = await response.json();
+          if (!response.ok) throw new Error(current.error || `HTTP ${response.status}`);
+          if (current.exists) {
+            data = { ...current.data, phase: 'completed', closedEarly: true };
+            const saved = await fetch(url, {
+              method: 'PUT',
+              headers: { ...getSyncHeaders(), 'x-tournament-revision': current.revision },
+              body: JSON.stringify({ data })
+            });
+            const result = await saved.json();
+            if (!saved.ok) throw new Error(result.error || `HTTP ${saved.status}`);
+            data.playerProfileIds = result.playerProfileIds;
+            sync = { ...sync, status: 'synced', revision: result.revision, lastSynced: result.updatedAt };
+          } else if (!data) {
+            throw new Error('Tournament no longer exists; refresh the list');
+          }
+        }
+        if (!data) throw new Error('Tournament no longer exists; refresh the list');
+        data = { ...data, phase: 'completed', closedEarly: true };
+        const fresh = createDefaultState(id, data.config?.name);
+        const closed = normalizeTournamentState({
+          ...data, tournamentId: id, auth: isCurrent ? state.auth : (local?.auth || state.auth),
+          ui: isCurrent ? state.ui : (local?.ui || fresh.ui), sync
+        }, id);
+        registry.items[id] = closed;
+        if (isCurrent) state = closed;
+        tournamentCatalog.loaded = false;
+        upsertPlayerDataTournament(id, closed, sync.lastSynced);
+        saveRegistry();
+        render();
+      }
+
       async function createNewTournament(name, date, venue) {
         tournamentCatalog.loaded = false;
+        if (getSyncApiUrl() && (syncTimer || syncInFlight || state.sync.status === 'pending')) {
+          do {
+            clearTimeout(syncTimer);
+            syncTimer = null;
+            if (!await pushToTurso(true)) return false;
+          } while (state.sync.status === 'pending');
+        }
         saveRegistry();
-        const id = 't_' + Date.now();
+        const previous = state;
+        const id = `t_${createUniqueId()}`;
         const fresh = createDefaultState(id, name || 'New Badminton Tournament');
         if (date) fresh.config.date = date;
         if (venue) fresh.config.venue = venue;
         fresh.auth = { ...state.auth };
-        fresh.sync = { ...state.sync };
+        fresh.sync = { ...state.sync, status: getSyncApiUrl() ? 'synced' : 'local' };
+        fresh.sync.revision = 'new';
+        fresh.sync.lastSynced = null;
         fresh.ui.activeTab = state.auth.role === 'admin' ? 'setup' : 'dashboard';
         registry.items[id] = fresh;
         state = fresh;
         saveRegistry();
-        if (getSyncApiUrl()) await pushToTurso(true);
+        if (getSyncApiUrl() && !await pushToTurso(true, false)) {
+          delete registry.items[id];
+          state = previous;
+          saveRegistry();
+          render();
+          return false;
+        }
+        if (previous.ui?.emptyTournament ||
+            (getSyncApiUrl() && previous.sync?.revision === 'new' && previous.sync?.status === 'synced')) {
+          delete registry.items[previous.tournamentId];
+        }
+        saveRegistry();
         await navigateToPage(state.ui.activeTab);
+        render();
+        return true;
       }
 
       async function deleteTournament(id) {
@@ -1121,10 +1287,13 @@
           throw new Error('Tournament is no longer available');
         }
         const remainingIds = [...availableIds].filter(candidate => candidate !== tournamentId);
-        if (!remainingIds.length) throw new Error('At least one tournament must remain');
-
         const wasActive = tournamentId === String(state.tournamentId);
         const apiUrl = getSyncApiUrl();
+        if (wasActive) {
+          clearTimeout(syncTimer);
+          syncTimer = null;
+          if (syncInFlight) await syncInFlight;
+        }
         if (apiUrl) {
           const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}`, {
             method: 'DELETE',
@@ -1148,25 +1317,30 @@
         );
 
         if (wasActive) {
-          const nextState = registry.items[nextId] || nextTournament?.data || createDefaultState(nextId, nextTournament?.name);
+          const nextState = nextId
+            ? registry.items[nextId] || nextTournament?.data || createDefaultState(nextId, nextTournament?.name)
+            : createDefaultState(`t_${createUniqueId()}`, 'New Tournament');
+          if (!nextId) nextState.ui.emptyTournament = true;
           const keepAuth = state.auth;
           const keepSync = state.sync;
           state = normalizeTournamentState({
             ...nextState,
-            tournamentId: nextId,
+            tournamentId: nextId || nextState.tournamentId,
             auth: keepAuth,
-            sync: { ...keepSync, ...(nextState.sync || {}) },
+            sync: nextId ? { ...keepSync, ...(nextState.sync || {}) } :
+              { ...keepSync, status: apiUrl ? 'synced' : 'local', revision: 'new', lastSynced: null },
             ui: { ...(nextState.ui || {}), activeTab: getRequestedPage() }
-          }, nextId);
-          registry.items[nextId] = state;
+          }, nextId || nextState.tournamentId);
+          registry.items[state.tournamentId] = state;
+          window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
         }
         saveRegistry();
         render();
-        if (wasActive && apiUrl) await pullFromTurso(true);
+        if (wasActive && apiUrl && nextId) await pullFromTurso(true);
         showToast('Tournament deleted', 'success');
       }
 
-      function confirmTournamentDeletion(id, name) {
+      function confirmTournamentDeletion(id, name, onDeleted) {
         openModal(`
           <div role="alertdialog" aria-modal="true" aria-labelledby="delete-tournament-title" class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
             <h3 id="delete-tournament-title" class="text-base font-bold">Delete tournament permanently?</h3>
@@ -1185,6 +1359,7 @@
           try {
             await deleteTournament(id);
             closeModal();
+            if (onDeleted) await onDeleted();
           } catch (err) {
             confirmButton.disabled = false;
             confirmButton.textContent = 'Permanently delete';
@@ -1194,6 +1369,8 @@
       }
 
       function saveState() {
+        delete state.ui.emptyTournament;
+        syncGeneration++;
         tournamentCatalog.loaded = false;
         const apiUrl = getSyncApiUrl();
         if (apiUrl) state.sync.status = 'pending';
@@ -1205,7 +1382,7 @@
         }
         if (apiUrl) {
           clearTimeout(syncTimer);
-          syncTimer = setTimeout(() => { pushToTurso(true); }, 600);
+          syncTimer = setTimeout(() => { syncTimer = null; pushToTurso(true); }, 600);
         }
       }
 
@@ -1454,7 +1631,7 @@
         if (pin === state.auth.pin) {
           state.auth.loggedIn = true;
           state.auth.role = 'admin';
-          saveState();
+          saveRegistry();
           render();
           showToast('Signed in as Admin', 'success');
         } else {
@@ -1468,7 +1645,7 @@
         if (state.ui.activeTab === 'setup') {
           state.ui.activeTab = state.phase === 'setup' ? 'dashboard' : state.phase;
         }
-        saveState();
+        saveRegistry();
         if (state.ui.activeTab !== getRequestedPage()) {
           window.location.replace(getPageUrl(state.ui.activeTab));
           return;
@@ -1476,9 +1653,14 @@
         render();
       }
 
-      function logout() {
+      async function logout() {
+        if (state.auth.role === 'admin' && syncTimer && getSyncApiUrl()) {
+          clearTimeout(syncTimer);
+          syncTimer = null;
+          if (!await pushToTurso(true)) return;
+        }
         state.auth.loggedIn = false;
-        saveState();
+        saveRegistry();
         render();
       }
 
@@ -1512,8 +1694,21 @@
         if (rerender !== false) render();
       }
 
-      function startTournament() {
+      async function startTournament() {
         if (state.auth.role !== 'admin') return;
+        if (state.phase === 'completed') {
+          const target = state;
+          try {
+            if ((await getOpenTournaments()).some(tournament => String(tournament.id) !== String(state.tournamentId))) {
+              showToast('Close or delete the open tournament before reopening this tournament', 'error');
+              return;
+            }
+          } catch (err) {
+            showToast(`Could not check open tournaments: ${err.message}`, 'error');
+            return;
+          }
+          if (state !== target) return;
+        }
         const round1Error = getRound1SetupError();
         if (round1Error) {
           showToast(round1Error, 'error');
@@ -1550,6 +1745,7 @@
         state.semis = { A: [], B: [] };
         state.finals = { A: null, B: null };
         state.phase = 'qr1';
+        delete state.closedEarly;
         state.ui.activeTab = 'qr1';
         state.ui.qr1GroupFilter = 'ALL';
         saveState();
@@ -1735,9 +1931,15 @@
           }
         }
         if (!reset) {
-          save();
+          save(null);
           return;
         }
+        if (!getSyncApiUrl() && state.phase === 'completed' && getLocalTournamentCatalog()
+          .some(tournament => tournament.id !== String(state.tournamentId) && tournament.phase !== 'completed')) {
+          showToast('Close or delete the open tournament before reopening this tournament', 'error');
+          return;
+        }
+        const confirmedRevision = state.sync.revision;
         openModal(`
           <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
             <h3 class="text-base font-bold">Change this score?</h3>
@@ -1756,10 +1958,108 @@
             showToast('The tournament changed; review the score and try again', 'error');
             return;
           }
-          reset();
+          if (!getSyncApiUrl()) {
+            reset();
+            delete state.closedEarly;
+          }
           closeModal();
-          save();
+          save(confirmedRevision);
         });
+      }
+
+      async function saveMatchScore(listKey, id, expectedMatch, score, confirmedRevision) {
+        if (state.sync.status !== 'synced' || !state.sync.revision || state.sync.revision === 'new') {
+          showToast('Sync or reload the tournament before saving a score', 'error');
+          return false;
+        }
+        if (scoreSaveInProgress) {
+          showToast('Wait for the current score to save', 'error');
+          return false;
+        }
+        const tournamentId = state.tournamentId;
+        const previousRevision = state.sync.revision;
+        let conflict = false;
+        scoreSaveInProgress = true;
+        const app = document.getElementById('app');
+        app.inert = true;
+        try {
+          const response = await fetch(`${getSyncApiUrl()}/api/tournaments/${encodeURIComponent(tournamentId)}/matches/${encodeURIComponent(id)}/score`, {
+            method: 'PATCH',
+            headers: getSyncHeaders(),
+            body: JSON.stringify({ listKey, expectedMatch, ...score, confirmedRevision })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            conflict = response.status === 409;
+            throw new Error(result.error || `HTTP ${response.status}`);
+          }
+          if (state.tournamentId !== tournamentId || state.sync.revision !== previousRevision || state.sync.status !== 'synced') {
+            throw new Error('Tournament changed locally; reload before making further changes');
+          }
+          const inputValues = new Map();
+          let staleDraft = false;
+          document.querySelectorAll('[data-score-input], [data-final-input]').forEach(input => {
+            const attr = input.hasAttribute('data-score-input') ? 'data-score-input' : 'data-final-input';
+            const key = input.getAttribute(attr);
+            if ((attr === 'data-score-input' && key.startsWith(`${listKey}:${id}:`)) ||
+                (attr === 'data-final-input' && listKey === `final_${key.split(':')[0]}`)) return;
+            const parts = key.split(':');
+            let before, after, expected;
+            if (attr === 'data-final-input') {
+              before = state.finals[parts[0]];
+              after = result.data.finals?.[parts[0]];
+              expected = before?.games?.[Number(parts[1])]?.[`s${parts[2]}`];
+            } else {
+              const find = (tournament) => {
+                const list = parts[0] === 'qr1' ? tournament.qr1Matches :
+                  parts[0].startsWith('qr2_') ? tournament.qr2Matches?.[parts[0].slice(4)] :
+                    tournament.semis?.[parts[0].slice(5)];
+                return list?.find(match => match.id === parts[1]);
+              };
+              before = find(state);
+              after = find(result.data);
+              expected = before?.[`s${parts[2]}`];
+            }
+            if (input.value !== (expected == null ? '' : String(expected))) {
+              inputValues.set(`${attr}|${key}`, input.value);
+              if (JSON.stringify(before) !== JSON.stringify(after)) staleDraft = true;
+            }
+          });
+          if (staleDraft) {
+            state.sync.status = 'error';
+            const badge = document.getElementById('sync-status-pill');
+            if (badge) badge.textContent = 'Sync Error';
+            showToast('Score saved, but another edited match changed remotely. Note unsaved scores, then use Cloud Sync → Pull from DB.', 'error');
+            return false;
+          }
+          const keepAuth = state.auth, keepUi = state.ui, keepSync = state.sync;
+          state = normalizeTournamentState({
+            ...result.data, tournamentId, auth: keepAuth, ui: keepUi,
+            sync: { ...keepSync, status: 'synced', revision: result.revision, lastSynced: result.updatedAt }
+          }, tournamentId);
+          tournamentCatalog.loaded = false;
+          upsertPlayerDataTournament(tournamentId, state, result.updatedAt);
+          saveRegistry();
+          render();
+          document.querySelectorAll('[data-score-input], [data-final-input]').forEach(input => {
+            const attr = input.hasAttribute('data-score-input') ? 'data-score-input' : 'data-final-input';
+            const key = `${attr}|${input.getAttribute(attr)}`;
+            if (inputValues.has(key)) input.value = inputValues.get(key);
+          });
+          return true;
+        } catch (err) {
+          console.error('Score save failed:', err);
+          if (conflict) {
+            state.sync.status = 'error';
+            const badge = document.getElementById('sync-status-pill');
+            if (badge) badge.textContent = 'Sync Error';
+          }
+          showToast(`Score save failed or could not be confirmed: ${err.message}`, 'error');
+          return false;
+        } finally {
+          app.inert = false;
+          scoreSaveInProgress = false;
+        }
       }
 
       // Compute overall KPIs
@@ -1879,6 +2179,12 @@
       // Renderers
       function render() {
         const app = document.getElementById('app');
+        const openStandings = new Set(
+          [...app.querySelectorAll('details[data-standings][open]')].map(details => details.dataset.standings)
+        );
+        const openMatches = new Set(
+          [...app.querySelectorAll('details[data-match][open]')].map(details => details.dataset.match)
+        );
         if (state.auth.role === 'player' && playerMustChangePassword) {
           app.innerHTML = renderRequiredPasswordChange();
           bindRequiredPasswordChange();
@@ -1903,6 +2209,12 @@
           </main>
           ${state.ui.bracketOpen ? renderBracketOverlay() : ''}
         `;
+        app.querySelectorAll('details[data-standings]').forEach(details => {
+          details.open = openStandings.has(details.dataset.standings);
+        });
+        app.querySelectorAll('details[data-match]').forEach(details => {
+          details.open = openMatches.has(details.dataset.match);
+        });
         if (state.auth.role === 'player') {
           applyPlayerReadOnlyControls();
           bindPlayerAppEvents();
@@ -2596,9 +2908,9 @@
                 <select id="tournament-switcher" aria-label="Switch current tournament" class="font-bold text-sm sm:text-base tracking-tight bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 rounded-lg px-2.5 py-1 max-w-[240px] sm:max-w-xs truncate">
                   ${Object.values(registry.items).map(t => `<option value="${esc(t.tournamentId)}" ${t.tournamentId === state.tournamentId ? 'selected' : ''}>${esc(t.config?.name || 'Tournament')}</option>`).join('')}
                 </select>
-                ${state.phase !== 'setup' && phaseLabels[state.phase] ? `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gold-500/15 text-gold-600 dark:text-gold-400 border border-gold-500/30">${phaseLabels[state.phase]}</span>` : ''}
+                ${state.phase !== 'setup' && phaseLabels[state.phase] ? `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gold-500/15 text-gold-600 dark:text-gold-400 border border-gold-500/30">${state.phase === 'completed' && state.closedEarly ? 'Closed' : phaseLabels[state.phase]}</span>` : ''}
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full ${isAdmin ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' : state.auth.role === 'player' ? 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border border-blue-500/30' : 'bg-stone-200 dark:bg-stone-800 text-stone-600 dark:text-stone-300'}">${roleLabel}</span>
-                ${state.auth.role === 'player' ? '' : `<button id="open-sync-modal-btn" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs border ${state.sync?.status === 'synced' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : state.sync?.status === 'error' ? 'border-red-500/30 bg-red-500/10 text-red-500' : 'border-stone-300 dark:border-stone-700 text-stone-500 dark:text-stone-400'}"><span class="w-1.5 h-1.5 rounded-full ${state.sync?.status === 'synced' ? 'bg-emerald-500' : state.sync?.status === 'error' ? 'bg-red-500' : 'bg-stone-400'}"></span><span id="sync-status-pill">${state.sync?.status === 'synced' ? 'Cloud Synced' : state.sync?.status === 'error' ? 'Sync Error' : 'Cloud Sync'}</span></button>`}
+                ${isAdmin ? `<button id="open-sync-modal-btn" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs border ${state.sync?.status === 'synced' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : state.sync?.status === 'error' ? 'border-red-500/30 bg-red-500/10 text-red-500' : 'border-stone-300 dark:border-stone-700 text-stone-500 dark:text-stone-400'}"><span class="w-1.5 h-1.5 rounded-full ${state.sync?.status === 'synced' ? 'bg-emerald-500' : state.sync?.status === 'error' ? 'bg-red-500' : 'bg-stone-400'}"></span><span id="sync-status-pill">${state.sync?.status === 'synced' ? 'Cloud Synced' : state.sync?.status === 'error' ? 'Sync Error' : 'Cloud Sync'}</span></button>` : ''}
                 <button id="logout-btn" class="text-xs text-stone-500 hover:text-stone-900 dark:hover:text-stone-100 underline underline-offset-2">Logout</button>
               </div>
 
@@ -3020,15 +3332,19 @@
         `;
       }
 
-      function renderStandingsTable(title, players, matches, highlightTopN, accentClass, wpFirst = false) {
+      function renderStandingsTable(title, players, matches, highlightTopN, accentClass, wpFirst = false, description = '') {
         const rows = computeStandings(players, matches, wpFirst);
         return `
-          <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
-            <div class="px-4 py-3 border-b border-stone-200 dark:border-stone-800 flex items-center justify-between">
-              <h3 class="font-bold text-sm ${accentClass || ''}">${esc(title)}</h3>
-              ${highlightTopN ? `<span class="text-[11px] text-stone-500 dark:text-stone-400">Top ${highlightTopN} advance</span>` : ''}
-            </div>
-            <div class="overflow-x-auto">
+          <details data-standings="${esc(title)}" class="group rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 overflow-hidden">
+            <summary class="px-4 py-3 flex items-center justify-between gap-3 cursor-pointer list-none">
+              <span class="font-bold text-sm ${accentClass || ''}">${esc(title)}</span>
+              <span class="flex items-center gap-2">
+                ${highlightTopN ? `<span class="text-[11px] text-stone-500 dark:text-stone-400">Top ${highlightTopN} advance</span>` : ''}
+                <span aria-hidden="true" class="text-stone-500 transition-transform group-open:rotate-180">▾</span>
+              </span>
+            </summary>
+            <div class="overflow-x-auto border-t border-stone-200 dark:border-stone-800">
+              ${description ? `<p class="px-4 pt-3 text-xs text-stone-500">${esc(description)}</p>` : ''}
               <table class="w-full text-xs sm:text-sm text-left">
                 <thead class="bg-cream-100/70 dark:bg-stone-800/60 text-stone-500 dark:text-stone-400 text-[11px] uppercase">
                   <tr>
@@ -3065,23 +3381,26 @@
                 </tbody>
               </table>
             </div>
-          </div>
+          </details>
         `;
       }
 
-      function renderMatchCard(m, listKey) {
+      function renderMatchCard(m, listKey, matchNumber) {
         const isAdmin = state.auth.role === 'admin';
         const p1Won = m.completed && m.s1 > m.s2;
         const p2Won = m.completed && m.s2 > m.s1;
         return `
-          <div class="rounded-xl bg-white dark:bg-[#191B1F] border ${m.completed ? 'border-emerald-500/30' : 'border-stone-200 dark:border-stone-800'} p-3.5 flex flex-col gap-2.5">
-            <div class="flex items-center justify-between text-[11px] text-stone-500 dark:text-stone-400">
-              <span class="font-mono">${esc(m.id)}</span>
+          <details data-match="${esc(JSON.stringify([listKey, m.id]))}" class="group rounded-xl bg-white dark:bg-[#191B1F] border ${m.completed ? 'border-emerald-500/30' : 'border-stone-200 dark:border-stone-800'}">
+            <summary class="p-3.5 flex items-center justify-between gap-2 cursor-pointer list-none text-[11px] text-stone-500 dark:text-stone-400">
+              <span class="font-bold text-sm text-stone-900 dark:text-stone-100">Match ${matchNumber}</span>
               <div class="flex items-center gap-1">
-                ${Number.isInteger(m.round) && Number.isInteger(m.court) ? `<span class="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-700 dark:text-sky-300 font-medium">Round ${m.round} · Court ${m.court}</span>` : ''}
+                ${Number.isInteger(m.round) && Number.isInteger(m.court) ? `<span class="px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-700 dark:text-sky-300 font-medium">Court ${m.court}</span>` : ''}
                 <span class="px-2 py-0.5 rounded-full font-medium ${m.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-stone-100 dark:bg-stone-800 text-stone-500'}">${m.completed ? 'Completed' : 'Pending'}</span>
+                <span aria-hidden="true" class="ml-1 transition-transform group-open:rotate-180">▾</span>
               </div>
-            </div>
+            </summary>
+            <div class="p-3.5 pt-0 space-y-2.5">
+            <div class="font-mono text-[11px] text-stone-500 dark:text-stone-400">${esc(m.id)}</div>
             <div class="flex items-center justify-between gap-2">
               <div class="flex-1 min-w-0">
                 <div class="text-sm font-semibold break-words ${p1Won ? 'text-emerald-600 dark:text-emerald-400' : ''}">${esc(m.p1 || m.t1)}</div>
@@ -3106,10 +3425,11 @@
               `}
             </div>
           </div>
+          </details>
         `;
       }
 
-      function renderScheduledMatchCards(matches, listKey, emptyMessage) {
+      function renderScheduledMatchCards(matches, listKey, groupName, emptyMessage) {
         if (!matches.length) return emptyMessage || '';
         const rounds = new Map();
         const unassigned = [];
@@ -3123,28 +3443,34 @@
           rounds.set(match.round, roundMatches);
         });
 
+        let matchNumber = 0;
         const scheduled = [...rounds.entries()]
           .sort((left, right) => left[0] - right[0])
-          .map(([round, roundMatches]) => `
+          .map(([, roundMatches]) => `
             <section class="space-y-2">
-              <div class="flex items-center justify-between text-[11px] font-semibold text-stone-500">
-                <span>Round ${round}</span>
-                <span>Parallel courts · no player overlap</span>
-              </div>
+              ${roundMatches.length > 1 ? '<div class="text-[11px] font-semibold text-stone-500">Parallel courts · no player overlap</div>' : ''}
               <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 ${[1, 2].map(court => {
                   const match = roundMatches.find(item => item.court === court);
                   return match
-                    ? renderMatchCard(match, listKey)
-                    : `<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 p-3.5 text-xs text-stone-400">Court ${court} · no compatible match this round</div>`;
+                    ? renderMatchCard(match, listKey, ++matchNumber)
+                    : `<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 p-3.5 text-xs text-stone-400">Court ${court} · no compatible match in this slot</div>`;
                 }).join('')}
               </div>
             </section>
           `).join('');
         const legacy = unassigned.length
-          ? `<section class="space-y-2"><p class="text-[11px] text-stone-500">Saved matches without court assignments; regenerate this schedule to create parallel court rounds.</p><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${unassigned.map(match => renderMatchCard(match, listKey)).join('')}</div></section>`
+          ? `<section class="space-y-2"><p class="text-[11px] text-stone-500">Saved matches without court assignments; regenerate this schedule to create parallel court slots.</p><div class="grid grid-cols-1 md:grid-cols-2 gap-3">${unassigned.map(match => renderMatchCard(match, listKey, ++matchNumber)).join('')}</div></section>`
           : '';
-        return scheduled + legacy;
+        return `
+          <section data-match-group="${esc(groupName)}" class="space-y-3" aria-label="${esc(groupName)} matches">
+            <div class="flex items-center justify-between gap-3">
+              <h3 class="text-sm font-bold">${esc(groupName)} Matches</h3>
+              <button type="button" data-match-toggle-all class="min-h-11 px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold hover:bg-cream-100 dark:hover:bg-stone-800">Expand all matches</button>
+            </div>
+            ${scheduled}${legacy}
+          </section>
+        `;
       }
 
       function renderQR1View() {
@@ -3177,8 +3503,7 @@
             </div>
 
             <section class="space-y-2" aria-label="Overall Round 1 standings">
-              <p class="text-xs text-stone-500">All Round 1 groups combined, ranked by WP first. Round 2 assignment uses the configured ranking order.</p>
-              ${renderStandingsTable('Overall Round 1 Standings', state.groups.flatMap(group => group.players), state.qr1Matches, 0, 'text-gold-600 dark:text-gold-400', true)}
+              ${renderStandingsTable('Overall Round 1 Standings', state.groups.flatMap(group => group.players), state.qr1Matches, 0, 'text-gold-600 dark:text-gold-400', true, 'All Round 1 groups combined, ranked by WP first. Round 2 assignment uses the configured ranking order.')}
             </section>
 
             ${visibleGroups.map(g => {
@@ -3186,7 +3511,7 @@
               return `
                 <div class="space-y-3">
                 ${renderStandingsTable(`${g.name} Standings`, g.players, gMatches, 0, 'text-gold-600 dark:text-gold-400')}
-                  ${renderScheduledMatchCards(gMatches, 'qr1')}
+                  ${renderScheduledMatchCards(gMatches, 'qr1', g.name)}
                 </div>
               `;
             }).join('')}
@@ -3250,7 +3575,7 @@
                       `}
                   </section>
                   ${renderStandingsTable(`Round 2 Group ${k} Standings (Top 8 → Group ${k} Semi-Finals)`, players, matches, 8, getPoolAccent(k))}
-                  ${renderScheduledMatchCards(matches, `qr2_${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${k} (needs at least 4 players).</div>`)}
+                  ${renderScheduledMatchCards(matches, `qr2_${k}`, `Group ${k}`, `<div class="text-xs text-stone-500 italic">No matches generated yet for Group ${esc(k)} (needs at least 4 players).</div>`)}
                 </div>
               `;
             }).join('')}
@@ -3286,7 +3611,7 @@
               ${poolKeys.map(k => `
                 <div class="space-y-3">
                   <h2 class="text-sm font-bold ${getPoolAccent(k)} uppercase tracking-wider">Group ${k} Semi-Finals</h2>
-                  ${renderScheduledMatchCards(state.semis[k], `semi_${k}`)}
+                  ${renderScheduledMatchCards(state.semis[k], `semi_${k}`, `Group ${k}`)}
                 </div>
               `).join('')}
             </div>
@@ -3304,15 +3629,18 @@
         const renderFinalCard = (f, poolKey, accent) => {
           if (!f) return '';
           return `
-            <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-5 space-y-4">
-              <div class="flex items-center justify-between">
-                <div>
-                  <h3 class="font-bold text-base ${accent}">Group ${poolKey} Final</h3>
-                  <p class="text-xs text-stone-500 dark:text-stone-400">${f.format === 'bo3' ? 'Best of 3 Games' : 'Single Game'}</p>
-                </div>
-                ${f.completed ? `<span class="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-bold">Champion: ${esc(f.winner)}</span>` : ''}
-              </div>
-
+            <details data-match="${esc(JSON.stringify(['final', poolKey]))}" class="group rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800">
+              <summary class="p-5 flex items-center justify-between gap-3 cursor-pointer list-none">
+                <span>
+                  <span class="block font-bold text-base ${accent}">Group ${esc(poolKey)} Final</span>
+                  <span class="block text-xs text-stone-500 dark:text-stone-400">${f.format === 'bo3' ? 'Best of 3 Games' : 'Single Game'}</span>
+                </span>
+                <span class="flex items-center gap-2">
+                  ${f.completed ? `<span class="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-bold">Champion: ${esc(f.winner)}</span>` : ''}
+                  <span aria-hidden="true" class="text-stone-500 transition-transform group-open:rotate-180">▾</span>
+                </span>
+              </summary>
+              <div class="px-5 pb-5 space-y-4">
               <div class="p-3 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 flex items-center justify-between text-sm font-semibold">
                 <span class="${f.winner === f.t1 ? 'text-emerald-500' : ''}">${esc(f.t1)}</span>
                 <span class="text-xs text-stone-400 px-2">VS</span>
@@ -3337,7 +3665,8 @@
               </div>
 
               ${isAdmin ? `<button data-save-final="${poolKey}" class="w-full py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 font-bold text-xs transition">Save Group ${poolKey} Final</button>` : ''}
-            </div>
+              </div>
+            </details>
           `;
         };
 
@@ -3350,7 +3679,7 @@
                 <button id="complete-tournament-btn" type="button" ${readyToComplete ? '' : 'disabled'} class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed">Mark Tournament Done</button>
               </div>
             ` : ''}
-            ${state.phase === 'completed' ? '<p class="text-sm font-semibold text-emerald-600 dark:text-emerald-400">Tournament marked done. Find it under Past Tournaments.</p>' : ''}
+            ${state.phase === 'completed' ? `<p class="text-sm font-semibold text-emerald-600 dark:text-emerald-400">Tournament ${state.closedEarly ? 'closed' : 'marked done'}. Find it under Past Tournaments.</p>` : ''}
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
               ${finalKeys.map(k => renderFinalCard(state.finals[k], k, getPoolAccent(k))).join('')}
             </div>
@@ -3400,7 +3729,7 @@
                 <h1 class="mt-1 text-xl sm:text-2xl font-extrabold">${esc(c.name || 'Tournament')}</h1>
                 <p class="mt-1 text-xs text-stone-500 dark:text-stone-400">${[c.date, c.venue].filter(Boolean).map(esc).join(' · ') || 'Date and venue not set'}</p>
               </div>
-              <span class="self-start sm:self-auto px-3 py-1 rounded-full text-xs font-semibold ${state.phase === 'completed' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-gold-500/15 text-gold-600 dark:text-gold-400'}">${esc(phaseLabels[state.phase] || state.phase)}</span>
+              <span class="self-start sm:self-auto px-3 py-1 rounded-full text-xs font-semibold ${state.phase === 'completed' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-gold-500/15 text-gold-600 dark:text-gold-400'}">${esc(state.phase === 'completed' && state.closedEarly ? 'Closed' : phaseLabels[state.phase] || state.phase)}</span>
             </div>
 
             <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -3429,22 +3758,22 @@
                   <span class="text-xs text-stone-500 tabular-nums">${s.done} of ${s.total} matches recorded</span>
                 </div>
                 <div class="divide-y divide-stone-100 dark:divide-stone-800 text-sm">
-                  <div class="py-3 flex items-center justify-between">
+                  <a href="${esc(getPageUrl('qr1'))}" data-tab="qr1" class="py-3 flex items-center justify-between gap-3 rounded hover:bg-cream-100 dark:hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-gold-500">
                     <div><div class="font-semibold">Qualifier Round 1</div><div class="text-xs text-stone-500">${state.groups.length} groups · ${s.totalPlayers} rostered · ${c.playersPerGroup} target/group</div></div>
-                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr1Done}/${s.qr1Total}</span>${roundStatus(s.qr1Done, s.qr1Total, 'qr1')}</div>
-                  </div>
-                  <div class="py-3 flex items-center justify-between">
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr1Done}/${s.qr1Total}</span>${roundStatus(s.qr1Done, s.qr1Total, 'qr1')}<span aria-hidden="true" class="text-stone-400">→</span></div>
+                  </a>
+                  <a href="${esc(getPageUrl('qr2'))}" data-tab="qr2" class="py-3 flex items-center justify-between gap-3 rounded hover:bg-cream-100 dark:hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-gold-500">
                     <div><div class="font-semibold">Qualifier Round 2</div><div class="text-xs text-stone-500">${round2Summary}</div></div>
-                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr2Done}/${s.qr2Total}</span>${roundStatus(s.qr2Done, s.qr2Total, 'qr2')}</div>
-                  </div>
-                  <div class="py-3 flex items-center justify-between">
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.qr2Done}/${s.qr2Total}</span>${roundStatus(s.qr2Done, s.qr2Total, 'qr2')}<span aria-hidden="true" class="text-stone-400">→</span></div>
+                  </a>
+                  <a href="${esc(getPageUrl('semis'))}" data-tab="semis" class="py-3 flex items-center justify-between gap-3 rounded hover:bg-cream-100 dark:hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-gold-500">
                     <div><div class="font-semibold">Semi-Finals</div><div class="text-xs text-stone-500">${semifinalSummary}</div></div>
-                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.semiDone}/${s.semiTotal}</span>${roundStatus(s.semiDone, s.semiTotal, 'semis')}</div>
-                  </div>
-                  <div class="py-3 flex items-center justify-between">
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.semiDone}/${s.semiTotal}</span>${roundStatus(s.semiDone, s.semiTotal, 'semis')}<span aria-hidden="true" class="text-stone-400">→</span></div>
+                  </a>
+                  <a href="${esc(getPageUrl('finals'))}" data-tab="finals" class="py-3 flex items-center justify-between gap-3 rounded hover:bg-cream-100 dark:hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-gold-500">
                     <div><div class="font-semibold">Finals</div><div class="text-xs text-stone-500">${finalsSummary}</div></div>
-                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.finalDone}/${s.finalTotal}</span>${roundStatus(s.finalDone, s.finalTotal, 'finals')}</div>
-                  </div>
+                    <div class="flex items-center gap-3"><span class="text-xs tabular-nums text-stone-500">${s.finalDone}/${s.finalTotal}</span>${roundStatus(s.finalDone, s.finalTotal, 'finals')}<span aria-hidden="true" class="text-stone-400">→</span></div>
+                  </a>
                 </div>
               </div>
 
@@ -3483,14 +3812,9 @@
       }
 
       function renderTournamentCatalogView() {
-        const now = new Date();
-        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
         const isPast = tournament => {
           const phase = tournament.phase || tournament.data?.phase || 'setup';
-          const date = tournament.date || tournament.data?.config?.date || '';
-          if (phase === 'completed') return true;
-          if (String(tournament.id) === String(state.tournamentId)) return false;
-          return Boolean(date && date < today);
+          return phase === 'completed';
         };
         const currentTournaments = tournamentCatalog.items.filter(tournament => !isPast(tournament));
         const pastTournaments = tournamentCatalog.items.filter(isPast)
@@ -3529,14 +3853,15 @@
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
                     <h3 class="font-bold text-base truncate">${esc(tournamentName)}</h3>
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phaseLabels[phase] || phase)}</span>
-                    ${selected ? '<span class="text-[10px] font-semibold text-gold-700 dark:text-gold-300">Currently open</span>' : ''}
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phase === 'completed' && data.closedEarly ? 'Closed' : phaseLabels[phase] || phase)}</span>
+                    ${selected ? '<span class="text-[10px] font-semibold text-gold-700 dark:text-gold-300">Selected</span>' : ''}
                   </div>
                   <p class="text-xs text-stone-500 mt-1">${esc(dateLabel)}${(tournament.venue || config.venue) ? ` · ${esc(tournament.venue || config.venue)}` : ''}</p>
+                  <p class="text-xs text-stone-500 mt-1">Tournament ID: ${esc(tournament.id)}</p>
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <button type="button" data-open-tournament="${esc(tournament.id)}" class="shrink-0 px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">${selected ? 'Open tournament' : 'View tournament'}</button>
-                  ${state.auth.role === 'admin' && tournamentCatalog.items.length > 1
+                  ${state.auth.role === 'admin'
                     ? `<button type="button" data-delete-tournament="${esc(tournament.id)}" data-tournament-name="${esc(tournamentName)}" aria-label="Delete ${esc(tournamentName)}" class="shrink-0 px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-red-600 dark:text-red-400 text-xs font-semibold hover:bg-red-50 dark:hover:bg-red-950/30">Delete</button>`
                     : ''}
                 </div>
@@ -3575,9 +3900,6 @@
             </div>
             ${tournamentCatalog.error ? `<p role="status" class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">${esc(tournamentCatalog.error)} Showing tournaments saved in this browser.</p>` : ''}
             ${tournamentCatalog.loading ? '<p class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">Loading tournament history…</p>' : ''}
-            ${state.auth.role === 'admin' && tournamentCatalog.loaded && tournamentCatalog.items.length === 1
-              ? '<p role="status" class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">At least one tournament must remain. Create another tournament to enable deleting this one.</p>'
-              : ''}
             ${tournamentCatalog.loaded && !tournamentCatalog.items.length ? renderEmptyState('No tournaments yet', 'Create a tournament or connect to a database to see saved events here.') : ''}
             ${section('Current & Upcoming', currentTournaments, 'No current or upcoming tournaments. Completed events are listed below.')}
             ${section('Past Tournaments', pastTournaments, 'Completed and previous events will appear here.')}
@@ -3807,7 +4129,7 @@
           const usedCodes = new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean));
           const profile = {
             name,
-            playerId: current.playerId || createPlayerId(),
+            playerId: current.playerId || createUniqueId(),
             playerCode: current.playerCode || createPlayerCode(usedCodes),
             photoUrl,
             age: ageInput ? Number(ageInput) : null,
@@ -4683,9 +5005,37 @@
         });
       }
 
+      function bindMatchViewEvents() {
+        document.querySelectorAll('[data-qr1-filter]').forEach(button => {
+          button.addEventListener('click', () => {
+            state.ui.qr1GroupFilter = button.getAttribute('data-qr1-filter');
+            render();
+          });
+        });
+        document.querySelectorAll('[data-match-group]').forEach(group => {
+          const button = group.querySelector('[data-match-toggle-all]');
+          const matches = [...group.querySelectorAll('details[data-match]')];
+          const updateButton = () => {
+            const allOpen = matches.length > 0 && matches.every(match => match.open);
+            const action = allOpen ? 'Collapse' : 'Expand';
+            button.textContent = `${action} all matches`;
+            button.setAttribute('aria-label', `${action} all matches in ${group.dataset.matchGroup}`);
+            button.disabled = matches.length === 0;
+          };
+          button.addEventListener('click', () => {
+            const open = !matches.every(match => match.open);
+            matches.forEach(match => { match.open = open; });
+            updateButton();
+          });
+          matches.forEach(match => match.addEventListener('toggle', updateButton));
+          updateButton();
+        });
+      }
+
       function applyPlayerReadOnlyControls() {
         const safeSelectors = [
           '[data-tab]', '[data-player-select]', '#open-bracket-btn', '#player-refresh-btn',
+          '[data-qr1-filter]', '[data-match-toggle-all]',
           '#player-directory-search', '#head-to-head-opponent', '#player-share-btn',
           '#player-edit-own-profile-btn', '#player-change-password-btn', '#player-delete-own-account-btn',
           '#player-self-checkin-btn', '#player-profile-shortcut', '[data-open-tournament]',
@@ -4702,6 +5052,7 @@
         bindThemeButtons();
         bindSetupWizardEvents();
         bindPageLinks();
+        bindMatchViewEvents();
         document.getElementById('logout-btn')?.addEventListener('click', async () => {
           try {
             await requestPlayerApi('/api/player-auth/logout', { method: 'POST' });
@@ -5247,7 +5598,7 @@
         const savedProfile = current ? {
           ...current,
           name: current.name,
-          playerId: current.playerId || incoming.playerId || createPlayerId(),
+          playerId: current.playerId || incoming.playerId || createUniqueId(),
           playerCode: current.playerCode || incoming.playerCode,
           photoUrl: current.photoUrl || incoming.photoUrl,
           age: current.age ?? incoming.age,
@@ -5266,7 +5617,7 @@
         } : {
           ...incoming,
           name: entry.canonicalName,
-          playerId: incoming.playerId || createPlayerId(),
+          playerId: incoming.playerId || createUniqueId(),
           playerCode: incoming.playerCode || createPlayerCode(
             new Set(playerData.profiles.map(item => String(item.playerCode || '')).filter(Boolean))
           ),
@@ -5339,7 +5690,7 @@
           if (apiUrl) {
             clearTimeout(syncTimer);
             syncTimer = null;
-            await pushToTurso(false);
+            if (!await pushToTurso(false)) throw new Error('Tournament changes were not synced');
             await loadPlayerData(true);
           }
           wizard.closed = true;
@@ -5623,11 +5974,120 @@
         });
       }
 
+      async function promptNewTournament() {
+        let open;
+        try {
+          open = await getOpenTournaments();
+        } catch (err) {
+          showToast(`Could not check open tournaments: ${err.message}`, 'error');
+          return;
+        }
+        open.forEach(tournament => {
+          if (!tournamentCatalog.items.some(item => String(item.id) === String(tournament.id))) {
+            tournamentCatalog.items.push(tournament);
+          }
+        });
+        if (open.length) {
+          openModal(`
+            <div role="dialog" aria-modal="true" aria-labelledby="open-tournament-title" class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+              <h3 id="open-tournament-title" class="text-base font-bold">Close or delete open tournaments first</h3>
+              <p class="text-sm text-stone-500">Only one tournament can be open at a time. Closing keeps its results; deleting permanently removes them.</p>
+              <div class="space-y-3">${open.map((tournament, index) => `
+                <div class="rounded-lg border border-stone-200 dark:border-stone-700 p-3 space-y-2">
+                  <div class="font-semibold text-sm">${esc(tournament.name || 'Tournament')}</div>
+                  <div class="text-xs text-stone-500">ID: ${esc(tournament.id)}</div>
+                  <div class="flex gap-2">
+                    <button type="button" data-close-open="${index}" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Close tournament</button>
+                    <button type="button" data-delete-open="${index}" class="px-3 py-2 rounded-lg border border-red-300 text-red-600 text-xs font-bold">Delete tournament</button>
+                  </div>
+                </div>`).join('')}</div>
+              <div class="flex justify-end"><button id="open-tournament-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-sm">Cancel</button></div>
+            </div>
+          `);
+          document.getElementById('open-tournament-cancel').addEventListener('click', closeModal);
+          document.querySelectorAll('[data-close-open]').forEach(button => button.addEventListener('click', () => {
+            const tournament = open[Number(button.getAttribute('data-close-open'))];
+            openModal(`
+              <div role="alertdialog" aria-modal="true" aria-labelledby="close-tournament-title" class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+                <h3 id="close-tournament-title" class="text-base font-bold">Close tournament?</h3>
+                <p class="text-sm text-stone-500">Close "${esc(tournament.name || 'Tournament')}" even if matches are incomplete? Its scores and history will be kept in Past Tournaments.</p>
+                <div class="flex justify-end gap-2">
+                  <button id="close-tournament-cancel" type="button" class="px-3 py-2 rounded-lg border border-stone-300 text-sm">Cancel</button>
+                  <button id="close-tournament-confirm" type="button" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-sm font-bold">Close tournament</button>
+                </div>
+              </div>
+            `);
+            document.getElementById('close-tournament-cancel').addEventListener('click', promptNewTournament);
+            document.getElementById('close-tournament-confirm').addEventListener('click', async event => {
+              event.currentTarget.disabled = true;
+              try {
+                await closeTournament(String(tournament.id));
+                showToast('Tournament closed; results were preserved', 'success');
+                await promptNewTournament();
+              } catch (err) {
+                event.currentTarget.disabled = false;
+                showToast(`Could not close tournament: ${err.message}`, 'error');
+              }
+            });
+          }));
+          document.querySelectorAll('[data-delete-open]').forEach(button => button.addEventListener('click', () => {
+            const tournament = open[Number(button.getAttribute('data-delete-open'))];
+            confirmTournamentDeletion(String(tournament.id), tournament.name || 'Tournament', promptNewTournament);
+          }));
+          return;
+        }
+        openModal(`
+          <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <h3 class="text-base font-bold">Create New Tournament</h3>
+            <div class="space-y-3 text-xs">
+              <div>
+                <label class="block font-semibold text-stone-500 mb-1">Tournament Name</label>
+                <input id="new-t-name" type="text" placeholder="Spring Open Badminton Tournament" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div><label class="block font-semibold text-stone-500 mb-1">Date</label><input id="new-t-date" type="date" value="${esc(state.config.date)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" /></div>
+                <div><label class="block font-semibold text-stone-500 mb-1">Venue</label><input id="new-t-venue" type="text" value="${esc(state.config.venue)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" /></div>
+              </div>
+            </div>
+            <div class="flex justify-end gap-2 pt-1">
+              <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="new-t-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('modal-cancel').addEventListener('click', closeModal);
+        document.getElementById('new-t-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          const name = document.getElementById('new-t-name').value.trim() || 'New Badminton Tournament';
+          const date = document.getElementById('new-t-date').value;
+          const venue = document.getElementById('new-t-venue').value.trim();
+          try {
+            if ((await getOpenTournaments()).length) {
+              await promptNewTournament();
+              return;
+            }
+            if (await createNewTournament(name, date, venue)) {
+              closeModal();
+              showToast(`Created "${name}"`, 'success');
+            } else if ((await getOpenTournaments()).length) {
+              await promptNewTournament();
+            } else {
+              button.disabled = false;
+            }
+          } catch (err) {
+            button.disabled = false;
+            showToast(`Could not create tournament: ${err.message}`, 'error');
+          }
+        });
+      }
+
       function bindAppEvents() {
         bindThemeButtons();
         bindSetupWizardEvents();
         bindPlayerDragAndDrop();
         bindPageLinks();
+        bindMatchViewEvents();
         document.getElementById('logout-btn')?.addEventListener('click', logout);
         document.getElementById('tournament-switcher')?.addEventListener('change', (e) => {
           switchTournament(e.target.value);
@@ -5635,47 +6095,18 @@
         document.querySelectorAll('[data-open-tournament]').forEach(button => {
           button.addEventListener('click', () => openTournamentFromCatalog(button.getAttribute('data-open-tournament')));
         });
+        document.querySelectorAll('[data-delete-tournament]').forEach(button => {
+          button.addEventListener('click', () => confirmTournamentDeletion(
+            button.getAttribute('data-delete-tournament'),
+            button.getAttribute('data-tournament-name') || 'Tournament'
+          ));
+        });
         document.getElementById('tournament-history-refresh')?.addEventListener('click', async event => {
           event.currentTarget.disabled = true;
           await loadTournamentCatalog(true);
           render();
         });
-        document.getElementById('new-tournament-btn')?.addEventListener('click', () => {
-          openModal(`
-            <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
-              <h3 class="text-base font-bold">Create New Tournament</h3>
-              <div class="space-y-3 text-xs">
-                <div>
-                  <label class="block font-semibold text-stone-500 mb-1">Tournament Name</label>
-                  <input id="new-t-name" type="text" placeholder="Spring Open Badminton Tournament" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm" />
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                  <div>
-                    <label class="block font-semibold text-stone-500 mb-1">Date</label>
-                    <input id="new-t-date" type="date" value="${esc(state.config.date)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
-                  </div>
-                  <div>
-                    <label class="block font-semibold text-stone-500 mb-1">Venue</label>
-                    <input id="new-t-venue" type="text" value="${esc(state.config.venue)}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
-                  </div>
-                </div>
-              </div>
-              <div class="flex justify-end gap-2 pt-1">
-                <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
-                <button id="new-t-confirm" class="px-4 py-1.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Create</button>
-              </div>
-            </div>
-          `);
-          document.getElementById('modal-cancel').addEventListener('click', closeModal);
-          document.getElementById('new-t-confirm').addEventListener('click', () => {
-            const name = document.getElementById('new-t-name').value.trim() || 'New Badminton Tournament';
-            const date = document.getElementById('new-t-date').value;
-            const venue = document.getElementById('new-t-venue').value.trim();
-            closeModal();
-            createNewTournament(name, date, venue);
-            showToast(`Created "${name}"`, 'success');
-          });
-        });
+        document.getElementById('new-tournament-btn')?.addEventListener('click', promptNewTournament);
         document.getElementById('open-sync-modal-btn')?.addEventListener('click', () => {
           openModal(`
             <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
@@ -5868,12 +6299,12 @@
             if (!state.checkIns) state.checkIns = {};
             if (state.checkIns[name]?.checkedIn) {
               delete state.checkIns[name];
+              saveState();
               showToast(`Removed check-in for ${name}`);
             } else {
               markPlayerCheckedIn(name, 'desk');
               showToast(`Checked in ${name}`, 'success');
             }
-            saveState();
             render();
           });
         });
@@ -5977,11 +6408,24 @@
             </div>
           `);
           document.getElementById('modal-cancel').addEventListener('click', closeModal);
-          document.getElementById('modal-reset-confirm').addEventListener('click', () => {
-            const role = state.auth.role;
-            state = createDefaultState();
-            state.auth.loggedIn = true;
-            state.auth.role = role;
+          document.getElementById('modal-reset-confirm').addEventListener('click', async () => {
+            const previous = state;
+            if (state.phase === 'completed') {
+              try {
+                if ((await getOpenTournaments()).some(tournament => String(tournament.id) !== String(previous.tournamentId))) {
+                  showToast('Close or delete the open tournament before reopening this tournament', 'error');
+                  return;
+                }
+              } catch (err) {
+                showToast(`Could not check open tournaments: ${err.message}`, 'error');
+                return;
+              }
+              if (state !== previous) return;
+            }
+            state = createDefaultState(previous.tournamentId);
+            state.auth = previous.auth;
+            state.sync = previous.sync;
+            state.ui.activeTab = getRequestedPage();
             closeModal();
             saveState();
             render();
@@ -6141,9 +6585,6 @@
         document.getElementById('start-tournament-btn')?.addEventListener('click', startTournament);
 
         // QR1, QR2, Semis, Finals bindings
-        document.querySelectorAll('[data-qr1-filter]').forEach(btn => {
-          btn.addEventListener('click', () => { state.ui.qr1GroupFilter = btn.getAttribute('data-qr1-filter'); render(); });
-        });
         document.getElementById('sim-qr1-btn')?.addEventListener('click', () => simulateMatches(state.qr1Matches));
         document.getElementById('advance-qr2-btn')?.addEventListener('click', advanceToQR2);
         document.getElementById('sim-qr2-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.qr2Matches || {}).flat()));
@@ -6257,7 +6698,14 @@
               showToast('Match no longer exists; refresh the schedule', 'error');
               return;
             }
-            const save = () => {
+            const expectedMatch = JSON.parse(JSON.stringify(m));
+            const save = async confirmedRevision => {
+              if (getSyncApiUrl()) {
+                if (await saveMatchScore(listKey, id, expectedMatch, { s1, s2 }, confirmedRevision)) {
+                  showToast('Score saved', 'success');
+                }
+                return;
+              }
               m.s1 = s1; m.s2 = s2; m.completed = true; m.completedAt = new Date().toISOString();
               saveState();
               render();
@@ -6295,23 +6743,41 @@
         });
 
         document.querySelectorAll('[data-save-final]').forEach(btn => {
-          btn.addEventListener('click', () => {
+          btn.addEventListener('click', async () => {
             const poolKey = btn.getAttribute('data-save-final');
             const f = state.finals[poolKey];
+            const expectedMatch = JSON.parse(JSON.stringify(f));
+            const games = [];
             let t1Wins = 0, t2Wins = 0;
             for (let gi = 0; gi < f.games.length; gi++) {
               const v1 = document.querySelector(`[data-final-input="${poolKey}:${gi}:1"]`).value;
               const v2 = document.querySelector(`[data-final-input="${poolKey}:${gi}:2"]`).value;
-              if (v1 === '' && v2 === '') continue;
+              if (v1 === '' && v2 === '') {
+                games.push({ s1: null, s2: null });
+                continue;
+              }
               const s1 = parseInt(v1, 10), s2 = parseInt(v2, 10);
               if (!isValidSingleScore(s1, s2, state.config.pointsToWin, state.config.deuceCap)) {
                 showToast(`Invalid score in Game ${gi + 1}`, 'error');
                 return;
               }
-              f.games[gi] = { s1, s2 };
+              games.push({ s1, s2 });
               if (s1 > s2) t1Wins++; else t2Wins++;
             }
+            if (getSyncApiUrl()) {
+              if (await saveMatchScore(`final_${poolKey}`, f.id || poolKey, expectedMatch, { games }, null)) {
+                const savedFinal = state.finals[poolKey];
+                showToast(savedFinal.completed ? `Group ${poolKey} Champion: ${savedFinal.winner}!` : 'Final game scores saved', 'success');
+              }
+              return;
+            }
             const needed = f.format === 'bo3' ? 2 : 1;
+            if (state.phase === 'completed' && t1Wins < needed && t2Wins < needed &&
+                getLocalTournamentCatalog().some(tournament => tournament.id !== String(state.tournamentId) && tournament.phase !== 'completed')) {
+              showToast('Close or delete the open tournament before reopening this tournament', 'error');
+              return;
+            }
+            f.games = games;
             if (t1Wins >= needed || t2Wins >= needed) {
               f.completed = true;
               f.winner = t1Wins > t2Wins ? f.t1 : f.t2;
@@ -6320,7 +6786,10 @@
             } else {
               f.completed = false;
               f.winner = null;
-              if (state.phase === 'completed') state.phase = 'finals';
+              if (state.phase === 'completed') {
+                state.phase = 'finals';
+                delete state.closedEarly;
+              }
               delete f.completedAt;
               showToast('Final game scores saved', 'success');
             }
@@ -6336,9 +6805,10 @@
             const latestRegistry = JSON.parse(event.newValue);
             registry = latestRegistry;
             const latestTournament = latestRegistry.items?.[state.tournamentId];
-            const localEditsPending = ['pending', 'syncing'].includes(state.sync?.status) ||
+            const localEditsPending = ['pending', 'syncing', 'error'].includes(state.sync?.status) ||
               ['pending', 'syncing'].includes(latestTournament?.sync?.status);
-            if (latestTournament && !localEditsPending && !isEditingFormField()) {
+            if (latestTournament && !localEditsPending && !scoreSaveInProgress &&
+                !isEditingFormField() && !hasUnsavedScoreEntry()) {
               const currentUi = state.ui;
               state = normalizeTournamentState({
                 ...latestTournament,

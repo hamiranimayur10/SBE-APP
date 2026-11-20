@@ -5,6 +5,8 @@ body { font-family: 'Inter', system-ui, sans-serif; }
 .player-roster-row.is-dragging { opacity: 0.4; }
 .player-drag-handle { cursor: grab; user-select: none; -webkit-user-select: none; }
 .player-drag-handle:active { cursor: grabbing; }
+details[data-standings] > summary::-webkit-details-marker,
+details[data-match] > summary::-webkit-details-marker { display: none; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: rgba(156, 163, 175, 0.4); border-radius: 9999px; }
 

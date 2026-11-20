@@ -34,6 +34,7 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
       SBE_TURSO_AUTH_TOKEN: '',
       TURSO_DATABASE_URL: '',
       TURSO_AUTH_TOKEN: '',
+      ADMIN_SYNC_KEY: '',
       VERCEL: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -61,6 +62,13 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
     const response = await fetch(`${baseUrl}/`);
     assert.equal(response.status, 200);
     assert.match(await response.text(), /SBE Light Vs Dark Side Tournament/);
+
+    const write = await fetch(`${baseUrl}/api/tournaments/test`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ config: { name: 'Test' }, groups: [] })
+    });
+    assert.equal(write.status, 503);
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

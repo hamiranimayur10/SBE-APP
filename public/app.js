@@ -850,22 +850,22 @@
         const apiUrl = getSyncApiUrl();
         let profiles;
         if (apiUrl) {
-          const response = await fetch(`${apiUrl}/api/players`, { cache: 'no-store' });
+          const response = await fetch(`${apiUrl}/api/player-import/directory`, { cache: 'no-store', headers: getSyncHeaders() });
           let result;
           try { result = await response.json(); } catch (_err) {
             throw new Error(`Unexpected response from player profiles (HTTP ${response.status})`);
           }
           if (!response.ok) throw new Error(result.error || `Player profiles request failed (HTTP ${response.status})`);
-          profiles = Array.isArray(result.players) ? result.players : [];
+          if (!Array.isArray(result.profiles)) throw new Error('Invalid player directory response');
+          profiles = result.profiles;
         } else {
           profiles = getLocalPlayerProfiles();
         }
 
-        playerData.profiles = profiles;
         return profiles;
       }
 
-      function addPlayerProfileToGroup(groupIndex, profile, skill) {
+      function addPlayerProfileToGroup(groupIndex, profile) {
         const group = state.groups[groupIndex];
         const name = String(profile?.name || '').trim();
         if (!group || !name || !isValidPlayerId(profile.playerId)) {
@@ -878,7 +878,7 @@
         }
 
         group.players.push(name);
-        setPlayerSkill(name, skill || 5);
+        setPlayerSkill(name, profile.skill ?? 5);
         if (!group.leader) group.leader = name;
         [name, ...(Array.isArray(profile.aliases) ? profile.aliases : [])].forEach(alias => {
           const key = normalizeImportName(alias);
@@ -3299,7 +3299,6 @@
                     </div>
 
                     <div class="flex items-center gap-1.5 pt-1">
-                      <input data-add-player-skill="${gi}" type="number" min="1" max="10" value="5" title="Skill level (1-10)" class="w-12 px-1.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs text-center font-semibold tabular-nums" />
                       <button data-add-player-btn="${gi}" class="flex-1 px-3 py-1.5 rounded-lg bg-stone-200 dark:bg-stone-800 hover:bg-stone-300 dark:hover:bg-stone-700 text-xs font-medium">+ Add player from profiles</button>
                     </div>
                   </div>
@@ -4048,7 +4047,6 @@
           .filter(profile => profile && profile.name && isValidPlayerId(profile.playerId))
           .filter(profile => !isPlayerProfileInRoster(profile))
           .sort((a, b) => (a.displayName || a.name).localeCompare(b.displayName || b.name));
-        const skill = document.querySelector(`[data-add-player-skill="${groupIndex}"]`)?.value || '5';
         let selectedPlayerId = availableProfiles[0]?.playerId || '';
         openModal(`
           <div class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-6 space-y-4">
@@ -4056,7 +4054,7 @@
               <div>
                 <p class="text-[10px] uppercase tracking-[0.18em] font-bold text-gold-700 dark:text-gold-400">Player directory</p>
                 <h3 class="mt-1 text-lg font-bold">Add a player to ${esc(group.name)}</h3>
-                <p class="mt-1 text-xs text-stone-500">Select a profile to link tournament scores to the player’s record.</p>
+                <p class="mt-1 text-xs text-stone-500">The profile skill is used initially; you can override it for this tournament.</p>
               </div>
               <span class="shrink-0 rounded-full bg-stone-100 dark:bg-[#111214] px-2.5 py-1 text-[10px] font-semibold text-stone-500">${availableProfiles.length} available</span>
             </div>
@@ -4092,7 +4090,7 @@
         document.getElementById('group-player-picker-cancel').addEventListener('click', closeModal);
         document.getElementById('group-create-profile-btn').addEventListener('click', () => {
           closeModal();
-          renderPlayerProfileEditor(null, profile => addPlayerProfileToGroup(groupIndex, profile, skill));
+          renderPlayerProfileEditor(null, profile => addPlayerProfileToGroup(groupIndex, profile));
         });
         const search = document.getElementById('group-profile-search');
         const cards = [...document.querySelectorAll('[data-group-profile-id]')];
@@ -4129,7 +4127,7 @@
             return;
           }
           closeModal();
-          addPlayerProfileToGroup(groupIndex, profile, skill);
+          addPlayerProfileToGroup(groupIndex, profile);
         });
       }
 
@@ -4166,6 +4164,10 @@
                 <label for="profile-club" class="block font-semibold text-stone-500 mb-1">Club</label>
                 <input id="profile-club" type="text" maxlength="120" value="${esc(current.club || '')}" placeholder="Club name" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
               </div>
+              <div>
+                <label for="profile-skill" class="block font-semibold text-stone-500 mb-1">Skill (1–10)</label>
+                <input id="profile-skill" type="number" min="1" max="10" step="1" value="${esc(current.skill ?? '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
               <div class="sm:col-span-2">
                 <label for="profile-ranking" class="block font-semibold text-stone-500 mb-1">National / Club Ranking</label>
                 <input id="profile-ranking" type="text" maxlength="120" value="${esc(current.ranking || '')}" placeholder="e.g. Club #8 · National B" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
@@ -4192,6 +4194,7 @@
             photoUrl,
             age: ageInput ? Number(ageInput) : null,
             club: document.getElementById('profile-club').value.trim(),
+            skill: document.getElementById('profile-skill').value === '' ? null : Number(document.getElementById('profile-skill').value),
             ranking: document.getElementById('profile-ranking').value.trim()
           };
           if (photoUrl && !photoUrl.startsWith('data:')) {
@@ -4237,7 +4240,7 @@
           ['name', 'Full name'], ['nickname', 'Nickname'], ['photoUrl', 'Profile photo'],
           ['age', 'Age'], ['gender', 'Gender'], ['club', 'Club / Academy'], ['ranking', 'Ranking'], ['country', 'Country'],
           ['state', 'State'], ['city', 'City'], ['emergencyContact', 'Emergency contact'],
-          ['playingHand', 'Playing hand'], ['preferredEvents', 'Preferred events'], ['email', 'Email']
+          ['playingHand', 'Playing hand'], ['preferredEvents', 'Preferred events'], ['email', 'Email'], ['skill', 'Skill']
         ];
         openModal(`
           <form id="player-own-profile-form" class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
@@ -4272,6 +4275,11 @@
               <div>
                 <label for="own-profile-club" class="block font-semibold text-stone-500 mb-1">Club / Academy</label>
                 <input id="own-profile-club" type="text" maxlength="120" value="${esc(profile.club || '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+              </div>
+              <div>
+                <label for="own-profile-skill" class="block font-semibold text-stone-500 mb-1">Skill (1–10)</label>
+                <input id="own-profile-skill" type="number" min="1" max="10" step="1" value="${esc(profile.skill ?? '')}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700" />
+                <p class="mt-1 text-stone-500">Used when you are added to a tournament; an admin can override it there.</p>
               </div>
               <div>
                 <label for="own-profile-country" class="block font-semibold text-stone-500 mb-1">Country</label>
@@ -4431,6 +4439,7 @@
                           ${profileDetail('age', 'Age', profile.age)}
                           ${profileDetail('club', 'Club / Academy', profile.club)}
                           ${profileDetail('ranking', 'Ranking', profile.ranking)}
+                          ${profileDetail('skill', 'Skill', profile.skill ? `${profile.skill}/10` : '')}
                         </div>
                         <div class="text-xs font-semibold mt-2">${selected.titlesWon} title${selected.titlesWon === 1 ? '' : 's'} · ${selected.wins}W–${selected.losses}L</div>
                         ${profile.playerCode ? `<div class="mt-1 text-[10px] font-mono text-stone-500">Player code: ${esc(profile.playerCode)}</div>` : ''}
@@ -4763,7 +4772,7 @@
                 <select id="ci-add-group" class="px-2.5 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs">
                   ${state.groups.map((g, gi) => `<option value="${gi}">${esc(g.name)}</option>`).join('')}
                 </select>
-                <input id="ci-add-skill" type="number" min="1" max="10" value="5" title="Skill (1-10)" class="w-14 px-2 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs text-center font-semibold tabular-nums" />
+                <input id="ci-add-skill" type="number" min="1" max="10" step="1" placeholder="Skill" title="Optional skill override (1-10); otherwise use profile skill" class="w-14 px-2 py-1.5 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs text-center font-semibold tabular-nums" />
                 <label class="inline-flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-300 px-1">
                   <input id="ci-add-signedin" type="checkbox" checked class="rounded border-stone-300 text-gold-500" />
                   <span>Signed In</span>
@@ -5256,6 +5265,7 @@
             photoUrl,
             gender: document.getElementById('own-profile-gender').value.trim(),
             club: document.getElementById('own-profile-club').value.trim(),
+            skill: document.getElementById('own-profile-skill').value === '' ? null : Number(document.getElementById('own-profile-skill').value),
             country: document.getElementById('own-profile-country').value.trim(),
             state: document.getElementById('own-profile-state').value.trim(),
             city: document.getElementById('own-profile-city').value.trim(),
@@ -5760,10 +5770,21 @@
           if (uniquePlayers.length < state.groups.length) {
             throw new Error(`Only ${uniquePlayers.length} unique players remain after duplicate matching. Import at least ${state.groups.length} to fill every group.`);
           }
+          const existingRosterSkills = new Map();
+          state.groups.flatMap(group => group.players).forEach(name => {
+            const key = normalizeImportName(name);
+            const skill = getPlayerSkill(name);
+            existingRosterSkills.set(`name:${key}`, skill);
+            const playerId = state.playerProfileIds?.[key];
+            if (playerId) existingRosterSkills.set(`id:${playerId}`, skill);
+          });
           state.groups.forEach(group => { group.players = []; group.leader = ''; });
           uniquePlayers.forEach((player, index) => {
             const group = state.groups[index % state.groups.length];
             group.players.push(player.name);
+            const existingSkill = existingRosterSkills.get(`id:${player.playerId}`) ??
+              existingRosterSkills.get(`name:${normalizeImportName(player.name)}`);
+            setPlayerSkill(player.name, existingSkill ?? player.profile?.skill ?? 5);
             if (!group.leader) group.leader = player.name;
           });
           saveState();
@@ -6346,12 +6367,34 @@
         document.getElementById('ci-import-btn')?.addEventListener('click', () => {
           openImportRosterModal();
         });
-        document.getElementById('ci-add-btn')?.addEventListener('click', async () => {
+        document.getElementById('ci-add-btn')?.addEventListener('click', async event => {
+          const button = event.currentTarget;
           const name = document.getElementById('ci-add-name')?.value.trim();
           const gi = Number(document.getElementById('ci-add-group')?.value || 0);
-          const skill = document.getElementById('ci-add-skill')?.value || 5;
+          const skillInput = document.getElementById('ci-add-skill');
+          const rawSkill = skillInput?.value || '';
           const autoSignIn = document.getElementById('ci-add-signedin')?.checked;
           if (!name) { showToast('Enter a player name', 'error'); return; }
+          if (rawSkill && (!Number.isInteger(Number(rawSkill)) || Number(rawSkill) < 1 || Number(rawSkill) > 10)) {
+            showToast('Skill must be a whole number between 1 and 10', 'error');
+            return;
+          }
+          let skill = rawSkill ? Number(rawSkill) : null;
+          if (skill === null) {
+            button.disabled = true;
+            try {
+              const { profiles } = await getPlayerImportDirectory();
+              const matches = profiles.filter(profile => [profile.name, ...(profile.aliases || [])]
+                .some(value => normalizeImportName(value) === normalizeImportName(name)));
+              if (matches.length > 1) throw new Error('Player name matches multiple profiles; enter a skill override');
+              skill = matches[0]?.skill ?? 5;
+            } catch (err) {
+              showToast(`Could not load player skill: ${err.message}`, 'error');
+              return;
+            } finally {
+              button.disabled = false;
+            }
+          }
           state.groups[gi].players.push(name);
           if (!state.groups[gi].leader) state.groups[gi].leader = name;
           setPlayerSkill(name, skill);

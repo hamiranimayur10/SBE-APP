@@ -87,6 +87,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(migratedDirectory.response.status, 200);
     const migratedProfile = migratedDirectory.body.profiles.find(player => player.name === 'Legacy Player');
     assert.ok(migratedProfile);
+    assert.equal(migratedProfile.skill, null);
     assert.match(migratedProfile.playerId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(migratedProfile.playerCode, /^\d{6}$/);
 
@@ -450,8 +451,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
         email: 'renamed@example.com',
         photoUrl: uploadedPhoto,
         age: 99,
+        skill: 8,
         ranking: 'Cannot edit ranking',
-        visibility: { name: false, city: false, email: false, ranking: false }
+        visibility: { name: false, city: false, email: false, ranking: false, skill: false }
       })
     });
     assert.equal(update.response.status, 200);
@@ -460,6 +462,15 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(update.body.player.age, null);
     assert.equal(update.body.player.ranking, '');
     assert.equal(update.body.player.photoUrl, uploadedPhoto);
+    assert.equal(update.body.player.skill, 8);
+    for (const skill of [0, 11, 2.5, '8']) {
+      const invalidSkill = await api('/api/player-auth/me', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json', cookie: playerCookie, 'x-player-revision': update.body.player.revision },
+        body: JSON.stringify({ skill })
+      });
+      assert.equal(invalidSkill.response.status, 400);
+    }
     const staleSelfUpdate = await api('/api/player-auth/me', {
       method: 'PUT',
       headers: { 'content-type': 'application/json', cookie: playerCookie, 'x-player-revision': registration.body.player.revision },
@@ -468,6 +479,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(staleSelfUpdate.response.status, 409);
     const ownSnapshot = await api('/api/tournament-history', { headers: { cookie: playerCookie } });
     assert.equal(ownSnapshot.body.ownPlayer.city, 'Hidden City');
+    assert.equal(ownSnapshot.body.ownPlayer.skill, 8);
     assert.equal(ownSnapshot.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
     const anonymousSnapshot = await api('/api/tournament-history');
     assert.equal(anonymousSnapshot.body.ownPlayer, null);
@@ -479,6 +491,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(publicProfile.city, '');
     assert.equal(publicProfile.email, '');
     assert.equal(publicProfile.ranking, '');
+    assert.equal(publicProfile.skill, null);
+    const skillDirectory = await api('/api/player-import/directory', { headers: adminHeaders });
+    assert.equal(skillDirectory.body.profiles.find(player => player.playerId === update.body.player.playerId).skill, 8);
     assert.deepEqual(publicProfile.aliases, []);
 
     const invalidLogin = await api('/api/player-auth/login', {
@@ -530,6 +545,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(adminRename.response.status, 200);
     assert.equal(adminRename.body.player.name, 'Admin Renamed Player');
+    assert.equal(adminRename.body.player.skill, 8);
     const renamedAccount = await api('/api/player-auth/me', {
       headers: { cookie: changedPasswordCookie }
     });
@@ -725,6 +741,32 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(selfCheckIn.body.revision, savedCheckIn.body.revision);
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].checkedIn, true);
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].source, 'player');
+
+    savedCheckIn.body.data.playerSkills['Roster Alice'] = 7;
+    const skillOverride = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': savedCheckIn.body.revision },
+      body: JSON.stringify(savedCheckIn.body.data)
+    });
+    assert.equal(skillOverride.response.status, 200);
+    const skillDb = createClient({ url: databaseUrl });
+    const checkInSkill = await skillDb.execute({
+      sql: 'SELECT skill FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+      args: ['auth-test', 'Roster Alice']
+    });
+    assert.equal(checkInSkill.rows[0].skill, 7);
+    await skillDb.close();
+    const profilesAfterOverride = await api('/api/player-import/directory', { headers: adminHeaders });
+    const aliceAfterOverride = profilesAfterOverride.body.profiles.find(player => player.name === 'Roster Alice');
+    assert.equal(aliceAfterOverride.skill, null);
+    const aliceSkillUpdate = await api('/api/player-auth/me', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: aliceCookie, 'x-player-revision': aliceAfterOverride.revision },
+      body: JSON.stringify({ skill: 4 })
+    });
+    assert.equal(aliceSkillUpdate.response.status, 200);
+    assert.equal(aliceSkillUpdate.body.player.skill, 4);
+    assert.equal((await api('/api/tournaments/auth-test')).body.data.playerSkills['Roster Alice'], 7);
 
     const duplicateSelfCheckIn = await api('/api/player-auth/tournaments/auth-test/checkin', {
       method: 'POST',

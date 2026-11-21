@@ -17,7 +17,7 @@ const ADMIN_SESSION_COOKIE = 'sbe_admin_session';
 const ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60;
 const PROFILE_VISIBILITY_FIELDS = [
   'name', 'nickname', 'photoUrl', 'age', 'gender', 'club', 'ranking', 'country', 'state', 'city',
-  'emergencyContact', 'playingHand', 'preferredEvents', 'email'
+  'emergencyContact', 'playingHand', 'preferredEvents', 'email', 'skill'
 ];
 
 class ValidationError extends Error {}
@@ -87,6 +87,7 @@ async function initSchema() {
       const profileColumns = [
         ['player_id', 'TEXT'],
         ['player_code', 'TEXT'],
+        ['skill', 'INTEGER'],
         ['nickname', "TEXT NOT NULL DEFAULT ''"],
         ['gender', "TEXT NOT NULL DEFAULT ''"],
         ['country', "TEXT NOT NULL DEFAULT ''"],
@@ -520,6 +521,7 @@ function serializePlayerProfile(row, publicView) {
     gender: row.gender || '',
     club: row.club || '',
     ranking: row.ranking || '',
+    skill: row.skill === null || row.skill === undefined ? null : Number(row.skill),
     country: row.country || '',
     state: row.state || '',
     city: row.city || '',
@@ -531,7 +533,7 @@ function serializePlayerProfile(row, publicView) {
   };
   if (publicView) {
     PROFILE_VISIBILITY_FIELDS.forEach(field => {
-      if (!visibility[field] && field !== 'name') profile[field] = field === 'preferredEvents' ? [] : '';
+      if (!visibility[field] && field !== 'name') profile[field] = field === 'preferredEvents' ? [] : field === 'skill' ? null : '';
     });
     if (!visibility.name) profile.aliases = [];
   }
@@ -612,6 +614,10 @@ function normalizeProfileInput(input, current) {
   }
   const playingHand = body.playingHand === undefined ? (current?.playing_hand || '') : body.playingHand;
   if (playingHand && !['Right', 'Left'].includes(playingHand)) throw new ValidationError('Playing hand must be Right or Left');
+  const skill = body.skill === undefined ? (current?.skill ?? null) : body.skill;
+  if (skill !== null && (!Number.isInteger(skill) || skill < 1 || skill > 10)) {
+    throw new ValidationError('Skill must be a whole number between 1 and 10');
+  }
   const visibility = getProfileVisibility(body.visibility === undefined ? current?.visibility : body.visibility);
   return {
     name,
@@ -624,6 +630,7 @@ function normalizeProfileInput(input, current) {
     city: stringField('city', 'city', 80),
     emergencyContact: stringField('emergencyContact', 'emergency_contact', 200),
     playingHand,
+    skill,
     preferredEvents: [...new Set(preferredEvents)],
     email,
     visibility
@@ -840,14 +847,14 @@ async function persistPlayerProfile(profile, options) {
       playerCode = requestedCode || await allocatePlayerCode(transaction);
     }
     const values = [
-      profile.name, profile.photoUrl, age, ranking, updatedAt, crypto.randomUUID(), profile.nickname, profile.gender, profile.club,
+      profile.name, profile.photoUrl, age, ranking, profile.skill, updatedAt, crypto.randomUUID(), profile.nickname, profile.gender, profile.club,
       profile.country, profile.state, profile.city, profile.emergencyContact, profile.playingHand,
       JSON.stringify(profile.preferredEvents), profile.email, JSON.stringify(profile.visibility), JSON.stringify(keptAliases)
     ];
     if (current) {
       const result = await transaction.execute({
         sql: `UPDATE player_profiles SET
-                player_name = ?, photo_url = ?, age = ?, ranking = ?, updated_at = ?, revision = ?, nickname = ?,
+                player_name = ?, photo_url = ?, age = ?, ranking = ?, skill = ?, updated_at = ?, revision = ?, nickname = ?,
                 gender = ?, club = ?, country = ?, state = ?, city = ?, emergency_contact = ?,
                 playing_hand = ?, preferred_events = ?, email = ?, visibility = ?, aliases = ?
               WHERE player_name = ?`,
@@ -857,9 +864,9 @@ async function persistPlayerProfile(profile, options) {
     } else {
       await transaction.execute({
         sql: `INSERT INTO player_profiles
-                (player_id, player_code, player_name, photo_url, age, ranking, updated_at, revision, nickname, gender, club,
+                (player_id, player_code, player_name, photo_url, age, ranking, skill, updated_at, revision, nickname, gender, club,
                  country, state, city, emergency_contact, playing_hand, preferred_events, email, visibility, aliases)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [playerId, playerCode, ...values]
       });
     }
@@ -1474,6 +1481,7 @@ app.post('/api/player-import', requireAdminKey, async (req, res) => {
         city: current.city || profile.city,
         emergencyContact: current.emergency_contact || profile.emergencyContact,
         playingHand: current.playing_hand || profile.playingHand,
+        skill: current.skill ?? profile.skill,
         preferredEvents: storedEvents.length ? storedEvents : profile.preferredEvents,
         email: current.email || profile.email,
         visibility: getProfileVisibility(current.visibility)
@@ -1496,6 +1504,7 @@ app.post('/api/player-import', requireAdminKey, async (req, res) => {
         ['city', mergedProfile.city],
         ['emergency_contact', mergedProfile.emergencyContact],
         ['playing_hand', mergedProfile.playingHand],
+        ['skill', mergedProfile.skill],
         ['preferred_events', JSON.stringify(mergedProfile.preferredEvents)],
         ['email', mergedProfile.email],
         ['age', mergedAge],
@@ -2169,6 +2178,20 @@ app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
     }
     if (resetAttendance) {
       await transaction.execute({ sql: 'DELETE FROM player_checkins WHERE tournament_id = ?', args: [id] });
+    } else if (payload.playerSkills && typeof payload.playerSkills === 'object' && !Array.isArray(payload.playerSkills)) {
+      const previousSkills = original ? (JSON.parse(original).playerSkills || {}) : {};
+      for (const [name, value] of Object.entries(payload.playerSkills)) {
+        if (value === previousSkills[name]) continue;
+        const skill = Number(value);
+        if (!Number.isInteger(skill) || skill < 1 || skill > 10) {
+          await transaction.rollback();
+          return res.status(400).json({ error: `Skill for ${name} must be a whole number between 1 and 10` });
+        }
+        await transaction.execute({
+          sql: 'UPDATE player_checkins SET skill = ? WHERE tournament_id = ? AND player_name = ?',
+          args: [skill, id, name]
+        });
+      }
     }
     await transaction.commit();
     res.json({ ok: true, id, updatedAt: now, revision: tournamentRevision(data), playerProfileIds: payload.playerProfileIds });

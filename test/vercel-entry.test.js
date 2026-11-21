@@ -35,6 +35,7 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
       TURSO_DATABASE_URL: '',
       TURSO_AUTH_TOKEN: '',
       ADMIN_SYNC_KEY: '',
+      ADMIN_PASSWORD: '',
       VERCEL: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -68,7 +69,13 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ config: { name: 'Test' }, groups: [] })
     });
-    assert.equal(write.status, 503);
+    assert.equal(write.status, 401);
+    const login = await fetch(`${baseUrl}/api/admin-auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-sbe-admin-request': '1' },
+      body: JSON.stringify({ password: 'a-test-admin-password' })
+    });
+    assert.equal(login.status, 503);
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

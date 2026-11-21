@@ -13,6 +13,8 @@ app.use(express.json({ limit: '8mb' }));
 const scrypt = promisify(crypto.scrypt);
 const PLAYER_SESSION_COOKIE = 'sbe_player_session';
 const PLAYER_SESSION_SECONDS = 30 * 24 * 60 * 60;
+const ADMIN_SESSION_COOKIE = 'sbe_admin_session';
+const ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60;
 const PROFILE_VISIBILITY_FIELDS = [
   'name', 'nickname', 'photoUrl', 'age', 'gender', 'club', 'ranking', 'country', 'state', 'city',
   'emergencyContact', 'playingHand', 'preferredEvents', 'email'
@@ -172,6 +174,20 @@ async function initSchema() {
         )
       `);
       await getDb().execute(`
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          token_hash TEXT PRIMARY KEY,
+          credential_tag TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        )
+      `);
+      await getDb().execute(`
+        CREATE TABLE IF NOT EXISTS admin_login_attempts (
+          id INTEGER PRIMARY KEY,
+          attempts INTEGER NOT NULL,
+          window_start INTEGER NOT NULL
+        )
+      `);
+      await getDb().execute(`
         CREATE TABLE IF NOT EXISTS player_invites (
           id TEXT PRIMARY KEY,
           token_hash TEXT NOT NULL UNIQUE,
@@ -219,8 +235,17 @@ async function requireAdminKey(req, res, next) {
     if (await findPlayerSession(req)) {
       return res.status(403).json({ error: 'Player accounts cannot perform admin actions' });
     }
+    if (await findAdminSession(req)) {
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers['x-sbe-admin-request'] !== '1') {
+        return res.status(403).json({ error: 'Admin request header required' });
+      }
+      return next();
+    }
+    if (!req.headers['x-sync-key']) {
+      return res.status(401).json({ error: 'Admin session required; sign in again' });
+    }
     if (!process.env.ADMIN_SYNC_KEY) {
-      return res.status(503).json({ error: 'Set ADMIN_SYNC_KEY on the backend and in the app Cloud Sync settings first' });
+      return res.status(401).json({ error: 'Admin session required' });
     }
     if (!validAdminKey(req)) return res.status(401).json({ error: 'Invalid admin sync key' });
     next();
@@ -265,6 +290,105 @@ function generateUniquePlayerCode(usedCodes) {
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
+
+function adminCredentialTag(password) {
+  return crypto.createHmac('sha256', password).update('sbe-admin-session-v1').digest('hex');
+}
+
+function configuredAdminPassword() {
+  const password = process.env.ADMIN_PASSWORD || '';
+  return password.length >= 16 && password.length <= 256 ? password : '';
+}
+
+function setAdminCookie(req, res, token, maxAge) {
+  const isSecure = process.env.VERCEL || req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  res.setHeader('Set-Cookie', `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Strict${isSecure ? '; Secure' : ''}`);
+}
+
+async function findAdminSession(req) {
+  const token = getCookie(req, ADMIN_SESSION_COOKIE);
+  const password = configuredAdminPassword();
+  if (!token || !password) return false;
+  const result = await getDb().execute({
+    sql: 'SELECT token_hash FROM admin_sessions WHERE token_hash = ? AND credential_tag = ? AND expires_at > ?',
+    args: [hashToken(token), adminCredentialTag(password), new Date().toISOString()]
+  });
+  return result.rows.length > 0;
+}
+
+app.post('/api/admin-auth/login', async (req, res) => {
+  try {
+    if (req.headers['x-sbe-admin-request'] !== '1') {
+      return res.status(403).json({ error: 'Admin request header required' });
+    }
+    if (await findPlayerSession(req)) {
+      return res.status(403).json({ error: 'Sign out of the player account before signing in as admin' });
+    }
+    const configured = configuredAdminPassword();
+    if (!configured) {
+      return res.status(503).json({ error: 'Set ADMIN_PASSWORD to a strong password of 16 to 256 characters on the backend' });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const attempts = await getDb().execute({
+      sql: `INSERT INTO admin_login_attempts (id, attempts, window_start) VALUES (1, 1, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              attempts = CASE WHEN window_start <= ? THEN 1 ELSE attempts + 1 END,
+              window_start = CASE WHEN window_start <= ? THEN excluded.window_start ELSE window_start END
+            RETURNING attempts`,
+      args: [now, now - 900, now - 900]
+    });
+    if (Number(attempts.rows[0].attempts) > 10) {
+      return res.status(429).json({ error: 'Too many admin login attempts. Try again in 15 minutes.' });
+    }
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const actual = Buffer.from(password);
+    const expected = Buffer.from(configured);
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+      return res.status(401).json({ error: 'Incorrect admin password' });
+    }
+    const token = crypto.randomBytes(32).toString('hex');
+    await getDb().execute({
+      sql: 'INSERT INTO admin_sessions (token_hash, credential_tag, expires_at) VALUES (?, ?, ?)',
+      args: [hashToken(token), adminCredentialTag(configured), new Date(Date.now() + ADMIN_SESSION_SECONDS * 1000).toISOString()]
+    });
+    await getDb().execute('DELETE FROM admin_login_attempts WHERE id = 1');
+    setAdminCookie(req, res, token, ADMIN_SESSION_SECONDS);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Admin login failed:', err);
+    res.status(500).json({ error: 'Admin login is unavailable' });
+  }
+});
+
+app.get('/api/admin-auth/me', async (req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!await findAdminSession(req) || await findPlayerSession(req)) {
+      return res.status(401).json({ error: 'Admin session required' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Admin session check failed:', err);
+    res.status(500).json({ error: 'Admin authentication is unavailable' });
+  }
+});
+
+app.post('/api/admin-auth/logout', async (req, res) => {
+  try {
+    if (req.headers['x-sbe-admin-request'] !== '1') {
+      return res.status(403).json({ error: 'Admin request header required' });
+    }
+    const token = getCookie(req, ADMIN_SESSION_COOKIE);
+    if (token) await getDb().execute({ sql: 'DELETE FROM admin_sessions WHERE token_hash = ?', args: [hashToken(token)] });
+    setAdminCookie(req, res, '', 0);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Admin logout failed:', err);
+    res.status(500).json({ error: 'Admin logout is unavailable' });
+  }
+});
 
 function getCookie(req, name) {
   const cookies = String(req.headers.cookie || '').split(';');

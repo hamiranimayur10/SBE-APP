@@ -6,6 +6,7 @@ const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const test = require('node:test');
 const { createClient } = require('@libsql/client');
+const crypto = require('node:crypto');
 const { buildAnalytics } = require('../public/player-analytics');
 
 const root = path.join(__dirname, '..');
@@ -46,6 +47,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     env: {
       ...process.env,
       ADMIN_SYNC_KEY: 'player-auth-test-admin-key',
+      ADMIN_PASSWORD: 'admin-session-test-password',
       PORT: String(port),
       SBE_TURSO_DATABASE_URL: databaseUrl,
       SBE_TURSO_AUTH_TOKEN: '',
@@ -90,6 +92,51 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const noKey = await api('/api/player-invites');
     assert.equal(noKey.response.status, 401);
+
+    const adminLoginHeaders = { 'content-type': 'application/json', 'x-sbe-admin-request': '1' };
+    const adminLogin = password => api('/api/admin-auth/login', {
+      method: 'POST',
+      headers: adminLoginHeaders,
+      body: JSON.stringify({ password })
+    });
+    const missingAdminHeader = await api('/api/admin-auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'admin-session-test-password' })
+    });
+    assert.equal(missingAdminHeader.response.status, 403);
+    assert.equal((await adminLogin('wrong-password')).response.status, 401);
+    const firstAdmin = await adminLogin('admin-session-test-password');
+    assert.equal(firstAdmin.response.status, 200);
+    const setAdminCookie = firstAdmin.response.headers.get('set-cookie');
+    assert.match(setAdminCookie, /HttpOnly/);
+    assert.match(setAdminCookie, /SameSite=Strict/);
+    const adminCookie = setAdminCookie.split(';')[0];
+    const secondAdmin = await adminLogin('admin-session-test-password');
+    assert.equal(secondAdmin.response.status, 200);
+    const secondAdminCookie = secondAdmin.response.headers.get('set-cookie').split(';')[0];
+    assert.notEqual(adminCookie, secondAdminCookie);
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: adminCookie } })).response.status, 200);
+    assert.equal((await api('/api/player-invites', { headers: { cookie: adminCookie } })).response.status, 200);
+    const blockedCsrf = await api('/api/player-invites', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: adminCookie },
+      body: JSON.stringify({})
+    });
+    assert.equal(blockedCsrf.response.status, 403);
+    const allowedSessionWrite = await api('/api/tournaments/session-test', {
+      method: 'PUT',
+      headers: { ...adminLoginHeaders, cookie: adminCookie, 'x-tournament-revision': 'new' },
+      body: JSON.stringify({ tournamentId: 'session-test', phase: 'completed', config: { name: 'Session Test' }, groups: [] })
+    });
+    assert.equal(allowedSessionWrite.response.status, 200);
+    const adminLogout = await api('/api/admin-auth/logout', {
+      method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie }
+    });
+    assert.equal(adminLogout.response.status, 200);
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: adminCookie } })).response.status, 401);
+    assert.equal((await api('/api/player-invites', { headers: { cookie: adminCookie } })).response.status, 401);
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 200);
 
     const savedTournament = await api('/api/tournaments/auth-test', {
       method: 'PUT',
@@ -547,6 +594,36 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       body: JSON.stringify({ listKey: 'qr1', expectedMatch: {}, s1: 21, s2: 12 })
     });
     assert.equal(playerScoreWrite.response.status, 403);
+    const playerAndAdminWrite = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminLoginHeaders, cookie: `${changedPasswordCookie}; ${secondAdminCookie}` },
+      body: JSON.stringify({ config: { name: 'Player changed this' }, groups: [] })
+    });
+    assert.equal(playerAndAdminWrite.response.status, 403);
+    const sessionDb = createClient({ url: databaseUrl });
+    const secondTokenHash = crypto.createHash('sha256').update(secondAdminCookie.split('=')[1]).digest('hex');
+    await sessionDb.execute({
+      sql: 'UPDATE admin_sessions SET credential_tag = ? WHERE token_hash = ?',
+      args: ['old-credential', secondTokenHash]
+    });
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 401);
+    await sessionDb.execute({
+      sql: 'UPDATE admin_sessions SET credential_tag = ? WHERE token_hash = ?',
+      args: [crypto.createHmac('sha256', 'admin-session-test-password').update('sbe-admin-session-v1').digest('hex'), secondTokenHash]
+    });
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 200);
+    await sessionDb.execute({
+      sql: 'UPDATE admin_sessions SET expires_at = ? WHERE token_hash = ?',
+      args: ['2000-01-01T00:00:00.000Z', secondTokenHash]
+    });
+    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 401);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      assert.equal((await adminLogin('wrong-password')).response.status, 401);
+    }
+    assert.equal((await adminLogin('admin-session-test-password')).response.status, 429);
+    await sessionDb.execute('UPDATE admin_login_attempts SET window_start = 0 WHERE id = 1');
+    assert.equal((await adminLogin('admin-session-test-password')).response.status, 200);
+    sessionDb.close();
 
     const guestTournamentRead = await api('/api/tournaments/auth-test');
     assert.equal(guestTournamentRead.response.status, 200);

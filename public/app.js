@@ -397,10 +397,11 @@
       let playerInviteContext = null;
       let playerInviteError = '';
       let playerAuthError = '';
+      let adminAuthError = '';
 
       function getSyncHeaders() {
-        const headers = { 'Content-Type': 'application/json' };
-        if (state.sync?.syncKey) headers['x-sync-key'] = state.sync.syncKey;
+        const headers = { 'Content-Type': 'application/json', 'x-sbe-admin-request': '1' };
+        if (!usesAdminSession() && state.sync?.syncKey) headers['x-sync-key'] = state.sync.syncKey;
         return headers;
       }
 
@@ -416,6 +417,27 @@
           return `${window.location.protocol}//${window.location.hostname}:3001`;
         }
         return window.location.protocol === 'https:' || isLocalOrigin ? window.location.origin : '';
+      }
+
+      function usesAdminSession() {
+        const apiUrl = getSyncApiUrl();
+        return Boolean(apiUrl && new URL(apiUrl).origin === window.location.origin);
+      }
+
+      async function requestAdminSession(path, options) {
+        if (!usesAdminSession()) throw new Error('Admin sessions require the app and API to use the same origin');
+        const response = await fetch(`${getSyncApiUrl()}${path}`, {
+          credentials: 'same-origin',
+          ...options,
+          headers: { 'Content-Type': 'application/json', 'x-sbe-admin-request': '1' }
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          const error = new Error(result.error || `Admin authentication failed (HTTP ${response.status})`);
+          error.status = response.status;
+          throw error;
+        }
+        return result;
       }
 
       function getPlayerAuthApiUrl() {
@@ -1627,16 +1649,34 @@
       }
 
       // Actions
-      function loginAdmin(pin) {
-        if (pin === state.auth.pin) {
-          state.auth.loggedIn = true;
-          state.auth.role = 'admin';
-          saveRegistry();
-          render();
-          showToast('Signed in as Admin', 'success');
-        } else {
+      async function loginAdmin(password) {
+        if (usesAdminSession()) {
+          try {
+            await requestAdminSession('/api/admin-auth/login', {
+              method: 'POST',
+              body: JSON.stringify({ password })
+            });
+          } catch (err) {
+            adminAuthError = err.message;
+            render();
+            return;
+          }
+        } else if (password !== state.auth.pin) {
           showToast('Incorrect Admin PIN', 'error');
+          return;
         }
+        adminAuthError = '';
+        if (usesAdminSession()) {
+          Object.values(registry.items).forEach(tournament => {
+            if (tournament.sync) tournament.sync.syncKey = '';
+          });
+          state.sync.syncKey = '';
+        }
+        state.auth.loggedIn = true;
+        state.auth.role = 'admin';
+        saveRegistry();
+        render();
+        showToast('Signed in as Admin', 'success');
       }
 
       function loginGuest() {
@@ -1654,10 +1694,25 @@
       }
 
       async function logout() {
-        if (state.auth.role === 'admin' && syncTimer && getSyncApiUrl()) {
+        if (state.auth.role === 'admin' && scoreSaveInProgress) {
+          showToast('Wait for the score to finish saving before signing out', 'error');
+          return;
+        }
+        if (state.auth.role === 'admin' && getSyncApiUrl() &&
+            (syncTimer || syncInFlight || state.sync.status === 'pending')) {
           clearTimeout(syncTimer);
           syncTimer = null;
-          if (!await pushToTurso(true)) return;
+          do {
+            if (!await pushToTurso(true)) return;
+          } while (state.sync.status === 'pending');
+        }
+        if (state.auth.role === 'admin' && usesAdminSession()) {
+          try {
+            await requestAdminSession('/api/admin-auth/logout', { method: 'POST' });
+          } catch (err) {
+            showToast(`Could not end the admin session: ${err.message}`, 'error');
+            return;
+          }
         }
         state.auth.loggedIn = false;
         saveRegistry();
@@ -2787,6 +2842,7 @@
       }
 
       function renderLoginScreen() {
+        const adminSession = usesAdminSession();
         const inviteForm = playerInviteContext ? `
           <form id="player-register-form" class="mt-4 border-t border-stone-200 dark:border-stone-800 pt-4 space-y-3">
             <h2 class="text-sm font-bold">Create Player Account</h2>
@@ -2849,10 +2905,11 @@
 
               <form id="login-form" class="space-y-4">
                 <div>
-                  <label class="block text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">4-Digit Admin PIN</label>
-                  <input id="pin-input" type="password" inputmode="numeric" maxlength="4" placeholder="••••"
+                  <label for="pin-input" class="block text-xs font-semibold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">${adminSession ? 'Admin password' : '4-Digit Admin PIN'}</label>
+                  <input id="pin-input" type="password" ${adminSession ? 'maxlength="256" autocomplete="current-password"' : 'inputmode="numeric" maxlength="4" placeholder="••••"'} required
                     class="w-full px-4 py-2.5 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-center text-lg tracking-[0.4em] font-semibold focus:outline-none focus:ring-2 focus:ring-gold-500" />
                 </div>
+                ${adminAuthError ? `<p role="alert" class="text-xs text-red-600 dark:text-red-400">${esc(adminAuthError)}</p>` : ''}
                 <button type="submit" class="w-full py-2.5 px-4 rounded-xl bg-gold-500 hover:bg-gold-400 text-stone-950 font-semibold text-sm transition shadow-sm">
                   Enter as Admin
                 </button>
@@ -4894,9 +4951,12 @@
 
       function bindLoginEvents() {
         bindThemeButtons();
-        document.getElementById('login-form').addEventListener('submit', (e) => {
+        document.getElementById('login-form').addEventListener('submit', async (e) => {
           e.preventDefault();
-          loginAdmin(document.getElementById('pin-input').value.trim());
+          const submit = e.currentTarget.querySelector('button[type="submit"]');
+          submit.disabled = true;
+          await loginAdmin(document.getElementById('pin-input').value);
+          submit.disabled = false;
         });
         document.getElementById('guest-btn').addEventListener('click', loginGuest);
         document.getElementById('player-login-form')?.addEventListener('submit', async event => {
@@ -6117,11 +6177,11 @@
                   <label class="block font-semibold text-stone-500 mb-1">Backend API URL (optional)</label>
                   <input id="sync-api-url" type="url" value="${esc(state.sync?.apiUrl || '')}" placeholder="Leave blank to use this Vercel deployment" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
                 </div>
-                <div>
+                ${usesAdminSession() ? '' : `<div>
                   <label class="block font-semibold text-stone-500 mb-1">Admin Sync Key</label>
                   <input id="sync-api-key" type="password" value="${esc(state.sync?.syncKey || '')}" placeholder="Required when ADMIN_SYNC_KEY is set on the backend" autocomplete="off" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
                   <p class="mt-1 text-[11px] text-stone-500">Enter the same value configured in the backend’s <code>.env</code> file or Vercel environment. For local use, open the app on port 3001; the 8080 preview now connects to that backend.</p>
-                </div>
+                </div>`}
               </div>
               <div class="flex flex-wrap justify-between gap-2 pt-1">
                 <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Close</button>
@@ -6133,19 +6193,62 @@
             </div>
           `);
           document.getElementById('modal-cancel').addEventListener('click', closeModal);
-          const saveInputs = () => {
+          const saveInputs = async () => {
             if (!state.sync) state.sync = { apiUrl: '', syncKey: '', status: 'local', lastSynced: null };
-            state.sync.apiUrl = (document.getElementById('sync-api-url').value || '').trim().replace(/\/+$/, '');
-            state.sync.syncKey = (document.getElementById('sync-api-key').value || '').trim();
-            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) {}
+            const previousUrl = state.sync.apiUrl;
+            const previousSession = usesAdminSession();
+            const nextUrl = (document.getElementById('sync-api-url').value || '').trim().replace(/\/+$/, '');
+            if (nextUrl) {
+              try {
+                new URL(nextUrl);
+              } catch (_err) {
+                showToast('Enter a valid backend URL', 'error');
+                return false;
+              }
+            }
+            state.sync.apiUrl = nextUrl;
+            const validUrl = getSyncApiUrl();
+            const nextSession = usesAdminSession();
+            state.sync.apiUrl = previousUrl;
+            if (nextUrl && !validUrl) {
+              showToast('Enter an HTTPS backend URL or a localhost HTTP URL', 'error');
+              return false;
+            }
+            if (previousSession !== nextSession) {
+              if (syncTimer || syncInFlight || ['pending', 'syncing', 'error'].includes(state.sync.status)) {
+                showToast('Resolve unsynced changes before changing the backend', 'error');
+                return false;
+              }
+              if (previousSession) {
+                try {
+                  await requestAdminSession('/api/admin-auth/logout', { method: 'POST' });
+                } catch (err) {
+                  showToast(`Could not end the admin session: ${err.message}`, 'error');
+                  return false;
+                }
+              }
+              state.sync.apiUrl = nextUrl;
+              state.auth.loggedIn = false;
+              state.auth.role = 'guest';
+              saveRegistry();
+              closeModal();
+              render();
+              showToast('Backend changed. Sign in again to continue.', 'success');
+              return false;
+            }
+            state.sync.apiUrl = nextUrl;
+            const keyInput = document.getElementById('sync-api-key');
+            if (keyInput) state.sync.syncKey = keyInput.value.trim();
+            saveRegistry();
+            return true;
           };
           document.getElementById('sync-pull-btn').addEventListener('click', async () => {
-            saveInputs();
+            if (!await saveInputs()) return;
             closeModal();
             await pullFromTurso(false);
           });
           document.getElementById('sync-save-push-btn').addEventListener('click', async () => {
-            saveInputs();
+            if (!await saveInputs()) return;
             closeModal();
             await pushToTurso(false);
             render();
@@ -6855,6 +6958,28 @@
       (async () => {
         if (playerInviteToken) {
           await loadPlayerInvite();
+        } else if (usesAdminSession() && (state.auth.role === 'admin' || !state.auth.loggedIn)) {
+          try {
+            await requestAdminSession('/api/admin-auth/me');
+            state.auth.loggedIn = true;
+            state.auth.role = 'admin';
+            Object.values(registry.items).forEach(tournament => {
+              if (tournament.sync) tournament.sync.syncKey = '';
+            });
+            state.sync.syncKey = '';
+            saveRegistry();
+          } catch (err) {
+            if (state.auth.role === 'admin') {
+              state.auth.loggedIn = false;
+              state.auth.role = 'guest';
+              saveRegistry();
+            }
+            if (err.status !== 401) {
+              console.error('Could not restore admin session:', err);
+              adminAuthError = `Admin session could not be restored: ${err.message}`;
+            }
+            if (!state.auth.loggedIn) await restorePlayerSession();
+          }
         } else if (state.auth.role === 'player' || !state.auth.loggedIn) {
           await restorePlayerSession();
         }

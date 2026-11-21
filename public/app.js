@@ -247,6 +247,7 @@
             venue: 'Orange County Badminton Club',
             rules: '',
             numGroups: DEFAULT_GROUP_COUNT,
+            rosterTarget: null,
             playersPerGroup: 6,
             matchesPerPlayer: 4,
             qr2MatchesPerPlayer: 4,
@@ -865,29 +866,40 @@
         return profiles;
       }
 
-      function addPlayerProfileToGroup(groupIndex, profile) {
+      function addPlayerProfilesToGroup(groupIndex, profiles) {
+        if (state.auth.role !== 'admin') return false;
         const group = state.groups[groupIndex];
-        const name = String(profile?.name || '').trim();
-        if (!group || !name || !isValidPlayerId(profile.playerId)) {
-          showToast('Choose a player profile with a valid player ID', 'error');
+        if (!group || !profiles.length || profiles.some(profile => !String(profile?.name || '').trim() || !isValidPlayerId(profile?.playerId))) {
+          showToast('Choose player profiles with valid player IDs', 'error');
           return false;
         }
-        if (isPlayerProfileInRoster(profile)) {
-          showToast(`${profile.displayName || name} is already in this tournament`, 'error');
-          return false;
+        for (let index = 0; index < profiles.length; index++) {
+          const profile = profiles[index];
+          if (isPlayerProfileInRoster(profile) || profiles.slice(0, index).some(other =>
+            other.playerId === profile.playerId || samePlayerIdentity(other, profile))) {
+            showToast(`${profile.displayName || profile.name} is already selected or in this tournament`, 'error');
+            return false;
+          }
         }
 
-        group.players.push(name);
-        setPlayerSkill(name, profile.skill ?? 5);
-        if (!group.leader) group.leader = name;
-        [name, ...(Array.isArray(profile.aliases) ? profile.aliases : [])].forEach(alias => {
-          const key = normalizeImportName(alias);
-          if (key) state.playerProfileIds[key] = profile.playerId;
+        profiles.forEach(profile => {
+          const name = String(profile.name).trim();
+          group.players.push(name);
+          setPlayerSkill(name, profile.skill ?? 5);
+          if (!group.leader) group.leader = name;
+          [name, ...(Array.isArray(profile.aliases) ? profile.aliases : [])].forEach(alias => {
+            const key = normalizeImportName(alias);
+            if (key) state.playerProfileIds[key] = profile.playerId;
+          });
         });
         saveState();
         render();
-        showToast(`Added ${profile.displayName || name} to ${group.name}`, 'success');
+        showToast(`Added ${profiles.length} ${profiles.length === 1 ? 'player' : 'players'} to ${group.name}`, 'success');
         return true;
+      }
+
+      function addPlayerProfileToGroup(groupIndex, profile) {
+        return addPlayerProfilesToGroup(groupIndex, [profile]);
       }
 
       function isPlayerProfileInRoster(profile) {
@@ -3160,8 +3172,9 @@
                     <input id="cfg-num-groups" type="number" min="2" max="8" value="${c.numGroups}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
-                    <label for="cfg-total-players" class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Rostered Players</label>
-                    <input id="cfg-total-players" type="number" value="${totalPlayers}" readonly class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <label for="cfg-total-players" class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Rostered Players Target</label>
+                    <input id="cfg-total-players" type="number" min="0" step="1" value="${c.rosterTarget ?? totalPlayers}" ${state.auth.role === 'admin' ? '' : 'readonly'} aria-describedby="cfg-total-players-help" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <p id="cfg-total-players-help" class="mt-1 text-xs text-stone-500">${totalPlayers} actually rostered. Target is for planning only; edit groups to change the roster.</p>
                   </div>
                   <div>
                     <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Players / Group Target</label>
@@ -4047,14 +4060,14 @@
           .filter(profile => profile && profile.name && isValidPlayerId(profile.playerId))
           .filter(profile => !isPlayerProfileInRoster(profile))
           .sort((a, b) => (a.displayName || a.name).localeCompare(b.displayName || b.name));
-        let selectedPlayerId = availableProfiles[0]?.playerId || '';
+        const selectedPlayerIds = new Set();
         openModal(`
           <div class="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 sm:p-6 space-y-4">
             <div class="flex items-start justify-between gap-3">
               <div>
                 <p class="text-[10px] uppercase tracking-[0.18em] font-bold text-gold-700 dark:text-gold-400">Player directory</p>
-                <h3 class="mt-1 text-lg font-bold">Add a player to ${esc(group.name)}</h3>
-                <p class="mt-1 text-xs text-stone-500">The profile skill is used initially; you can override it for this tournament.</p>
+                <h3 class="mt-1 text-lg font-bold">Add players to ${esc(group.name)}</h3>
+                <p class="mt-1 text-xs text-stone-500">Select one or more players. Profile skills are used initially; you can override them for this tournament.</p>
               </div>
               <span class="shrink-0 rounded-full bg-stone-100 dark:bg-[#111214] px-2.5 py-1 text-[10px] font-semibold text-stone-500">${availableProfiles.length} available</span>
             </div>
@@ -4062,8 +4075,8 @@
               <label class="sr-only" for="group-profile-search">Search by name, player code, or club</label>
               <input id="group-profile-search" type="search" placeholder="Search name, 6-digit code, or club..." class="w-full px-4 py-3 rounded-xl bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm focus:outline-none focus:ring-2 focus:ring-gold-500/50" />
               <div id="group-profile-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[48vh] overflow-y-auto pr-1">
-                ${availableProfiles.map((profile, index) => `
-                  <button type="button" data-group-profile-id="${esc(profile.playerId)}" data-profile-search="${esc(`${profile.displayName || profile.name} ${profile.playerCode || ''} ${profile.club || ''}`.toLocaleLowerCase())}" aria-pressed="${index === 0}" class="group w-full flex items-center gap-3 rounded-xl border ${index === 0 ? 'border-gold-500 bg-gold-500/10 ring-1 ring-gold-500/30' : 'border-stone-200 dark:border-stone-700 hover:border-gold-500/60'} p-3 text-left transition">
+                ${availableProfiles.map(profile => `
+                  <button type="button" data-group-profile-id="${esc(profile.playerId)}" data-profile-search="${esc(`${profile.displayName || profile.name} ${profile.playerCode || ''} ${profile.club || ''}`.toLocaleLowerCase())}" aria-pressed="false" class="group w-full flex items-center gap-3 rounded-xl border border-stone-200 dark:border-stone-700 hover:border-gold-500/60 p-3 text-left transition">
                     ${getPlayerAvatar(profile.displayName || profile.name, profile, 'w-11 h-11')}
                     <span class="min-w-0 flex-1">
                       <span class="block truncate text-sm font-bold">${esc(profile.displayName || profile.name)}</span>
@@ -4082,7 +4095,7 @@
               <button id="group-create-profile-btn" type="button" class="px-3 py-2.5 rounded-lg border border-gold-500/40 text-xs font-semibold text-gold-700 dark:text-gold-400 hover:bg-gold-500/10">Create new player profile</button>
               <div class="flex justify-end gap-2">
                 <button id="group-player-picker-cancel" type="button" class="px-3 py-2.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
-                <button id="group-player-picker-add" type="button" ${selectedPlayerId ? '' : 'disabled'} class="px-4 py-2.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold disabled:opacity-50">Add selected player</button>
+                <button id="group-player-picker-add" type="button" disabled class="px-4 py-2.5 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold disabled:opacity-50">Add selected players (0)</button>
               </div>
             </div>
           </div>
@@ -4096,38 +4109,33 @@
         const cards = [...document.querySelectorAll('[data-group-profile-id]')];
         const addButton = document.getElementById('group-player-picker-add');
         cards.forEach(card => card.addEventListener('click', () => {
-          selectedPlayerId = card.getAttribute('data-group-profile-id');
-          cards.forEach(item => {
-            const selected = item === card;
-            item.setAttribute('aria-pressed', String(selected));
-            item.classList.toggle('border-gold-500', selected);
-            item.classList.toggle('border-stone-200', !selected);
-            item.classList.toggle('dark:border-stone-700', !selected);
-            item.classList.toggle('bg-gold-500/10', selected);
-            item.classList.toggle('ring-1', selected);
-            item.classList.toggle('ring-gold-500/30', selected);
-          });
-          addButton.disabled = false;
+          const playerId = card.getAttribute('data-group-profile-id');
+          if (selectedPlayerIds.has(playerId)) selectedPlayerIds.delete(playerId);
+          else selectedPlayerIds.add(playerId);
+          const selected = selectedPlayerIds.has(playerId);
+          card.setAttribute('aria-pressed', String(selected));
+          card.classList.toggle('border-gold-500', selected);
+          card.classList.toggle('border-stone-200', !selected);
+          card.classList.toggle('dark:border-stone-700', !selected);
+          card.classList.toggle('bg-gold-500/10', selected);
+          card.classList.toggle('ring-1', selected);
+          card.classList.toggle('ring-gold-500/30', selected);
+          addButton.disabled = selectedPlayerIds.size === 0;
+          addButton.textContent = `Add selected players (${selectedPlayerIds.size})`;
         }));
         search?.addEventListener('input', () => {
           const query = search.value.toLocaleLowerCase().trim();
           let visibleCount = 0;
           cards.forEach(card => {
             const visible = !query || card.getAttribute('data-profile-search').includes(query);
-            card.hidden = !visible;
+            card.classList.toggle('hidden', !visible);
             if (visible) visibleCount++;
           });
           document.getElementById('group-profile-empty-search').classList.toggle('hidden', visibleCount > 0);
-          addButton.disabled = !selectedPlayerId || cards.find(card => card.getAttribute('data-group-profile-id') === selectedPlayerId)?.hidden;
         });
         document.getElementById('group-player-picker-add').addEventListener('click', () => {
-          const profile = availableProfiles.find(item => item.playerId === selectedPlayerId);
-          if (!profile) {
-            showToast('Select an available player profile', 'error');
-            return;
-          }
-          closeModal();
-          addPlayerProfileToGroup(groupIndex, profile);
+          const selected = availableProfiles.filter(profile => selectedPlayerIds.has(profile.playerId));
+          if (addPlayerProfilesToGroup(groupIndex, selected)) closeModal();
         });
       }
 
@@ -6667,6 +6675,19 @@
 
         // Setup bindings
         document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5));
+        document.getElementById('cfg-total-players')?.addEventListener('change', event => {
+          const input = event.currentTarget;
+          if (state.auth.role !== 'admin') return;
+          const count = input.valueAsNumber;
+          if (input.value !== '' && (!Number.isSafeInteger(count) || count < 0)) {
+            showToast('Rostered players target must be a non-negative whole number', 'error');
+            input.value = state.config.rosterTarget ?? state.groups.reduce((sum, group) => sum + group.players.length, 0);
+            return;
+          }
+          state.config.rosterTarget = input.value === '' ? null : count;
+          saveState();
+          render();
+        });
         document.getElementById('cfg-players-per-group')?.addEventListener('change', (e) => {
           const ppg = Math.max(4, Math.min(12, parseInt(e.target.value, 10) || 6));
           state.config.playersPerGroup = ppg;

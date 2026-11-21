@@ -58,6 +58,8 @@ Players register with an email and a password of at least 12 characters using an
 
 Players and admins can save an optional whole-number profile skill from 1 to 10. When a player is added to a tournament, that skill is copied to the tournament roster; an unset skill defaults to 5. Admins can override the tournament skill without changing the profile. Later profile changes do not alter existing tournament skills or overrides. The profile skill can be hidden on public player cards, but the tournament roster's skill remains visible to tournament viewers.
 
+In tournament setup, admins can select multiple unassigned profiles when adding players to a group. The editable rostered players target is for planning only; the actual count and schedules use the players assigned to groups.
+
 Player cards show a skill level based on the visible profile skill: Beginner (1–5), Intermediate (6–7), or Advanced (8–10). An unset or hidden skill has no public level. Match forecasts still use recorded match performance, not this profile-based level.
 
 ## Player profiles and performance

@@ -291,6 +291,14 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.deepEqual(correction.body.data.qr2Pools.A, []);
     const removeScoreFixture = await api('/api/tournaments/score-test', { method: 'DELETE', headers: adminHeaders });
     assert.equal(removeScoreFixture.response.status, 200);
+    assert.equal((await api('/api/tournaments/score-test')).body.exists, false);
+    const saveDeletedTournament = await api('/api/tournaments/score-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': correction.body.revision },
+      body: JSON.stringify(correction.body.data)
+    });
+    assert.equal(saveDeletedTournament.response.status, 409);
+    assert.equal((await api('/api/tournaments/score-test')).body.exists, false);
     const newTournament = (id, phase = 'setup', extra = {}) => api(`/api/tournaments/${id}`, {
       method: 'PUT',
       headers: { ...adminHeaders, 'x-tournament-revision': 'new' },

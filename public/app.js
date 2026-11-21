@@ -376,6 +376,7 @@
       let playerDataPromise = null;
       let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
       let tournamentCatalogPromise = null;
+      let remoteTournamentIds = null;
       let playerAccountProfile = null;
       let playerMustChangePassword = false;
       let playerInviteContext = null;
@@ -713,25 +714,19 @@
             return;
           }
           try {
-            const response = await fetch(`${apiUrl}/api/tournament-history`);
+            const response = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Tournament history request failed (HTTP ${response.status})`);
-            const combined = new Map((result.tournaments || []).map(tournament => [String(tournament.id), {
+            if (!Array.isArray(result.tournaments)) throw new Error('Invalid tournament history response');
+            tournamentCatalog.items = result.tournaments.map(tournament => ({
               ...tournament,
               id: String(tournament.id),
               name: tournament.name || tournament.data?.config?.name || 'Tournament',
               date: tournament.date || tournament.data?.config?.date || '',
               venue: tournament.data?.config?.venue || '',
               phase: tournament.phase || tournament.data?.phase || 'setup'
-            }]));
-            localTournaments.forEach(tournament => {
-              if (tournament.id === String(state.tournamentId) || !combined.has(tournament.id)) {
-                combined.set(tournament.id, tournament);
-              }
-            });
-            tournamentCatalog.items = [...combined.values()];
+            }));
           } catch (err) {
-            tournamentCatalog.items = localTournaments;
             tournamentCatalog.error = `Cloud tournament history could not be loaded: ${err.message}`;
           }
         })().finally(() => {
@@ -758,11 +753,10 @@
             const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`);
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Tournament request failed (HTTP ${response.status})`);
-            if (result.exists && result.data) {
-              data = result.data;
-              remoteRevision = result.revision;
-              remoteUpdatedAt = result.updatedAt;
-            }
+            if (!result.exists || !result.data) throw new Error('Tournament no longer exists; refresh the list');
+            data = result.data;
+            remoteRevision = result.revision;
+            remoteUpdatedAt = result.updatedAt;
           }
           if (!data || !data.config) throw new Error('Tournament data is incomplete');
           const previous = registry.items[id];
@@ -991,7 +985,7 @@
                   registry.items[t.id].config.date = t.date || registry.items[t.id].config.date;
                   registry.items[t.id].config.venue = t.venue || registry.items[t.id].config.venue;
                   registry.items[t.id].phase = t.phase || 'setup';
-                  registry.items[t.id].sync = { ...state.sync, revision: null, lastSynced: null };
+                  registry.items[t.id].sync = { ...state.sync, status: 'synced', revision: null, lastSynced: null, remoteListed: true };
                 }
               });
             }
@@ -1013,6 +1007,12 @@
             render();
             if (!silent) showToast('Loaded tournament from Turso DB', 'success');
           } else {
+            if ((startingRevision && startingRevision !== 'new') ||
+                (startingRevision === null && target.sync.remoteListed)) {
+              if (!silent) throw new Error('This tournament was deleted. Local changes have not been replaced.');
+              await refreshTournamentList(true);
+              return;
+            }
             state.sync.status = 'synced';
             state.sync.revision = 'new';
             saveRegistry();
@@ -1073,7 +1073,11 @@
           liveScoreRefreshErrorLogged = false;
           const badge = document.getElementById('sync-status-pill');
           if (badge) badge.textContent = 'Cloud Synced';
-          if (!result.exists || result.unchanged || !result.data) return;
+          if (!result.exists) {
+            await refreshTournamentList(true);
+            return;
+          }
+          if (result.unchanged || !result.data) return;
 
           const keepAuth = state.auth;
           const keepUi = state.ui;
@@ -1104,6 +1108,133 @@
           }
         } finally {
           liveScoreRefreshInProgress = false;
+        }
+      }
+
+      let tournamentListRefreshInProgress = false;
+      let tournamentListRefreshErrorLogged = false;
+      let tournamentListRenderPending = false;
+      let tournamentListCatalogSignature = null;
+      let deletedTournamentNotice = '';
+
+      async function refreshTournamentList(force = false) {
+        if (tournamentListRefreshInProgress || !state.auth.loggedIn ||
+            (!force && document.visibilityState === 'hidden')) return;
+        const apiUrl = getSyncApiUrl();
+        if (!apiUrl) return;
+        const target = state;
+        const generation = syncGeneration;
+        tournamentListRefreshInProgress = true;
+        try {
+          const response = await fetch(`${apiUrl}/api/tournaments`, { cache: 'no-store' });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || `Tournament list request failed (HTTP ${response.status})`);
+          if (!Array.isArray(result.tournaments)) throw new Error('Invalid tournament list response');
+          if (state !== target || syncGeneration !== generation) return;
+          tournamentListRefreshErrorLogged = false;
+          const remote = new Map(result.tournaments.map(tournament => [String(tournament.id), tournament]));
+          const previousIds = remoteTournamentIds;
+          remoteTournamentIds = new Set(remote.keys());
+          let changed = !previousIds || previousIds.size !== remote.size ||
+            [...previousIds].some(id => !remote.has(id));
+          remote.forEach((tournament, id) => {
+            if (registry.items[id]) return;
+            const item = createDefaultState(id, tournament.name);
+            item.config.date = tournament.date || item.config.date;
+            item.config.venue = tournament.venue || item.config.venue;
+            item.phase = tournament.phase || 'setup';
+            item.sync = { ...target.sync, status: 'synced', revision: null, lastSynced: null, remoteListed: true };
+            registry.items[id] = item;
+            changed = true;
+          });
+          Object.entries(registry.items).forEach(([id, item]) => {
+            if (id === String(target.tournamentId) || remote.has(id) || item.ui?.emptyTournament ||
+                item.sync?.status !== 'synced' || item.sync?.revision === 'new') return;
+            delete registry.items[id];
+            changed = true;
+          });
+
+          const activeId = String(target.tournamentId);
+          const deleted = !remote.has(activeId) && target.sync?.revision !== 'new' &&
+            (target.sync?.revision || target.sync?.remoteListed);
+          const modalOpen = !document.getElementById('modal-root').classList.contains('hidden');
+          if (deleted) {
+            const hasLocalChanges = ['pending', 'syncing', 'error'].includes(target.sync.status) ||
+              scoreSaveInProgress || checkInSaveInProgress || isEditingFormField() || hasUnsavedScoreEntry() || modalOpen;
+            if (hasLocalChanges) {
+              if (deletedTournamentNotice !== activeId) {
+                showToast('This tournament was deleted in another session. Your edits have not been replaced; copy them before leaving, as they cannot be synced to the deleted tournament.', 'error');
+                deletedTournamentNotice = activeId;
+              }
+            } else {
+              const next = result.tournaments[0];
+              let nextData;
+              let nextRevision = 'new';
+              let nextUpdatedAt = null;
+              if (next) {
+                const nextResponse = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(next.id)}`, { cache: 'no-store' });
+                const nextResult = await nextResponse.json();
+                if (!nextResponse.ok) throw new Error(nextResult.error || `Tournament request failed (HTTP ${nextResponse.status})`);
+                if (!nextResult.exists || !nextResult.data || !nextResult.revision) return;
+                nextData = nextResult.data;
+                nextRevision = nextResult.revision;
+                nextUpdatedAt = nextResult.updatedAt;
+              } else {
+                nextData = createDefaultState(`t_${createUniqueId()}`, 'New Tournament');
+              }
+              if (state !== target || syncGeneration !== generation || target.sync.status !== 'synced' ||
+                  scoreSaveInProgress || checkInSaveInProgress || isEditingFormField() || hasUnsavedScoreEntry() ||
+                  !document.getElementById('modal-root').classList.contains('hidden')) return;
+              const nextId = next ? String(next.id) : nextData.tournamentId;
+              const nextUi = { ...target.ui };
+              if (next) delete nextUi.emptyTournament;
+              else nextUi.emptyTournament = true;
+              state = normalizeTournamentState({
+                ...nextData, tournamentId: nextId, auth: target.auth, ui: nextUi,
+                sync: { ...target.sync, status: 'synced', revision: nextRevision, lastSynced: nextUpdatedAt }
+              }, nextId);
+              delete registry.items[activeId];
+              registry.items[nextId] = state;
+              playerData.loaded = false;
+              playerData.tournaments = playerData.tournaments.filter(tournament =>
+                String(tournament.id || tournament.tournamentId) !== activeId
+              );
+              window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
+              deletedTournamentNotice = '';
+              changed = true;
+              showToast('The selected tournament was deleted in another session.', 'error');
+            }
+          } else {
+            deletedTournamentNotice = '';
+          }
+          if (changed) {
+            saveRegistry();
+            tournamentListRenderPending = true;
+          }
+          if (tournamentListRenderPending && !isEditingFormField() && !hasUnsavedScoreEntry() &&
+              !scoreSaveInProgress && !checkInSaveInProgress && !modalOpen) {
+            tournamentListRenderPending = false;
+            render();
+          }
+
+          const signature = JSON.stringify(result.tournaments.map(tournament =>
+            [String(tournament.id), tournament.updated_at, tournament.name, tournament.phase]));
+          if (state.ui.activeTab === 'tournaments' && !tournamentCatalog.loading &&
+              !isEditingFormField() && !modalOpen && signature !== tournamentListCatalogSignature) {
+            const before = JSON.stringify([tournamentCatalog.items, tournamentCatalog.error]);
+            await loadTournamentCatalog(true);
+            if (!tournamentCatalog.error) tournamentListCatalogSignature = signature;
+            if (state.ui.activeTab === 'tournaments' &&
+                before !== JSON.stringify([tournamentCatalog.items, tournamentCatalog.error])) render();
+          }
+        } catch (err) {
+          if (!tournamentListRefreshErrorLogged) {
+            console.error('Tournament list refresh failed:', err);
+            showToast(`Could not refresh tournaments: ${err.message}`, 'error');
+            tournamentListRefreshErrorLogged = true;
+          }
+        } finally {
+          tournamentListRefreshInProgress = false;
         }
       }
 
@@ -1184,7 +1315,7 @@
         if (!next) return;
         const keepAuth = state.auth;
         const keepSync = state.sync;
-        state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey } }, id);
+        state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey, remoteListed: Boolean(next.sync?.remoteListed) } }, id);
         state.ui.activeTab = getRequestedPage();
         if (state.auth.role === 'guest' && state.ui.activeTab === 'setup') state.ui.activeTab = 'dashboard';
         window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
@@ -2976,7 +3107,11 @@
                   </svg>
                 </div>
                 <select id="tournament-switcher" aria-label="Switch current tournament" class="font-bold text-sm sm:text-base tracking-tight bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 rounded-lg px-2.5 py-1 max-w-[240px] sm:max-w-xs truncate">
-                  ${Object.values(registry.items).map(t => `<option value="${esc(t.tournamentId)}" ${t.tournamentId === state.tournamentId ? 'selected' : ''}>${esc(t.config?.name || 'Tournament')}</option>`).join('')}
+                  ${Object.values(registry.items).filter(t =>
+                    !getSyncApiUrl() || !remoteTournamentIds || remoteTournamentIds.has(String(t.tournamentId)) ||
+                    String(t.tournamentId) === String(state.tournamentId) ||
+                    (t.sync?.status !== 'synced' && t.sync?.revision !== null)
+                  ).map(t => `<option value="${esc(t.tournamentId)}" ${t.tournamentId === state.tournamentId ? 'selected' : ''}>${esc(t.config?.name || 'Tournament')}</option>`).join('')}
                 </select>
                 ${state.phase !== 'setup' && phaseLabels[state.phase] ? `<span class="px-2 py-0.5 text-xs font-semibold rounded-full bg-gold-500/15 text-gold-600 dark:text-gold-400 border border-gold-500/30">${state.phase === 'completed' && state.closedEarly ? 'Closed' : phaseLabels[state.phase]}</span>` : ''}
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full ${isAdmin ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' : state.auth.role === 'player' ? 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border border-blue-500/30' : 'bg-stone-200 dark:bg-stone-800 text-stone-600 dark:text-stone-300'}">${roleLabel}</span>
@@ -3968,7 +4103,7 @@
                 ${state.auth.role === 'admin' ? '<button id="new-tournament-btn" class="px-3 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold">+ New Tournament</button>' : ''}
               </div>
             </div>
-            ${tournamentCatalog.error ? `<p role="status" class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">${esc(tournamentCatalog.error)} Showing tournaments saved in this browser.</p>` : ''}
+            ${tournamentCatalog.error ? `<p role="status" class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">${esc(tournamentCatalog.error)} Previously loaded results may be stale.</p>` : ''}
             ${tournamentCatalog.loading ? '<p class="rounded-lg border border-stone-200 dark:border-stone-800 p-3 text-xs text-stone-500">Loading tournament history…</p>' : ''}
             ${tournamentCatalog.loaded && !tournamentCatalog.items.length ? renderEmptyState('No tournaments yet', 'Create a tournament or connect to a database to see saved events here.') : ''}
             ${section('Current & Upcoming', currentTournaments, 'No current or upcoming tournaments. Completed events are listed below.')}
@@ -7089,6 +7224,7 @@
 
       window.addEventListener('focus', () => {
         refreshLiveScores();
+        refreshTournamentList();
         if (!playerData.loaded || playerData.loading || state.ui.activeTab !== 'players' || !getSyncApiUrl()) return;
         loadPlayerData(true).then(() => {
           if (state.ui.activeTab === 'players') render();
@@ -7100,7 +7236,10 @@
       });
 
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') refreshLiveScores();
+        if (document.visibilityState === 'visible') {
+          refreshLiveScores();
+          refreshTournamentList();
+        }
       });
 
       async function refreshPlayerDirectory() {
@@ -7150,6 +7289,7 @@
         if (getSyncApiUrl()) {
           await pullFromTurso(true);
           window.setInterval(refreshLiveScores, 2000);
+          window.setInterval(refreshTournamentList, 2000);
           window.setInterval(refreshPlayerDirectory, 2000);
         }
       })();

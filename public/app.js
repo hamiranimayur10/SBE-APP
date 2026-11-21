@@ -555,10 +555,12 @@
           playerId: profile.playerId || createUniqueId(),
           playerCode: profile.playerCode || createPlayerCode(usedCodes)
         };
-        const profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
+        const profiles = playerData.profiles.filter(item =>
+          !(profile.playerId && item.playerId === profile.playerId) && !samePlayerIdentity(item, profile)
+        );
         profiles.push(savedProfile);
         playerData.profiles = profiles;
-        playerData.loaded = true;
+        playerData.loaded = !getSyncApiUrl();
         try {
           localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(profiles));
         } catch (_err) {
@@ -663,7 +665,11 @@
       }
 
       async function loadPlayerData(force) {
-        if (playerData.loading) return playerDataPromise;
+        if (playerData.loading) {
+          await playerDataPromise;
+          if (force) return loadPlayerData(true);
+          return;
+        }
         if (playerData.loaded && !force) return;
         playerData.loading = true;
         playerData.error = '';
@@ -676,43 +682,19 @@
             return;
           }
           try {
-            const [historyResponse, profilesResponse] = await Promise.all([
-              fetch(`${apiUrl}/api/tournament-history`),
-              fetch(`${apiUrl}/api/players`)
-            ]);
+            const historyResponse = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
             const historyJson = await historyResponse.json();
-            const profilesJson = await profilesResponse.json();
             if (!historyResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${historyResponse.status})`);
-            if (!profilesResponse.ok) throw new Error(profilesJson.error || `Profiles request failed (HTTP ${profilesResponse.status})`);
-            const tournaments = new Map((historyJson.tournaments || []).map(tournament => [String(tournament.id), tournament]));
-            localTournaments.forEach(tournament => {
-              const id = String(tournament.id);
-              const remote = tournaments.get(id);
-              const localSyncStatus = tournament.data?.sync?.status;
-              const localSyncedAt = Date.parse(tournament.data?.sync?.lastSynced || '');
-              const remoteUpdatedAt = Date.parse(remote?.updatedAt || '');
-              if (!remote || localSyncStatus !== 'synced' || !Number.isFinite(remoteUpdatedAt) ||
-                (Number.isFinite(localSyncedAt) && localSyncedAt >= remoteUpdatedAt)) {
-                const data = {
-                  ...(remote?.data || {}),
-                  ...(tournament.data || {}),
-                  playerProfileIds: {
-                    ...(tournament.data?.playerProfileIds || {}),
-                    ...(remote?.data?.playerProfileIds || {})
-                  }
-                };
-                tournaments.set(id, { ...(remote || {}), ...tournament, id, data });
-              }
-            });
-            playerData.tournaments = [...tournaments.values()];
-            const profiles = Array.isArray(profilesJson.players) ? profilesJson.players : [];
-            playerData.profiles = playerAccountProfile
-              ? [...profiles.filter(profile => !samePlayerIdentity(profile, playerAccountProfile)), playerAccountProfile]
-              : profiles;
+            if (!Array.isArray(historyJson.tournaments) || !Array.isArray(historyJson.players)) {
+              throw new Error('Invalid player directory response');
+            }
+            playerData.tournaments = historyJson.tournaments;
+            if (state.auth.role === 'player' && historyJson.ownPlayer) playerAccountProfile = historyJson.ownPlayer;
+            playerData.profiles = playerAccountProfile && state.auth.role === 'player'
+              ? [...historyJson.players.filter(profile => profile.playerId !== playerAccountProfile.playerId), playerAccountProfile]
+              : historyJson.players;
           } catch (err) {
-            playerData.tournaments = localTournaments;
-            playerData.profiles = getLocalPlayerProfiles();
-            playerData.error = `Could not load cloud player data: ${err.message}`;
+            playerData.error = `Could not load current cloud player data: ${err.message}`;
           }
         })().finally(() => {
           playerData.loading = false;
@@ -824,9 +806,9 @@
         }
       }
 
-      async function persistPlayerProfile(profile) {
+      async function persistPlayerProfile(profile, current) {
         const apiUrl = getSyncApiUrl();
-        const existing = playerData.profiles.find(item => samePlayerIdentity(item, profile));
+        const existing = current || playerData.profiles.find(item => samePlayerIdentity(item, profile));
         let savedProfile = {
           ...profile,
           playerId: profile.playerId || existing?.playerId || createUniqueId(),
@@ -835,9 +817,9 @@
           )
         };
         if (apiUrl) {
-          const response = await fetch(`${apiUrl}/api/players/${encodeURIComponent(profile.name)}`, {
+          const response = await fetch(`${apiUrl}/api/players/${encodeURIComponent(current?.name || profile.name)}`, {
             method: 'PUT',
-            headers: getSyncHeaders(),
+            headers: { ...getSyncHeaders(), 'x-player-revision': current?.revision || 'new' },
             body: JSON.stringify(savedProfile)
           });
           const result = await response.json();
@@ -885,7 +867,7 @@
         const apiUrl = getSyncApiUrl();
         let profiles;
         if (apiUrl) {
-          const response = await fetch(`${apiUrl}/api/players`);
+          const response = await fetch(`${apiUrl}/api/players`, { cache: 'no-store' });
           let result;
           try { result = await response.json(); } catch (_err) {
             throw new Error(`Unexpected response from player profiles (HTTP ${response.status})`);
@@ -896,12 +878,8 @@
           profiles = getLocalPlayerProfiles();
         }
 
-        const merged = [...profiles];
-        getLocalPlayerProfiles().forEach(profile => {
-          if (!merged.some(existing => samePlayerIdentity(existing, profile))) merged.push(profile);
-        });
-        playerData.profiles = merged;
-        return merged;
+        playerData.profiles = profiles;
+        return profiles;
       }
 
       function addPlayerProfileToGroup(groupIndex, profile, skill) {
@@ -1144,7 +1122,10 @@
           const response = await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
             method: 'POST',
             headers: getSyncHeaders(),
-            body: JSON.stringify({ playerName, groupName, skill, checkedIn, time, source, walkIn })
+            body: JSON.stringify({
+              playerName, groupName, skill, checkedIn, time, source, walkIn,
+              playerId: state.playerProfileIds?.[normalizeImportName(playerName)] || ''
+            })
           });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Check-in sync failed (HTTP ${response.status})`);
@@ -1397,7 +1378,7 @@
         const apiUrl = getSyncApiUrl();
         if (apiUrl) state.sync.status = 'pending';
         saveRegistry();
-        if (playerData.loaded) {
+        if (playerData.loaded && !apiUrl) {
           const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
           tournaments.set(String(state.tournamentId), { id: String(state.tournamentId), data: state });
           playerData.tournaments = [...tournaments.values()];
@@ -1410,6 +1391,10 @@
 
       function upsertPlayerDataTournament(id, data, updatedAt) {
         if (!playerData.loaded) return;
+        if (getSyncApiUrl()) {
+          playerData.loaded = false;
+          return;
+        }
         const key = String(id);
         const tournaments = new Map(playerData.tournaments.map(tournament => [String(tournament.id || tournament.tournamentId), tournament]));
         const current = tournaments.get(key) || {};
@@ -2471,7 +2456,9 @@
 
       function removeCachedPlayerProfile(profile) {
         const matchesDeletedPlayer = item =>
-          (profile.playerId && item.playerId === profile.playerId) || samePlayerIdentity(item, profile);
+          profile.playerId && item.playerId
+            ? item.playerId === profile.playerId
+            : samePlayerIdentity(item, profile);
         playerData.profiles = playerData.profiles.filter(item => !matchesDeletedPlayer(item));
         try {
           const cached = JSON.parse(localStorage.getItem(PLAYER_PROFILES_KEY) || '[]');
@@ -2486,7 +2473,15 @@
       }
 
       function refreshLocalTournamentStates(updatedTournamentIds, deletedPlayer, anonymizedName) {
+        if (hasUnsyncedPlayerDeletionChanges()) {
+          throw new Error('Local tournament changes are unsynced; resolve them before refreshing history');
+        }
         const updatedIds = new Set((updatedTournamentIds || []).map(String));
+        for (const [id, tournament] of Object.entries(registry.items || {})) {
+          if (updatedIds.has(String(id)) && tournament.sync?.status !== 'synced') {
+            throw new Error('A local tournament has not been synced; resolve it before refreshing history');
+          }
+        }
         Object.entries(registry.items || {}).forEach(([id, tournament]) => {
           const anonymized = anonymizeLocalTournamentState(tournament, deletedPlayer, anonymizedName);
           if (updatedIds.has(String(id))) {
@@ -2504,11 +2499,17 @@
 
       async function refreshAnonymizedTournaments(tournamentIds) {
         for (const id of tournamentIds || []) {
+          if (hasUnsyncedPlayerDeletionChanges()) {
+            throw new Error('Local tournament changes are unsynced; resolve them before refreshing history');
+          }
           const tournament = await requestAdminApi(`/api/tournaments/${encodeURIComponent(id)}`);
           if (!tournament.exists || !tournament.data) {
             throw new Error(`Updated tournament ${id} could not be reloaded`);
           }
           const previous = registry.items[String(id)] || createDefaultState(id, tournament.data.config?.name || 'Tournament');
+          if (registry.items[String(id)] && previous.sync?.status !== 'synced') {
+            throw new Error('A local tournament has not been synced; resolve it before refreshing history');
+          }
           const refreshed = normalizeTournamentState({
             ...tournament.data,
             tournamentId: String(id),
@@ -2517,6 +2518,7 @@
             sync: {
               ...(previous.sync || {}),
               status: 'synced',
+              revision: tournament.revision,
               lastSynced: tournament.updatedAt || new Date().toISOString()
             }
           }, String(id));
@@ -2580,6 +2582,12 @@
         });
       }
 
+      function hasUnsyncedPlayerDeletionChanges() {
+        return Boolean(syncTimer || syncInFlight || scoreSaveInProgress ||
+          Object.values(registry.items || {}).some(tournament =>
+            ['pending', 'syncing', 'error'].includes(tournament.sync?.status)));
+      }
+
       function confirmBulkPlayerDeletion(profiles) {
         if (state.auth.role !== 'admin' || !profiles.length) return;
         openModal(`
@@ -2598,20 +2606,32 @@
           const button = event.currentTarget;
           button.disabled = true;
           document.getElementById('bulk-player-confirm-cancel').disabled = true;
+          if (hasUnsyncedPlayerDeletionChanges()) {
+            button.disabled = false;
+            document.getElementById('bulk-player-confirm-cancel').disabled = false;
+            showToast('Resolve unsynced tournament changes before deleting players', 'error');
+            return;
+          }
           const updatedIds = new Set();
-          let deletedCount = 0;
-          let failure = '';
           let cacheError = false;
-          for (const profile of profiles) {
-            button.textContent = `Deleting ${deletedCount + 1} of ${profiles.length}...`;
-            let result;
-            try {
-              result = await requestAdminApi(`/api/players/${encodeURIComponent(profile.name)}?playerId=${encodeURIComponent(profile.playerId)}`, { method: 'DELETE' });
-            } catch (err) {
-              failure = `${profile.name}: ${err.message}`;
-              break;
-            }
-            deletedCount++;
+          button.textContent = 'Deleting profiles...';
+          let deleted;
+          try {
+            const result = await requestAdminApi('/api/players/delete-batch', {
+              method: 'POST',
+              body: JSON.stringify({ players: profiles.map(profile => ({
+                name: profile.name, playerId: profile.playerId, revision: profile.revision
+              })) })
+            });
+            deleted = result.deleted;
+          } catch (err) {
+            button.disabled = false;
+            button.textContent = 'Delete profiles';
+            document.getElementById('bulk-player-confirm-cancel').disabled = false;
+            showToast(`Could not confirm player deletion: ${err.message}. Refresh the directory before retrying.`, 'error');
+            return;
+          }
+          for (const result of deleted) {
             (result.updatedTournamentIds || []).forEach(id => updatedIds.add(id));
             try {
               cacheError = !removeCachedPlayerProfile(result.deletedPlayer) || cacheError;
@@ -2619,12 +2639,10 @@
             } catch (err) {
               console.error('Player was deleted, but local history could not be updated:', err);
               cacheError = true;
-              failure = `local history update after deleting ${profile.name}: ${err.message}`;
-              break;
             }
           }
           let refreshError = '';
-          if (deletedCount) {
+          if (deleted.length) {
             try {
               await refreshAnonymizedTournaments([...updatedIds]);
             } catch (err) {
@@ -2641,11 +2659,10 @@
             saveRegistry();
             render();
           }
-          if (failure || refreshError || cacheError || playerData.error) {
+          if (refreshError || cacheError || playerData.error) {
             openModal(`
               <div role="alert" class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
-                <h3 class="text-base font-bold">Deleted ${deletedCount} of ${profiles.length} profiles</h3>
-                ${failure ? `<p class="text-xs text-red-600 dark:text-red-400">Deletion stopped at ${esc(failure)}. Remaining players were not deleted.</p>` : ''}
+                <h3 class="text-base font-bold">Deleted ${deleted.length} profiles</h3>
                 ${refreshError || cacheError || playerData.error ? `<p class="text-xs text-red-600 dark:text-red-400">Local history refresh needs attention${refreshError ? `: ${esc(refreshError)}` : ''}${playerData.error ? `: ${esc(playerData.error)}` : ''}.</p>` : ''}
                 <div class="flex justify-end"><button id="bulk-player-result-close" type="button" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Close</button></div>
               </div>
@@ -2653,12 +2670,13 @@
             document.getElementById('bulk-player-result-close').addEventListener('click', closeModal);
           } else {
             closeModal();
-            showToast(`Deleted ${deletedCount} player profile${deletedCount === 1 ? '' : 's'}; scores were anonymized`, 'success');
+            showToast(`Deleted ${deleted.length} player profile${deleted.length === 1 ? '' : 's'}; scores were anonymized`, 'success');
           }
         });
       }
 
-      function confirmAdminDeletePlayerProfile(playerName) {
+      function confirmAdminDeletePlayerProfile(profile) {
+        const playerName = profile.name;
         openModal(`
           <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-red-300 dark:border-red-900/60 p-6 space-y-4">
             <div>
@@ -2674,11 +2692,16 @@
         document.getElementById('admin-delete-profile-cancel').addEventListener('click', closeModal);
         document.getElementById('admin-delete-profile-confirm').addEventListener('click', async event => {
           const button = event.currentTarget;
+          if (hasUnsyncedPlayerDeletionChanges()) {
+            showToast('Resolve unsynced tournament changes before deleting players', 'error');
+            return;
+          }
           button.disabled = true;
           button.textContent = 'Deleting…';
           try {
-            const result = await requestAdminApi(`/api/players/${encodeURIComponent(playerName)}`, {
-              method: 'DELETE'
+            const result = await requestAdminApi(`/api/players/${encodeURIComponent(playerName)}?playerId=${encodeURIComponent(profile.playerId)}`, {
+              method: 'DELETE',
+              headers: { 'x-player-revision': profile.revision }
             });
             closeModal();
             const cacheRemoved = removeCachedPlayerProfile(result.deletedPlayer);
@@ -4209,7 +4232,7 @@
           const submit = event.currentTarget.querySelector('button[type="submit"]');
           submit.disabled = true;
           try {
-            const savedProfile = await persistPlayerProfile(profile);
+            const savedProfile = await persistPlayerProfile(profile, editing ? current : null);
             closeModal();
               if (onSaved) {
                 onSaved(savedProfile);
@@ -4335,10 +4358,12 @@
       function renderPlayerProfilesView() {
         const analytics = window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId);
         const directory = [...analytics.players]
-          .filter(player => !isAnonymizedPlayerName(player.name))
+          .filter(player => !isAnonymizedPlayerName(player.name) &&
+            (!getSyncApiUrl() || playerData.profiles.some(profile => samePlayerIdentity(profile, { name: player.name }))))
           .sort((a, b) => a.name.localeCompare(b.name));
         const playerSearch = (state.ui.playerSearch || '').toLocaleLowerCase().trim();
-        const selected = analytics.getPlayer(state.ui.selectedPlayerName) || directory[0] || null;
+        const requestedPlayer = analytics.getPlayer(state.ui.selectedPlayerName);
+        const selected = directory.find(player => player.key === requestedPlayer?.key) || directory[0] || null;
         const opponent = directory.find(player =>
           player.key !== selected?.key && player.key === window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent)
         ) || directory.find(player => player.key !== selected?.key) || null;
@@ -4392,7 +4417,7 @@
                 ${state.auth.role === 'admin' ? '<button id="player-bulk-delete-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete Players</button><button id="player-invites-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Player Invites</button><button id="player-add-profile-btn" class="px-3 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">+ Add Profile</button>' : ''}
               </div>
             </div>
-            ${playerData.error ? `<div role="status" class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-700 dark:text-amber-300">${esc(playerData.error)}. Showing locally available results.</div>` : ''}
+            ${playerData.error ? `<div role="status" class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-700 dark:text-amber-300">${esc(playerData.error)}. Previously loaded results may be out of date.</div>` : ''}
             ${playerData.loading ? `<div class="p-3 rounded-lg ${panelClass} text-xs text-stone-500">Loading player history…</div>` : ''}
             ${directory.length === 0 && !playerData.loading ? renderEmptyState('No players found', 'Add players to a tournament roster or create a player profile as an admin.') : `
               <div class="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-5 items-start">
@@ -5184,7 +5209,7 @@
         });
         document.getElementById('player-edit-own-profile-btn')?.addEventListener('click', () => {
           renderOwnPlayerProfileEditor(playerAccountProfile);
-          bindOwnPlayerProfileEditor();
+          bindOwnPlayerProfileEditor(playerAccountProfile.revision);
         });
         document.getElementById('player-change-password-btn')?.addEventListener('click', openPlayerPasswordChangeModal);
         document.getElementById('player-delete-own-account-btn')?.addEventListener('click', confirmPlayerAccountDeletion);
@@ -5215,7 +5240,7 @@
         });
       }
 
-      function bindOwnPlayerProfileEditor() {
+      function bindOwnPlayerProfileEditor(revision) {
         bindProfilePhotoControls('own-profile');
         document.getElementById('player-own-profile-cancel')?.addEventListener('click', closeModal);
         document.getElementById('player-own-profile-form')?.addEventListener('submit', async event => {
@@ -5252,6 +5277,7 @@
           try {
             const result = await requestPlayerApi('/api/player-auth/me', {
               method: 'PUT',
+              headers: { 'x-player-revision': revision },
               body: JSON.stringify(profile)
             });
             applyPlayerAccount(result.player);
@@ -6449,12 +6475,18 @@
         document.getElementById('player-invites-btn')?.addEventListener('click', () => {
           openPlayerInvitesModal().catch(err => showToast(`Could not open player invitations: ${err.message}`, 'error'));
         });
-        document.getElementById('player-edit-profile-btn')?.addEventListener('click', event => {
+        document.getElementById('player-edit-profile-btn')?.addEventListener('click', async event => {
           const selectedName = event.currentTarget.getAttribute('data-player-edit-name') || state.ui.selectedPlayerName;
-          const profile = playerData.profiles.find(item =>
-            window.PlayerAnalytics.normalizeName(item.name) === window.PlayerAnalytics.normalizeName(selectedName)
-          );
-          renderPlayerProfileEditor(profile || { name: selectedName });
+          try {
+            const profiles = getSyncApiUrl()
+              ? (await requestAdminApi('/api/player-import/directory')).profiles
+              : getLocalPlayerProfiles();
+            const profile = profiles.find(item => samePlayerIdentity(item, { name: selectedName }));
+            if (!profile) throw new Error('Player profile no longer exists; refresh the directory');
+            renderPlayerProfileEditor(profile);
+          } catch (err) {
+            showToast(`Could not load player profile: ${err.message}`, 'error');
+          }
         });
         document.getElementById('player-reset-password-btn')?.addEventListener('click', event => {
           resetPlayerPassword(event.currentTarget.getAttribute('data-player-account-name'));
@@ -6463,7 +6495,13 @@
           confirmAdminDeletePlayerLogin(event.currentTarget.getAttribute('data-player-account-name'));
         });
         document.getElementById('player-delete-profile-btn')?.addEventListener('click', event => {
-          confirmAdminDeletePlayerProfile(event.currentTarget.getAttribute('data-player-delete-name'));
+          const name = event.currentTarget.getAttribute('data-player-delete-name');
+          const profile = playerData.profiles.find(item => samePlayerIdentity(item, { name }));
+          if (!profile?.playerId || !profile.revision) {
+            showToast('Reload the player directory before deleting this profile', 'error');
+            return;
+          }
+          confirmAdminDeletePlayerProfile(profile);
         });
         document.getElementById('player-share-btn')?.addEventListener('click', () => {
           const shareUrl = new URL(window.location.href);
@@ -6925,7 +6963,7 @@
           } catch (err) {
             console.error('Could not refresh player match history from another tab:', err);
           }
-        } else if (event.key === PLAYER_PROFILES_KEY && event.newValue) {
+        } else if (event.key === PLAYER_PROFILES_KEY && event.newValue && !getSyncApiUrl()) {
           try {
             const profiles = JSON.parse(event.newValue);
             if (!Array.isArray(profiles)) throw new Error('Stored profiles are not a list');
@@ -6954,6 +6992,17 @@
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') refreshLiveScores();
       });
+
+      async function refreshPlayerDirectory() {
+        if (document.visibilityState === 'hidden' || !state.auth.loggedIn || state.ui.playerCheckInMode ||
+            state.ui.activeTab !== 'players' ||
+            !getSyncApiUrl() || playerData.loading || isEditingFormField() ||
+            !document.getElementById('modal-root').classList.contains('hidden')) return;
+        const before = JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error]);
+        await loadPlayerData(true);
+        if (state.ui.activeTab === 'players' &&
+            before !== JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error])) render();
+      }
 
       (async () => {
         if (playerInviteToken) {
@@ -6991,6 +7040,7 @@
         if (getSyncApiUrl()) {
           await pullFromTurso(true);
           window.setInterval(refreshLiveScores, 2000);
+          window.setInterval(refreshPlayerDirectory, 2000);
         }
       })();
     })();

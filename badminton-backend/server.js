@@ -21,6 +21,8 @@ const PROFILE_VISIBILITY_FIELDS = [
 ];
 
 class ValidationError extends Error {}
+class ConflictError extends Error {}
+class NotFoundError extends Error {}
 
 let db;
 function getDatabaseUrl() {
@@ -95,15 +97,23 @@ async function initSchema() {
         ['preferred_events', "TEXT NOT NULL DEFAULT '[]'"],
         ['email', "TEXT NOT NULL DEFAULT ''"],
         ['visibility', "TEXT NOT NULL DEFAULT '{}'"],
-        ['aliases', "TEXT NOT NULL DEFAULT '[]'"]
+        ['aliases', "TEXT NOT NULL DEFAULT '[]'"],
+        ['revision', 'TEXT']
       ];
       const profileInfo = await getDb().execute('PRAGMA table_info(player_profiles)');
       const existingColumns = new Set(profileInfo.rows.map(column => String(column.name)));
       for (const [name, definition] of profileColumns) {
         if (!existingColumns.has(name)) {
-          await getDb().execute(`ALTER TABLE player_profiles ADD COLUMN ${name} ${definition}`);
+          try {
+            await getDb().execute(`ALTER TABLE player_profiles ADD COLUMN ${name} ${definition}`);
+          } catch (err) {
+            if (!/duplicate column name/i.test(String(err.message))) throw err;
+            const columns = await getDb().execute('PRAGMA table_info(player_profiles)');
+            if (!columns.rows.some(column => String(column.name) === name)) throw err;
+          }
         }
       }
+      await getDb().execute("UPDATE player_profiles SET revision = lower(hex(randomblob(16))) WHERE revision IS NULL OR revision = ''");
       const profileRows = await getDb().execute('SELECT player_name, player_id, player_code FROM player_profiles ORDER BY player_name');
       const seenPlayerIds = new Set();
       const seenPlayerCodes = new Set();
@@ -139,15 +149,24 @@ async function initSchema() {
       }
       await getDb().execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_player_id ON player_profiles(player_id)');
       await getDb().execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_player_code ON player_profiles(player_code)');
-      const tournamentRows = await getDb().execute('SELECT id, data FROM tournaments');
-      const rosterNames = [];
-      for (const row of tournamentRows.rows) {
-        const tournament = JSON.parse(row.data);
-        rosterNames.push(...getTournamentRosterNames(tournament));
+      const rosterTransaction = await getDb().transaction('write');
+      try {
+        const tournamentRows = await rosterTransaction.execute('SELECT id, data FROM tournaments');
+        const rosterNames = [];
+        for (const row of tournamentRows.rows) {
+          const tournament = JSON.parse(row.data);
+          rosterNames.push(...getTournamentRosterNames(tournament));
+        }
+        const checkInRows = await rosterTransaction.execute('SELECT player_name FROM player_checkins');
+        rosterNames.push(...checkInRows.rows.map(row => row.player_name));
+        await ensurePlayerProfiles(rosterNames, rosterTransaction);
+        await rosterTransaction.commit();
+      } catch (err) {
+        await rosterTransaction.rollback();
+        throw err;
+      } finally {
+        rosterTransaction.close();
       }
-      const checkInRows = await getDb().execute('SELECT player_name FROM player_checkins');
-      rosterNames.push(...checkInRows.rows.map(row => row.player_name));
-      await ensurePlayerProfiles(rosterNames);
       await getDb().execute(`
         CREATE TABLE IF NOT EXISTS player_accounts (
           id TEXT PRIMARY KEY,
@@ -491,6 +510,7 @@ function serializePlayerProfile(row, publicView) {
   const profile = {
     playerId: row.player_id || '',
     playerCode: row.player_code || '',
+    revision: row.revision || '',
     name: row.player_name,
     displayName: visibility.name ? row.player_name : (row.nickname || 'Player'),
     aliases: parseJsonField(row.aliases, []),
@@ -518,19 +538,19 @@ function serializePlayerProfile(row, publicView) {
   return profile;
 }
 
-async function getPlayerProfile(name) {
-  const result = await getDb().execute({
+async function getPlayerProfile(name, executor = getDb()) {
+  const result = await executor.execute({
     sql: 'SELECT * FROM player_profiles WHERE player_name = ? COLLATE NOCASE LIMIT 1',
     args: [String(name || '').trim()]
   });
   return result.rows[0] || null;
 }
 
-async function getProfileByName(name) {
+async function getProfileByName(name, executor = getDb()) {
   const cleanName = normalizePlayerName(name);
-  const exact = await getPlayerProfile(name);
+  const exact = await getPlayerProfile(name, executor);
   if (exact) return exact;
-  const profiles = await getDb().execute('SELECT * FROM player_profiles');
+  const profiles = await executor.execute('SELECT * FROM player_profiles');
   return profiles.rows.find(profile =>
     parseJsonField(profile.aliases, []).some(alias => normalizePlayerName(alias) === cleanName)
   ) || null;
@@ -610,11 +630,11 @@ function normalizeProfileInput(input, current) {
   };
 }
 
-async function getRosterNames() {
+async function getRosterNames(executor = getDb()) {
   const names = new Map();
-  const profiles = await getDb().execute('SELECT player_name FROM player_profiles ORDER BY player_name');
+  const profiles = await executor.execute('SELECT player_name FROM player_profiles ORDER BY player_name');
   profiles.rows.forEach(row => names.set(normalizePlayerName(row.player_name), row.player_name));
-  const tournaments = await getDb().execute('SELECT id, data FROM tournaments');
+  const tournaments = await executor.execute('SELECT id, data FROM tournaments');
   tournaments.rows.forEach(row => {
     const tournament = JSON.parse(row.data);
     if (!tournament || typeof tournament !== 'object') throw new Error(`Invalid tournament data for ${row.id}`);
@@ -727,8 +747,8 @@ async function ensurePlayerProfiles(names, executor) {
     if (!key || /^(TBD|Seed\s+\d+)$/i.test(playerName) || isAnonymizedPlayerName(playerName) || known.has(key)) continue;
     const playerCode = await allocatePlayerCode(database);
     await database.execute({
-      sql: 'INSERT INTO player_profiles (player_id, player_code, player_name, updated_at) VALUES (?, ?, ?, ?)',
-      args: [crypto.randomUUID(), playerCode, playerName, new Date().toISOString()]
+      sql: 'INSERT INTO player_profiles (player_id, player_code, player_name, updated_at, revision) VALUES (?, ?, ?, ?, ?)',
+      args: [crypto.randomUUID(), playerCode, playerName, new Date().toISOString(), crypto.randomUUID()]
     });
     known.add(key);
   }
@@ -820,14 +840,14 @@ async function persistPlayerProfile(profile, options) {
       playerCode = requestedCode || await allocatePlayerCode(transaction);
     }
     const values = [
-      profile.name, profile.photoUrl, age, ranking, updatedAt, profile.nickname, profile.gender, profile.club,
+      profile.name, profile.photoUrl, age, ranking, updatedAt, crypto.randomUUID(), profile.nickname, profile.gender, profile.club,
       profile.country, profile.state, profile.city, profile.emergencyContact, profile.playingHand,
       JSON.stringify(profile.preferredEvents), profile.email, JSON.stringify(profile.visibility), JSON.stringify(keptAliases)
     ];
     if (current) {
       const result = await transaction.execute({
         sql: `UPDATE player_profiles SET
-                player_name = ?, photo_url = ?, age = ?, ranking = ?, updated_at = ?, nickname = ?,
+                player_name = ?, photo_url = ?, age = ?, ranking = ?, updated_at = ?, revision = ?, nickname = ?,
                 gender = ?, club = ?, country = ?, state = ?, city = ?, emergency_contact = ?,
                 playing_hand = ?, preferred_events = ?, email = ?, visibility = ?, aliases = ?
               WHERE player_name = ?`,
@@ -837,9 +857,9 @@ async function persistPlayerProfile(profile, options) {
     } else {
       await transaction.execute({
         sql: `INSERT INTO player_profiles
-                (player_id, player_code, player_name, photo_url, age, ranking, updated_at, nickname, gender, club,
+                (player_id, player_code, player_name, photo_url, age, ranking, updated_at, revision, nickname, gender, club,
                  country, state, city, emergency_contact, playing_hand, preferred_events, email, visibility, aliases)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [playerId, playerCode, ...values]
       });
     }
@@ -890,13 +910,24 @@ app.get('/api/tournaments', async (_req, res) => {
   }
 });
 
-app.get('/api/tournament-history', async (_req, res) => {
+app.get('/api/tournament-history', async (req, res) => {
   try {
-    const [result, profilesResult] = await Promise.all([
-      getDb().execute('SELECT id, name, date, phase, data, updated_at FROM tournaments ORDER BY date DESC, updated_at DESC'),
-      getDb().execute('SELECT player_id, player_name, aliases FROM player_profiles')
-    ]);
+    const token = getCookie(req, PLAYER_SESSION_COOKIE);
+    const [result, profilesResult, sessionResult] = await getDb().batch([
+      'SELECT id, name, date, phase, data, updated_at FROM tournaments ORDER BY date DESC, updated_at DESC',
+      'SELECT * FROM player_profiles ORDER BY player_name',
+      {
+        sql: `SELECT a.player_name FROM player_sessions s JOIN player_accounts a ON a.id = s.account_id
+              WHERE s.token_hash = ? AND s.expires_at > ?`,
+        args: [token ? hashToken(token) : '', new Date().toISOString()]
+      }
+    ], 'read');
+    const ownName = sessionResult.rows[0]?.player_name;
+    const ownProfile = ownName && profilesResult.rows.find(row => normalizePlayerName(row.player_name) === normalizePlayerName(ownName));
+    res.set('Cache-Control', 'no-store');
     res.json({
+      players: profilesResult.rows.map(row => serializePlayerProfile(row, true)),
+      ownPlayer: ownProfile ? serializePlayerProfile(ownProfile, false) : null,
       tournaments: result.rows.map(row => {
         const state = JSON.parse(row.data);
         if (!state || typeof state !== 'object' || Array.isArray(state) ||
@@ -1030,17 +1061,21 @@ app.post('/api/player-auth/register', async (req, res) => {
       args: [accountId, canonicalName, email, salt, passwordHash, now, now]
     });
     if (currentProfile) {
-      await transaction.execute({
-        sql: 'UPDATE player_profiles SET email = ?, updated_at = ? WHERE player_name = ?',
-        args: [email, now, currentProfile.player_name]
+      const updatedProfile = await transaction.execute({
+        sql: 'UPDATE player_profiles SET email = ?, updated_at = ?, revision = ? WHERE player_name = ? AND revision = ?',
+        args: [email, now, crypto.randomUUID(), currentProfile.player_name, currentProfile.revision]
       });
+      if (!Number(updatedProfile.rowsAffected)) {
+        await transaction.rollback();
+        return res.status(409).json({ error: 'Player profile changed; reload the invitation and try again' });
+      }
     } else {
       const playerCode = await allocatePlayerCode(transaction);
       await transaction.execute({
         sql: `INSERT INTO player_profiles
-                (player_id, player_code, player_name, email, updated_at, preferred_events, visibility, aliases)
-              VALUES (?, ?, ?, ?, ?, '[]', '{}', '[]')`,
-        args: [crypto.randomUUID(), playerCode, canonicalName, email, now]
+                (player_id, player_code, player_name, email, updated_at, revision, preferred_events, visibility, aliases)
+              VALUES (?, ?, ?, ?, ?, ?, '[]', '{}', '[]')`,
+        args: [crypto.randomUUID(), playerCode, canonicalName, email, now, crypto.randomUUID()]
       });
     }
     const useResult = await transaction.execute({
@@ -1199,42 +1234,67 @@ app.delete('/api/player-auth/me', requirePlayer, async (req, res) => {
 });
 
 app.put('/api/player-auth/me', requirePlayer, async (req, res) => {
+  let transaction;
   try {
-    const current = await getPlayerProfile(req.playerSession.playerName);
-    if (!current) return res.status(404).json({ error: 'Player profile is unavailable' });
+    const revision = req.get('x-player-revision');
+    if (!revision) return res.status(428).json({ error: 'Player revision is required; reload before saving' });
+    transaction = await getDb().transaction('write');
+    const session = await transaction.execute({
+      sql: 'SELECT account_id FROM player_sessions WHERE token_hash = ? AND account_id = ? AND expires_at > ?',
+      args: [hashToken(getCookie(req, PLAYER_SESSION_COOKIE)), req.playerSession.accountId, new Date().toISOString()]
+    });
+    if (!session.rows.length) {
+      await transaction.rollback();
+      return res.status(401).json({ error: 'Player session expired; sign in again' });
+    }
+    const current = await getPlayerProfile(req.playerSession.playerName, transaction);
+    if (!current || revision !== current.revision) {
+      await transaction.rollback();
+      return res.status(409).json({ error: 'Player profile changed; reload before saving' });
+    }
     const profile = normalizeProfileInput(req.body, current);
     if (!profile.email) throw new ValidationError('Email address is required for player sign-in');
 
-    const duplicateEmail = await getDb().execute({
+    const duplicateEmail = await transaction.execute({
       sql: 'SELECT id FROM player_accounts WHERE email = ? COLLATE NOCASE AND id != ?',
       args: [profile.email, req.playerSession.accountId]
     });
-    if (duplicateEmail.rows.length) return res.status(409).json({ error: 'This email address is already in use' });
-    const duplicateName = await getProfileByName(profile.name);
+    if (duplicateEmail.rows.length) {
+      await transaction.rollback();
+      return res.status(409).json({ error: 'This email address is already in use' });
+    }
+    const duplicateName = await getProfileByName(profile.name, transaction);
     if (duplicateName && normalizePlayerName(duplicateName.player_name) !== normalizePlayerName(current.player_name)) {
+      await transaction.rollback();
       return res.status(409).json({ error: 'This full name is already linked to another player' });
     }
     const aliases = parseJsonField(current.aliases, []);
     const knownNames = new Set([current.player_name, ...aliases].map(normalizePlayerName));
-    const roster = await getRosterNames();
+    const roster = await getRosterNames(transaction);
     if (normalizePlayerName(profile.name) !== normalizePlayerName(current.player_name) &&
       roster.some(name => normalizePlayerName(name) === normalizePlayerName(profile.name)) &&
       !knownNames.has(normalizePlayerName(profile.name))) {
+      await transaction.rollback();
       return res.status(409).json({ error: 'That name is already used in tournament records' });
     }
 
     const savedProfile = await persistPlayerProfile(profile, {
       current,
-      accountId: req.playerSession.accountId
+      accountId: req.playerSession.accountId,
+      transaction
     });
+    await transaction.commit();
     res.json({ player: serializePlayerProfile(savedProfile, false) });
   } catch (err) {
+    if (transaction) await transaction.rollback();
     if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
     if (String(err.message || '').toLowerCase().includes('unique constraint')) {
       return res.status(409).json({ error: 'This player name or email is already in use' });
     }
     console.error('Player profile update failed:', err);
     res.status(500).json({ error: 'Player profile could not be updated' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 
@@ -1258,6 +1318,7 @@ app.post('/api/player-auth/logout', async (req, res) => {
 app.get('/api/players', async (_req, res) => {
   try {
     const result = await getDb().execute('SELECT * FROM player_profiles ORDER BY player_name');
+    res.set('Cache-Control', 'no-store');
     res.json({ players: result.rows.map(row => serializePlayerProfile(row, true)) });
   } catch (err) {
     console.error('Failed to load player profiles:', err);
@@ -1282,6 +1343,7 @@ app.get('/api/player-import/directory', requireAdminKey, async (_req, res) => {
       const tournament = JSON.parse(row.data);
       getTournamentRosterNames(tournament).forEach(addName);
     });
+    res.set('Cache-Control', 'no-store');
     res.json({
       profiles: profilesResult.rows.map(profile => serializePlayerProfile(profile, false)),
       rosterNames: [...rosterNames.values()].sort((a, b) => a.localeCompare(b))
@@ -1487,9 +1549,17 @@ app.post('/api/player-import', requireAdminKey, async (req, res) => {
 });
 
 app.put('/api/players/:name', requireAdminKey, async (req, res) => {
+  let transaction;
   try {
+    const revision = req.get('x-player-revision');
+    if (!revision) return res.status(428).json({ error: 'Player revision is required; reload before saving' });
     const requestedName = req.params.name.trim();
-    const current = await getPlayerProfile(requestedName);
+    transaction = await getDb().transaction('write');
+    const current = await getPlayerProfile(requestedName, transaction);
+    if ((current && current.revision !== revision) || (!current && revision !== 'new')) {
+      await transaction.rollback();
+      return res.status(409).json({ error: 'Player profile changed; reload before saving' });
+    }
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const requestedPlayerId = typeof body.playerId === 'string' ? body.playerId.trim().toLowerCase() : '';
     const requestedPlayerCode = typeof body.playerCode === 'string' ? body.playerCode.trim() : '';
@@ -1514,12 +1584,13 @@ app.put('/api/players/:name', requireAdminKey, async (req, res) => {
       throw new ValidationError('Age must be a whole number between 1 and 120');
     }
     if (ranking.length > 120) throw new ValidationError('Ranking must be 120 characters or fewer');
-    const duplicateName = await getProfileByName(profile.name);
+    const duplicateName = await getProfileByName(profile.name, transaction);
     if (duplicateName && (!current || normalizePlayerName(duplicateName.player_name) !== normalizePlayerName(current.player_name))) {
+      await transaction.rollback();
       return res.status(409).json({ error: 'This full name is already linked to another player' });
     }
     const accountResult = current
-      ? await getDb().execute({ sql: 'SELECT id FROM player_accounts WHERE player_name = ? COLLATE NOCASE', args: [current.player_name] })
+      ? await transaction.execute({ sql: 'SELECT id FROM player_accounts WHERE player_name = ? COLLATE NOCASE', args: [current.player_name] })
       : { rows: [] };
     if (accountResult.rows.length && !profile.email) {
       throw new ValidationError('Player account email cannot be blank');
@@ -1530,129 +1601,181 @@ app.put('/api/players/:name', requireAdminKey, async (req, res) => {
       ranking,
       playerId: requestedPlayerId,
       playerCode: requestedPlayerCode,
-      accountId: accountResult.rows[0]?.id
+      accountId: accountResult.rows[0]?.id,
+      transaction
     });
+    await transaction.commit();
     res.json({ ok: true, player: serializePlayerProfile(savedProfile, false), updatedAt: savedProfile.updated_at });
   } catch (err) {
+    if (transaction) await transaction.rollback();
     if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
     if (String(err.message || '').toLowerCase().includes('unique constraint')) {
       return res.status(409).json({ error: 'This player name or email is already in use' });
     }
     console.error('Admin player profile update failed:', err);
     res.status(500).json({ error: 'Player profile could not be updated' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
+
+async function deletePlayerProfile(transaction, requestedName, expectedPlayerId, revision) {
+  const profileResult = await transaction.execute({
+    sql: 'SELECT * FROM player_profiles WHERE player_name = ? COLLATE NOCASE LIMIT 1',
+    args: [requestedName]
+  });
+  const profile = profileResult.rows[0];
+  if (!profile) throw new NotFoundError('Player profile not found; refresh the directory');
+  if (expectedPlayerId.toLowerCase() !== String(profile.player_id || '').toLowerCase() || revision !== profile.revision) {
+    throw new ConflictError('Player profile changed; refresh the directory and try again');
+  }
+
+  const accountResult = await transaction.execute({
+    sql: 'SELECT id, player_name, email FROM player_accounts WHERE player_name = ? COLLATE NOCASE',
+    args: [profile.player_name]
+  });
+  const account = accountResult.rows[0] || null;
+  const otherProfiles = await transaction.execute({
+    sql: 'SELECT player_name, nickname, aliases FROM player_profiles WHERE player_id != ?',
+    args: [profile.player_id]
+  });
+  const otherNames = new Set(otherProfiles.rows.flatMap(other =>
+    [other.player_name, other.nickname, ...parseJsonField(other.aliases, [])].map(normalizeImportName)
+  ).filter(Boolean));
+  const safeNickname = otherNames.has(normalizeImportName(profile.nickname)) ? '' : (profile.nickname || '');
+  const safeAliases = parseJsonField(profile.aliases, [])
+    .filter(alias => !otherNames.has(normalizeImportName(alias)));
+  const identityNames = new Set([
+    profile.player_name,
+    safeNickname,
+    ...safeAliases,
+    account?.player_name
+  ].map(normalizeImportName).filter(Boolean));
+  const profileId = String(profile.player_id || '').toLowerCase();
+  const anonymizedName = `Anonymous Player ${crypto.randomBytes(8).toString('hex')}`;
+  const now = new Date().toISOString();
+  const tournamentResult = await transaction.execute('SELECT id, data FROM tournaments');
+  const updatedTournamentIds = [];
+
+  for (const row of tournamentResult.rows) {
+    const originalData = JSON.parse(row.data);
+    const anonymizedData = anonymizeTournamentPlayer(originalData, identityNames, profileId, anonymizedName);
+    if (JSON.stringify(anonymizedData) === JSON.stringify(originalData)) continue;
+    await transaction.execute({
+      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
+      args: [JSON.stringify(anonymizedData), now, row.id]
+    });
+    updatedTournamentIds.push(String(row.id));
+  }
+
+  const emailIdentities = new Set([profile.email, account?.email]
+    .map(value => normalizePlayerName(value))
+    .filter(Boolean));
+  const inviteResult = await transaction.execute('SELECT id, target_name, target_email, contact_value FROM player_invites');
+  for (const invite of inviteResult.rows) {
+    const hasPlayerIdentity = identityNames.has(normalizeImportName(invite.target_name)) ||
+      identityNames.has(normalizeImportName(invite.contact_value));
+    const hasPlayerEmail = emailIdentities.has(normalizePlayerName(invite.target_email)) ||
+      emailIdentities.has(normalizePlayerName(invite.contact_value));
+    if (hasPlayerIdentity || hasPlayerEmail) {
+      await transaction.execute({ sql: 'DELETE FROM player_invites WHERE id = ?', args: [invite.id] });
+    }
+  }
+
+  const checkInResult = await transaction.execute('SELECT tournament_id, player_name FROM player_checkins');
+  for (const checkIn of checkInResult.rows) {
+    if (!identityNames.has(normalizeImportName(checkIn.player_name))) continue;
+    await transaction.execute({
+      sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+      args: [checkIn.tournament_id, checkIn.player_name]
+    });
+  }
+
+  if (account) {
+    await transaction.execute({
+      sql: 'DELETE FROM player_sessions WHERE account_id = ?',
+      args: [account.id]
+    });
+    await transaction.execute({
+      sql: 'DELETE FROM player_accounts WHERE id = ?',
+      args: [account.id]
+    });
+  }
+  await transaction.execute({
+    sql: 'DELETE FROM player_profiles WHERE player_name = ? COLLATE NOCASE',
+    args: [profile.player_name]
+  });
+  return {
+    ok: true,
+    playerName: profile.player_name,
+    anonymizedName,
+    updatedTournamentIds,
+    deletedPlayer: {
+      name: profile.player_name,
+      nickname: safeNickname,
+      playerId: profile.player_id || '',
+      aliases: safeAliases
+    },
+    message: 'Player profile and login deleted; tournament scores were kept with the player anonymized'
+  };
+}
+
+function validatePlayerDeletion(name, playerId, revision) {
+  if (typeof name !== 'string' || !name.trim()) throw new ValidationError('Player name is required');
+  if (typeof playerId !== 'string' || !isPlayerId(playerId)) throw new ValidationError('Player ID must be a UUID');
+  if (typeof revision !== 'string' || !revision) throw new ValidationError('Player revision is required; refresh the directory');
+}
 
 app.delete('/api/players/:name', requireAdminKey, async (req, res) => {
   let transaction;
   try {
-    const requestedName = String(req.params.name || '').trim();
-    if (!requestedName) throw new ValidationError('Player name is required');
-    const expectedPlayerId = req.query.playerId;
-    if (expectedPlayerId !== undefined && (typeof expectedPlayerId !== 'string' || !isPlayerId(expectedPlayerId))) {
-      throw new ValidationError('Player ID must be a UUID');
-    }
-
+    const name = String(req.params.name || '').trim();
+    const playerId = req.query.playerId;
+    const revision = req.get('x-player-revision');
+    validatePlayerDeletion(name, playerId, revision);
     transaction = await getDb().transaction('write');
-    const profileResult = await transaction.execute({
-      sql: 'SELECT * FROM player_profiles WHERE player_name = ? COLLATE NOCASE LIMIT 1',
-      args: [requestedName]
-    });
-    const profile = profileResult.rows[0];
-    if (!profile) {
-      await transaction.rollback();
-      return res.status(404).json({ error: 'Player profile not found' });
-    }
-    if (expectedPlayerId && expectedPlayerId.toLowerCase() !== String(profile.player_id || '').toLowerCase()) {
-      await transaction.rollback();
-      return res.status(409).json({ error: 'Player profile changed; refresh the directory and try again' });
-    }
-
-    const accountResult = await transaction.execute({
-      sql: 'SELECT id, player_name, email FROM player_accounts WHERE player_name = ? COLLATE NOCASE',
-      args: [profile.player_name]
-    });
-    const account = accountResult.rows[0] || null;
-    const identityNames = new Set([
-      profile.player_name,
-      profile.nickname,
-      ...parseJsonField(profile.aliases, []),
-      account?.player_name
-    ].map(normalizeImportName).filter(Boolean));
-    const profileId = String(profile.player_id || '').toLowerCase();
-    const anonymizedName = `Anonymous Player ${crypto.randomBytes(8).toString('hex')}`;
-    const now = new Date().toISOString();
-    const tournamentResult = await transaction.execute('SELECT id, data FROM tournaments');
-    const updatedTournamentIds = [];
-
-    for (const row of tournamentResult.rows) {
-      const originalData = JSON.parse(row.data);
-      const anonymizedData = anonymizeTournamentPlayer(originalData, identityNames, profileId, anonymizedName);
-      if (JSON.stringify(anonymizedData) === JSON.stringify(originalData)) continue;
-      await transaction.execute({
-        sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
-        args: [JSON.stringify(anonymizedData), now, row.id]
-      });
-      updatedTournamentIds.push(String(row.id));
-    }
-
-    const emailIdentities = new Set([profile.email, account?.email]
-      .map(value => normalizePlayerName(value))
-      .filter(Boolean));
-    const inviteResult = await transaction.execute('SELECT id, target_name, target_email, contact_value FROM player_invites');
-    for (const invite of inviteResult.rows) {
-      const hasPlayerIdentity = identityNames.has(normalizeImportName(invite.target_name)) ||
-        identityNames.has(normalizeImportName(invite.contact_value));
-      const hasPlayerEmail = emailIdentities.has(normalizePlayerName(invite.target_email)) ||
-        emailIdentities.has(normalizePlayerName(invite.contact_value));
-      if (hasPlayerIdentity || hasPlayerEmail) {
-        await transaction.execute({ sql: 'DELETE FROM player_invites WHERE id = ?', args: [invite.id] });
-      }
-    }
-
-    const checkInResult = await transaction.execute('SELECT tournament_id, player_name FROM player_checkins');
-    for (const checkIn of checkInResult.rows) {
-      if (!identityNames.has(normalizeImportName(checkIn.player_name))) continue;
-      await transaction.execute({
-        sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
-        args: [checkIn.tournament_id, checkIn.player_name]
-      });
-    }
-
-    if (account) {
-      await transaction.execute({
-        sql: 'DELETE FROM player_sessions WHERE account_id = ?',
-        args: [account.id]
-      });
-      await transaction.execute({
-        sql: 'DELETE FROM player_accounts WHERE id = ?',
-        args: [account.id]
-      });
-    }
-    await transaction.execute({
-      sql: 'DELETE FROM player_profiles WHERE player_name = ? COLLATE NOCASE',
-      args: [profile.player_name]
-    });
+    const result = await deletePlayerProfile(transaction, name, playerId, revision);
     await transaction.commit();
-
-    res.json({
-      ok: true,
-      playerName: profile.player_name,
-      anonymizedName,
-      updatedTournamentIds,
-      deletedPlayer: {
-        name: profile.player_name,
-        nickname: profile.nickname || '',
-        playerId: profile.player_id || '',
-        aliases: parseJsonField(profile.aliases, [])
-      },
-      message: 'Player profile and login deleted; tournament scores were kept with the player anonymized'
-    });
+    res.json(result);
   } catch (err) {
     if (transaction) await transaction.rollback();
     if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    if (err instanceof ConflictError) return res.status(409).json({ error: err.message });
+    if (err instanceof NotFoundError) return res.status(404).json({ error: err.message });
     console.error('Admin player profile deletion failed:', err);
     res.status(500).json({ error: 'Player profile could not be deleted' });
+  } finally {
+    if (transaction) transaction.close();
+  }
+});
+
+app.post('/api/players/delete-batch', requireAdminKey, async (req, res) => {
+  let transaction;
+  try {
+    const players = req.body?.players;
+    if (!Array.isArray(players) || !players.length || players.length > 1000) {
+      throw new ValidationError('Select between 1 and 1000 player profiles');
+    }
+    const ids = new Set();
+    for (const player of players) {
+      validatePlayerDeletion(player?.name, player?.playerId, player?.revision);
+      const id = player.playerId.toLowerCase();
+      if (ids.has(id)) throw new ValidationError('Each player may be selected only once');
+      ids.add(id);
+    }
+    transaction = await getDb().transaction('write');
+    const deleted = [];
+    for (const player of players) {
+      deleted.push(await deletePlayerProfile(transaction, player.name.trim(), player.playerId, player.revision));
+    }
+    await transaction.commit();
+    res.json({ ok: true, deleted });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    if (err instanceof ConflictError || err instanceof NotFoundError) return res.status(409).json({ error: err.message });
+    console.error('Batch player deletion failed:', err);
+    res.status(500).json({ error: 'Players could not be deleted; no profiles were removed' });
   } finally {
     if (transaction) transaction.close();
   }
@@ -1970,6 +2093,7 @@ app.patch('/api/tournaments/:id/matches/:matchId/score', requireAdminKey, async 
 
 // Upsert one tournament
 app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
+  let transaction;
   try {
     const payload = req.body && req.body.data ? req.body.data : req.body;
     if (!payload || typeof payload !== 'object') {
@@ -1982,44 +2106,66 @@ app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
     payload.tournamentId = id;
     const revision = req.get('x-tournament-revision');
     if (!revision) return res.status(428).json({ error: 'Tournament revision is required; reload before saving' });
-    const existing = await getDb().execute({ sql: 'SELECT data, phase FROM tournaments WHERE id = ?', args: [id] });
+    transaction = await getDb().transaction('write');
+    const existing = await transaction.execute({ sql: 'SELECT data, phase FROM tournaments WHERE id = ?', args: [id] });
     const original = existing.rows[0]?.data;
     if ((original && revision !== tournamentRevision(original)) || (!original && revision !== 'new')) {
+      await transaction.rollback();
       return res.status(409).json({ error: 'Tournament changed; reload before saving' });
     }
     const phase = payload.phase || 'setup';
     const opening = phase !== 'completed' && (!original || existing.rows[0].phase === 'completed');
     if (opening) delete payload.closedEarly;
     if (opening) {
-      const open = await getDb().execute({
+      const open = await transaction.execute({
         sql: "SELECT id, name FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed' LIMIT 1",
         args: [id]
       });
-      if (open.rows.length) return res.status(409).json({ error: 'Close or delete the open tournament before creating or reopening another', openTournament: open.rows[0] });
+      if (open.rows.length) {
+        await transaction.rollback();
+        return res.status(409).json({ error: 'Close or delete the open tournament before creating or reopening another', openTournament: open.rows[0] });
+      }
     }
-    await ensurePlayerProfiles(getTournamentRosterNames(payload));
-    const profilesResult = await getDb().execute('SELECT player_id, player_name, aliases FROM player_profiles');
+    const beforeProfiles = await transaction.execute('SELECT player_id, player_name, aliases FROM player_profiles');
+    const currentLinks = getTournamentPlayerProfileIds(payload, beforeProfiles.rows);
+    for (const name of getTournamentRosterNames(payload)) {
+      const key = normalizeImportName(name);
+      const expectedId = payload.playerProfileIds?.[key];
+      if (expectedId && String(expectedId).toLowerCase() !== String(currentLinks[key] || '').toLowerCase()) {
+        await transaction.rollback();
+        return res.status(409).json({ error: 'A linked player profile changed or was deleted; reload before saving' });
+      }
+    }
+    await ensurePlayerProfiles(getTournamentRosterNames(payload), transaction);
+    const profilesResult = await transaction.execute('SELECT player_id, player_name, aliases FROM player_profiles');
     payload.playerProfileIds = getTournamentPlayerProfileIds(payload, profilesResult.rows);
     const cfg = payload.config || {};
     const now = new Date().toISOString();
     const data = JSON.stringify(payload);
-    const result = original ? await getDb().execute({
+    const result = original ? await transaction.execute({
       sql: `UPDATE tournaments SET name = ?, date = ?, venue = ?, phase = ?, data = ?, updated_at = ?
             WHERE id = ? AND data = ?
               AND (? = 'completed' OR COALESCE(phase, '') != 'completed'
                    OR NOT EXISTS (SELECT 1 FROM tournaments WHERE id != ? AND COALESCE(phase, '') != 'completed'))`,
       args: [cfg.name || 'Untitled Tournament', cfg.date || null, cfg.venue || null, phase, data, now, id, original, phase, id]
-    }) : await getDb().execute({
+    }) : await transaction.execute({
       sql: `INSERT INTO tournaments (id, name, date, venue, phase, data, updated_at)
             SELECT ?, ?, ?, ?, ?, ?, ?
             WHERE ? = 'completed' OR NOT EXISTS (SELECT 1 FROM tournaments WHERE COALESCE(phase, '') != 'completed')
             ON CONFLICT(id) DO NOTHING`,
       args: [id, cfg.name || 'Untitled Tournament', cfg.date || null, cfg.venue || null, phase, data, now, phase]
     });
-    if (!Number(result.rowsAffected)) return res.status(409).json({ error: 'Tournament changed or another tournament is open; reload and close or delete it before saving' });
+    if (!Number(result.rowsAffected)) {
+      await transaction.rollback();
+      return res.status(409).json({ error: 'Tournament changed or another tournament is open; reload and close or delete it before saving' });
+    }
+    await transaction.commit();
     res.json({ ok: true, id, updatedAt: now, revision: tournamentRevision(data), playerProfileIds: payload.playerProfileIds });
   } catch (err) {
+    if (transaction) await transaction.rollback();
     res.status(500).json({ error: err.message });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 
@@ -2047,77 +2193,97 @@ app.delete('/api/tournaments/:id', requireAdminKey, async (req, res) => {
   }
 });
 
-async function persistTournamentCheckIn(tournamentId, playerName, groupName, skill, checkedIn, time, source, walkIn) {
+async function persistTournamentCheckIn(tournamentId, playerName, groupName, skill, checkedIn, time, source, walkIn, expected = {}) {
   const nowTime = time || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  if (checkedIn === false) {
-    await getDb().execute({
-      sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
-      args: [tournamentId, playerName]
-    });
-  } else {
-    await getDb().execute({
-      sql: `INSERT INTO player_checkins (tournament_id, player_name, group_name, skill, checked_in, checked_in_at, source)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(tournament_id, player_name) DO UPDATE SET
-              group_name = COALESCE(excluded.group_name, player_checkins.group_name),
-              skill = COALESCE(excluded.skill, player_checkins.skill),
-              checked_in = 1,
-              checked_in_at = excluded.checked_in_at,
-              source = excluded.source`,
-      args: [tournamentId, playerName, groupName || null, Number(skill) || 5, nowTime, source || 'qr']
-    });
-  }
-
-  let saved = false;
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const existing = await getDb().execute({
+  const transaction = await getDb().transaction('write');
+  try {
+    const existing = await transaction.execute({
       sql: 'SELECT data FROM tournaments WHERE id = ?',
       args: [tournamentId]
     });
-    if (!existing.rows.length) {
-      saved = true;
-      break;
+    const original = existing.rows[0]?.data;
+    if (expected.tournamentData !== undefined && original !== expected.tournamentData) {
+      throw new ConflictError('Tournament changed; reload before checking in');
     }
-    const original = existing.rows[0].data;
-    const state = JSON.parse(original);
-    if (!state.checkIns) state.checkIns = {};
-    if (!state.playerSkills) state.playerSkills = {};
+    if (expected.accountId) {
+      const session = await transaction.execute({
+        sql: 'SELECT account_id FROM player_sessions WHERE token_hash = ? AND account_id = ? AND expires_at > ?',
+        args: [expected.tokenHash, expected.accountId, new Date().toISOString()]
+      });
+      if (!session.rows.length) throw new ConflictError('Player session changed; sign in again');
+    }
+    const profile = await getProfileByName(playerName, transaction);
+    if ((expected.playerId && (!profile || String(profile.player_id).toLowerCase() !== expected.playerId.toLowerCase())) ||
+        (!profile && checkedIn !== false && !walkIn)) {
+      throw new ConflictError('Player profile changed or was deleted; refresh before checking in');
+    }
+    if (expected.accountId) {
+      const previous = await transaction.execute({
+        sql: 'SELECT checked_in FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+        args: [tournamentId, playerName]
+      });
+      if (Number(previous.rows[0]?.checked_in) === 1) throw new ConflictError('You are already checked in');
+    }
     if (checkedIn === false) {
-      delete state.checkIns[playerName];
+      await transaction.execute({
+        sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+        args: [tournamentId, playerName]
+      });
     } else {
-      state.checkIns[playerName] = { checkedIn: true, time: nowTime, source: source || 'qr' };
+      await transaction.execute({
+        sql: `INSERT INTO player_checkins (tournament_id, player_name, group_name, skill, checked_in, checked_in_at, source)
+              VALUES (?, ?, ?, ?, 1, ?, ?)
+              ON CONFLICT(tournament_id, player_name) DO UPDATE SET
+                group_name = COALESCE(excluded.group_name, player_checkins.group_name),
+                skill = COALESCE(excluded.skill, player_checkins.skill),
+                checked_in = 1,
+                checked_in_at = excluded.checked_in_at,
+                source = excluded.source`,
+        args: [tournamentId, playerName, groupName || null, Number(skill) || 5, nowTime, source || 'qr']
+      });
     }
-    if (skill) state.playerSkills[playerName] = Math.max(1, Math.min(10, Number(skill)));
-    if (walkIn && Array.isArray(state.groups) && state.groups.length > 0) {
-      const alreadyIn = state.groups.some(group => (group.players || []).includes(playerName));
-      if (!alreadyIn) {
-        let targetIdx = 0;
-        state.groups.forEach((group, idx) => {
-          if (group.players.length < state.groups[targetIdx].players.length) targetIdx = idx;
-        });
-        state.groups[targetIdx].players.push(playerName);
+    if (original) {
+      const state = JSON.parse(original);
+      if (!state.checkIns) state.checkIns = {};
+      if (!state.playerSkills) state.playerSkills = {};
+      if (checkedIn === false) {
+        delete state.checkIns[playerName];
+      } else {
+        state.checkIns[playerName] = { checkedIn: true, time: nowTime, source: source || 'qr' };
       }
+      if (skill) state.playerSkills[playerName] = Math.max(1, Math.min(10, Number(skill)));
+      if (walkIn && Array.isArray(state.groups) && state.groups.length > 0) {
+        const alreadyIn = state.groups.some(group => (group.players || []).includes(playerName));
+        if (!alreadyIn) {
+          let targetIdx = 0;
+          state.groups.forEach((group, idx) => {
+            if (group.players.length < state.groups[targetIdx].players.length) targetIdx = idx;
+          });
+          state.groups[targetIdx].players.push(playerName);
+        }
+      }
+      await transaction.execute({
+        sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
+        args: [JSON.stringify(state), new Date().toISOString(), tournamentId]
+      });
     }
-    const result = await getDb().execute({
-      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ? AND data = ?',
-      args: [JSON.stringify(state), new Date().toISOString(), tournamentId, original]
-    });
-    if (Number(result.rowsAffected)) {
-      saved = true;
-      break;
-    }
+    if (checkedIn !== false && !profile) await ensurePlayerProfiles([playerName], transaction);
+    await transaction.commit();
+    return { ok: true, tournamentId, playerName, checkedIn: checkedIn !== false, time: nowTime };
+  } catch (err) {
+    await transaction.rollback();
+    throw err;
+  } finally {
+    transaction.close();
   }
-  if (!saved) throw new Error('Tournament changed repeatedly during check-in; please retry');
-
-  if (checkedIn !== false) await ensurePlayerProfiles([playerName]);
-  return { ok: true, tournamentId, playerName, checkedIn: checkedIn !== false, time: nowTime };
 }
 
 // Check in a player for a specific tournament
 app.post('/api/tournaments/:id/checkin', denyPlayerWrite, requireAdminKey, async (req, res) => {
   try {
-    const { playerName, groupName, skill, checkedIn, time, source, walkIn } = req.body || {};
+    const { playerName, groupName, skill, checkedIn, time, source, walkIn, playerId } = req.body || {};
     if (!playerName) return res.status(400).json({ error: 'playerName is required' });
+    if (playerId && !isPlayerId(playerId)) return res.status(400).json({ error: 'Player ID must be a UUID' });
     const result = await persistTournamentCheckIn(
       req.params.id,
       playerName,
@@ -2126,10 +2292,12 @@ app.post('/api/tournaments/:id/checkin', denyPlayerWrite, requireAdminKey, async
       checkedIn,
       time,
       source,
-      walkIn
+      walkIn,
+      { playerId }
     );
     res.json(result);
   } catch (err) {
+    if (err instanceof ConflictError) return res.status(409).json({ error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -2196,10 +2364,17 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
       true,
       undefined,
       'player',
-      false
+      false,
+      {
+        playerId: profile.player_id,
+        accountId: req.playerSession.accountId,
+        tokenHash: hashToken(getCookie(req, PLAYER_SESSION_COOKIE)),
+        tournamentData: tournamentResult.rows[0].data
+      }
     );
     res.json(result);
   } catch (err) {
+    if (err instanceof ConflictError) return res.status(409).json({ error: err.message });
     console.error('Player check-in failed:', err);
     res.status(500).json({ error: 'Player check-in failed' });
   }

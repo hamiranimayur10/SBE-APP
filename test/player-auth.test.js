@@ -359,7 +359,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const uploadedPhoto = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l3sAAAAASUVORK5CYII=';
     const profilePhotoUpdate = await api('/api/players/Legacy%20Player', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-player-revision': migratedProfile.revision },
       body: JSON.stringify({
         name: migratedProfile.name,
         playerId: migratedProfile.playerId,
@@ -442,7 +442,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const update = await api('/api/player-auth/me', {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', cookie: playerCookie },
+      headers: { 'content-type': 'application/json', cookie: playerCookie, 'x-player-revision': registration.body.player.revision },
       body: JSON.stringify({
         name: 'Renamed Player',
         nickname: 'Ace',
@@ -460,6 +460,17 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(update.body.player.age, null);
     assert.equal(update.body.player.ranking, '');
     assert.equal(update.body.player.photoUrl, uploadedPhoto);
+    const staleSelfUpdate = await api('/api/player-auth/me', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie: playerCookie, 'x-player-revision': registration.body.player.revision },
+      body: JSON.stringify({ city: 'Stale City' })
+    });
+    assert.equal(staleSelfUpdate.response.status, 409);
+    const ownSnapshot = await api('/api/tournament-history', { headers: { cookie: playerCookie } });
+    assert.equal(ownSnapshot.body.ownPlayer.city, 'Hidden City');
+    assert.equal(ownSnapshot.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
+    const anonymousSnapshot = await api('/api/tournament-history');
+    assert.equal(anonymousSnapshot.body.ownPlayer, null);
 
     const publicProfiles = await api('/api/players');
     assert.equal(publicProfiles.response.status, 200);
@@ -510,7 +521,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
 
     const adminRename = await api('/api/players/Renamed%20Player', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-player-revision': update.body.player.revision },
       body: JSON.stringify({
         name: 'Admin Renamed Player',
         playerId: update.body.player.playerId,
@@ -889,9 +900,10 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       })
     });
     assert.equal(profileDeleteFixture.response.status, 200);
+    const targetBeforeRename = (await api('/api/players')).body.players.find(player => player.name === 'History Target');
     const renamedTarget = await api('/api/players/History%20Target', {
       method: 'PUT',
-      headers: adminHeaders,
+      headers: { ...adminHeaders, 'x-player-revision': targetBeforeRename.revision },
       body: JSON.stringify({ name: 'History Target Renamed' })
     });
     assert.equal(renamedTarget.response.status, 200);
@@ -950,7 +962,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(deleteProfileAsPlayer.response.status, 403);
     const deleteWithStaleId = await api('/api/players/History%20Target%20Renamed?playerId=00000000-0000-4000-8000-000000000000', {
       method: 'DELETE',
-      headers: adminHeaders
+      headers: { ...adminHeaders, 'x-player-revision': deleteTargetRegistration.body.player.revision }
     });
     assert.equal(deleteWithStaleId.response.status, 409);
     const deleteWithInvalidId = await api('/api/players/History%20Target%20Renamed?playerId=invalid', {
@@ -960,7 +972,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(deleteWithInvalidId.response.status, 400);
     const deletedProfile = await api(`/api/players/History%20Target%20Renamed?playerId=${renamedTarget.body.player.playerId}`, {
       method: 'DELETE',
-      headers: adminHeaders
+      headers: { ...adminHeaders, 'x-player-revision': deleteTargetRegistration.body.player.revision }
     });
     assert.equal(deletedProfile.response.status, 200);
     assert.match(deletedProfile.body.anonymizedName, /^Anonymous Player [a-f0-9]{16}$/);
@@ -1028,6 +1040,104 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(Number(deletedPlayerRows.rows[0].invites), 0);
     assert.equal(Number(deletedPlayerRows.rows[0].checkins), 0);
     await verificationClient.close();
+
+    const snapshotFixture = await api('/api/tournaments/atomic-player-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
+      body: JSON.stringify({
+        tournamentId: 'atomic-player-test',
+        phase: 'completed',
+        config: { name: 'Atomic Player Test', pointsToWin: 21, deuceCap: 25 },
+        groups: [{ name: 'A', players: ['Atomic One', 'Atomic Two'] }],
+        qr1Matches: [{ id: 'atomic-match', p1: 'Atomic One', p2: 'Atomic Two', s1: 21, s2: 12, completed: true }]
+      })
+    });
+    assert.equal(snapshotFixture.response.status, 200);
+    const snapshot = await api('/api/tournament-history');
+    assert.equal(snapshot.response.headers.get('cache-control'), 'no-store');
+    let one = snapshot.body.players.find(player => player.name === 'Atomic One');
+    let two = snapshot.body.players.find(player => player.name === 'Atomic Two');
+    assert.ok(one.revision && two.revision);
+    assert.ok(snapshot.body.tournaments.some(tournament => tournament.id === 'atomic-player-test'));
+
+    const edits = await Promise.all(['Club A', 'Club B'].map(club => api('/api/players/Atomic%20One', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-player-revision': one.revision },
+      body: JSON.stringify({ name: 'Atomic One', playerId: one.playerId, club })
+    })));
+    assert.deepEqual(edits.map(result => result.response.status).sort(), [200, 409]);
+    const staleProfile = one;
+    one = edits.find(result => result.response.status === 200).body.player;
+    const staleBatch = await api('/api/players/delete-batch', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ players: [
+        { name: two.name, playerId: two.playerId, revision: two.revision },
+        { name: staleProfile.name, playerId: staleProfile.playerId, revision: staleProfile.revision }
+      ] })
+    });
+    assert.equal(staleBatch.response.status, 409);
+    const afterFailedBatch = await api('/api/tournament-history');
+    assert.ok(afterFailedBatch.body.players.some(player => player.playerId === one.playerId));
+    assert.ok(afterFailedBatch.body.players.some(player => player.playerId === two.playerId));
+    assert.equal(afterFailedBatch.body.tournaments.find(tournament => tournament.id === 'atomic-player-test').data.groups[0].players[1], 'Atomic Two');
+
+    const beforeDeletion = await api('/api/tournaments/atomic-player-test');
+    const [deleteBatch, score, checkin, ...concurrentSnapshots] = await Promise.all([
+      api('/api/players/delete-batch', {
+        method: 'POST', headers: adminHeaders,
+        body: JSON.stringify({ players: [one, two].map(player => ({
+          name: player.name, playerId: player.playerId, revision: player.revision
+        })) })
+      }),
+      api('/api/tournaments/atomic-player-test/matches/atomic-match/score', {
+        method: 'PATCH', headers: adminHeaders,
+        body: JSON.stringify({ listKey: 'qr1', expectedMatch: beforeDeletion.body.data.qr1Matches[0], s1: 21, s2: 18 })
+      }),
+      api('/api/tournaments/atomic-player-test/checkin', {
+        method: 'POST', headers: adminHeaders,
+        body: JSON.stringify({ playerName: two.name, playerId: two.playerId, checkedIn: true })
+      }),
+      ...Array.from({ length: 5 }, () => api('/api/tournament-history'))
+    ]);
+    assert.equal(deleteBatch.response.status, 200);
+    assert.ok([200, 409].includes(score.response.status));
+    assert.ok([200, 409].includes(checkin.response.status));
+    for (const result of concurrentSnapshots) {
+      assert.equal(result.response.status, 200);
+      const hasOne = result.body.players.some(player => player.playerId === one.playerId);
+      const hasTwo = result.body.players.some(player => player.playerId === two.playerId);
+      const group = result.body.tournaments.find(tournament => tournament.id === 'atomic-player-test').data.groups[0].players;
+      assert.equal(hasOne, hasTwo);
+      assert.equal(group.includes('Atomic One'), hasOne);
+      assert.equal(group.includes('Atomic Two'), hasTwo);
+    }
+    const afterDeletion = await api('/api/tournament-history');
+    assert.ok(!afterDeletion.body.players.some(player => [one.playerId, two.playerId].includes(player.playerId)));
+    const anonymousFixture = afterDeletion.body.tournaments.find(tournament => tournament.id === 'atomic-player-test');
+    assert.ok(anonymousFixture.data.groups[0].players.every(name => /^Anonymous Player /.test(name)));
+    assert.equal(anonymousFixture.data.qr1Matches[0].s2, score.response.status === 200 ? 18 : 12);
+    const staleTournamentWrite = await api('/api/tournaments/atomic-player-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': beforeDeletion.body.revision },
+      body: JSON.stringify(beforeDeletion.body.data)
+    });
+    assert.equal(staleTournamentWrite.response.status, 409);
+    const staleProfileWrite = await api('/api/players/Atomic%20One', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-player-revision': one.revision },
+      body: JSON.stringify({ name: one.name, playerId: one.playerId, club: 'Stale' })
+    });
+    assert.equal(staleProfileWrite.response.status, 409);
+    const afterStaleWrite = await api('/api/players');
+    assert.ok(!afterStaleWrite.body.players.some(player => [one.playerId, two.playerId].includes(player.playerId)));
+    const finalDb = createClient({ url: databaseUrl });
+    const staleCheckins = await finalDb.execute({
+      sql: 'SELECT player_name FROM player_checkins WHERE tournament_id = ?',
+      args: ['atomic-player-test']
+    });
+    assert.equal(staleCheckins.rows.length, 0);
+    await finalDb.close();
   } finally {
     if (child.exitCode === null) {
       const exited = new Promise(resolve => child.once('exit', resolve));

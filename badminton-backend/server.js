@@ -2114,6 +2114,14 @@ app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
       return res.status(409).json({ error: 'Tournament changed; reload before saving' });
     }
     const phase = payload.phase || 'setup';
+    const resetAttendance = req.get('x-reset-attendance') === '1';
+    if (resetAttendance && (phase !== 'setup' || !Array.isArray(payload.groups) ||
+        payload.groups.some(group => !group || !Array.isArray(group.players) || group.players.length) ||
+        !payload.checkIns || typeof payload.checkIns !== 'object' || Array.isArray(payload.checkIns) ||
+        Object.keys(payload.checkIns).length)) {
+      await transaction.rollback();
+      return res.status(400).json({ error: 'Attendance reset requires an empty tournament roster and check-ins' });
+    }
     const opening = phase !== 'completed' && (!original || existing.rows[0].phase === 'completed');
     if (opening) delete payload.closedEarly;
     if (opening) {
@@ -2159,6 +2167,9 @@ app.put('/api/tournaments/:id', requireAdminKey, async (req, res) => {
       await transaction.rollback();
       return res.status(409).json({ error: 'Tournament changed or another tournament is open; reload and close or delete it before saving' });
     }
+    if (resetAttendance) {
+      await transaction.execute({ sql: 'DELETE FROM player_checkins WHERE tournament_id = ?', args: [id] });
+    }
     await transaction.commit();
     res.json({ ok: true, id, updatedAt: now, revision: tournamentRevision(data), playerProfileIds: payload.playerProfileIds });
   } catch (err) {
@@ -2202,6 +2213,7 @@ async function persistTournamentCheckIn(tournamentId, playerName, groupName, ski
       args: [tournamentId]
     });
     const original = existing.rows[0]?.data;
+    if (!original) throw new NotFoundError('Tournament not found');
     if (expected.tournamentData !== undefined && original !== expected.tournamentData) {
       throw new ConflictError('Tournament changed; reload before checking in');
     }
@@ -2242,34 +2254,37 @@ async function persistTournamentCheckIn(tournamentId, playerName, groupName, ski
         args: [tournamentId, playerName, groupName || null, Number(skill) || 5, nowTime, source || 'qr']
       });
     }
-    if (original) {
-      const state = JSON.parse(original);
-      if (!state.checkIns) state.checkIns = {};
-      if (!state.playerSkills) state.playerSkills = {};
-      if (checkedIn === false) {
-        delete state.checkIns[playerName];
-      } else {
-        state.checkIns[playerName] = { checkedIn: true, time: nowTime, source: source || 'qr' };
-      }
-      if (skill) state.playerSkills[playerName] = Math.max(1, Math.min(10, Number(skill)));
-      if (walkIn && Array.isArray(state.groups) && state.groups.length > 0) {
-        const alreadyIn = state.groups.some(group => (group.players || []).includes(playerName));
-        if (!alreadyIn) {
-          let targetIdx = 0;
-          state.groups.forEach((group, idx) => {
-            if (group.players.length < state.groups[targetIdx].players.length) targetIdx = idx;
-          });
-          state.groups[targetIdx].players.push(playerName);
-        }
-      }
-      await transaction.execute({
-        sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
-        args: [JSON.stringify(state), new Date().toISOString(), tournamentId]
-      });
+    const state = JSON.parse(original);
+    if (!state.checkIns) state.checkIns = {};
+    if (!state.playerSkills) state.playerSkills = {};
+    if (checkedIn === false) {
+      delete state.checkIns[playerName];
+    } else {
+      state.checkIns[playerName] = { checkedIn: true, time: nowTime, source: source || 'qr' };
     }
+    if (skill) state.playerSkills[playerName] = Math.max(1, Math.min(10, Number(skill)));
+    if (walkIn && Array.isArray(state.groups) && state.groups.length > 0) {
+      const alreadyIn = state.groups.some(group => (group.players || []).includes(playerName));
+      if (!alreadyIn) {
+        let targetIdx = 0;
+        state.groups.forEach((group, idx) => {
+          if (group.players.length < state.groups[targetIdx].players.length) targetIdx = idx;
+        });
+        state.groups[targetIdx].players.push(playerName);
+      }
+    }
+    const data = JSON.stringify(state);
+    const updatedAt = new Date().toISOString();
+    await transaction.execute({
+      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
+      args: [data, updatedAt, tournamentId]
+    });
     if (checkedIn !== false && !profile) await ensurePlayerProfiles([playerName], transaction);
     await transaction.commit();
-    return { ok: true, tournamentId, playerName, checkedIn: checkedIn !== false, time: nowTime };
+    return {
+      ok: true, tournamentId, playerName, checkedIn: checkedIn !== false, time: nowTime,
+      data: state, revision: tournamentRevision(data), updatedAt
+    };
   } catch (err) {
     await transaction.rollback();
     throw err;
@@ -2298,6 +2313,7 @@ app.post('/api/tournaments/:id/checkin', denyPlayerWrite, requireAdminKey, async
     res.json(result);
   } catch (err) {
     if (err instanceof ConflictError) return res.status(409).json({ error: err.message });
+    if (err instanceof NotFoundError) return res.status(404).json({ error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -2375,6 +2391,7 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
     res.json(result);
   } catch (err) {
     if (err instanceof ConflictError) return res.status(409).json({ error: err.message });
+    if (err instanceof NotFoundError) return res.status(404).json({ error: err.message });
     console.error('Player check-in failed:', err);
     res.status(500).json({ error: 'Player check-in failed' });
   }

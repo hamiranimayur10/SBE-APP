@@ -659,6 +659,30 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       body: JSON.stringify({ playerName: 'Roster Bob' })
     });
     assert.equal(adminCheckIn.response.status, 200);
+    assert.equal(adminCheckIn.body.data.checkIns['Roster Bob'].checkedIn, true);
+    assert.match(adminCheckIn.body.revision, /^[0-9a-f]{64}$/);
+
+    const removeCheckIn = await api('/api/tournaments/auth-test/checkin', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ playerName: 'Roster Bob', checkedIn: false })
+    });
+    assert.equal(removeCheckIn.response.status, 200);
+    assert.equal(removeCheckIn.body.data.checkIns['Roster Bob'], undefined);
+    const attendanceDb = createClient({ url: databaseUrl });
+    const removedAttendance = await attendanceDb.execute({
+      sql: 'SELECT player_name FROM player_checkins WHERE tournament_id = ? AND player_name = ?',
+      args: ['auth-test', 'Roster Bob']
+    });
+    assert.equal(removedAttendance.rows.length, 0);
+    await attendanceDb.close();
+
+    const missingTournamentCheckIn = await api('/api/tournaments/missing-checkin-test/checkin', {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ playerName: 'Roster Bob' })
+    });
+    assert.equal(missingTournamentCheckIn.response.status, 404);
 
     const checkinWrite = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
@@ -696,7 +720,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(selfCheckIn.response.status, 200);
     assert.equal(selfCheckIn.body.playerName, 'Roster Alice');
     assert.equal(selfCheckIn.body.checkedIn, true);
+    assert.equal(selfCheckIn.body.data.checkIns['Roster Alice'].source, 'player');
     const savedCheckIn = await api('/api/tournaments/auth-test');
+    assert.equal(selfCheckIn.body.revision, savedCheckIn.body.revision);
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].checkedIn, true);
     assert.equal(savedCheckIn.body.data.checkIns['Roster Alice'].source, 'player');
 
@@ -1137,6 +1163,46 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       args: ['atomic-player-test']
     });
     assert.equal(staleCheckins.rows.length, 0);
+
+    const beforeReset = await api('/api/tournaments/auth-test');
+    assert.ok(beforeReset.body.data.checkIns['Roster Alice']);
+    const invalidReset = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': beforeReset.body.revision, 'x-reset-attendance': '1' },
+      body: JSON.stringify({ ...beforeReset.body.data, phase: 'setup' })
+    });
+    assert.equal(invalidReset.response.status, 400);
+    const malformedReset = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': beforeReset.body.revision, 'x-reset-attendance': '1' },
+      body: JSON.stringify({ ...beforeReset.body.data, phase: 'setup', groups: [null], checkIns: {} })
+    });
+    assert.equal(malformedReset.response.status, 400);
+    const resetData = {
+      ...beforeReset.body.data, phase: 'setup', groups: [{ name: 'Group A', players: [], leader: '' }],
+      checkIns: {}, qr1Matches: []
+    };
+    const staleReset = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': 'stale', 'x-reset-attendance': '1' },
+      body: JSON.stringify(resetData)
+    });
+    assert.equal(staleReset.response.status, 409);
+    assert.equal((await finalDb.execute({
+      sql: 'SELECT player_name FROM player_checkins WHERE tournament_id = ?',
+      args: ['auth-test']
+    })).rows.length, 1);
+    const reset = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': beforeReset.body.revision, 'x-reset-attendance': '1' },
+      body: JSON.stringify(resetData)
+    });
+    assert.equal(reset.response.status, 200);
+    assert.equal((await finalDb.execute({
+      sql: 'SELECT player_name FROM player_checkins WHERE tournament_id = ?',
+      args: ['auth-test']
+    })).rows.length, 0);
+    assert.ok((await api('/api/players')).body.players.some(player => player.name === 'Roster Alice'));
     await finalDb.close();
   } finally {
     if (child.exitCode === null) {

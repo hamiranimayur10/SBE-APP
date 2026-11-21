@@ -230,28 +230,7 @@
         });
       }
 
-      const DEFAULT_GROUPS = [
-        {
-          id: 'A', name: 'Group A', leader: 'Nishant',
-          players: ['Makarand', 'Syed', 'Madhu', 'Nishant', 'Nikhil', 'Sabbir']
-        },
-        {
-          id: 'B', name: 'Group B', leader: 'Prakaash',
-          players: ['Puneet', 'Srini', 'Arjun', 'Saurav', 'Prakaash', 'Siri']
-        },
-        {
-          id: 'C', name: 'Group C', leader: 'Mayur',
-          players: ['Rijo', 'Mayur', 'Ajay', 'John', 'Amit S', 'Arun']
-        },
-        {
-          id: 'D', name: 'Group D', leader: 'Pankaj',
-          players: ['Sunil', 'Harsha', 'Vikram', 'Pankaj', 'Chakresh', 'Vijay']
-        },
-        {
-          id: 'E', name: 'Group E', leader: 'Abhijat',
-          players: ['Siddarth', 'Tensingh', 'Abhijat', 'Nishtha', 'Amit J', 'Kishor']
-        }
-      ];
+      const DEFAULT_GROUP_COUNT = 5;
 
       function createDefaultState(id, customName) {
         const def = {
@@ -267,7 +246,7 @@
             date: '2026-03-15',
             venue: 'Orange County Badminton Club',
             rules: '',
-            numGroups: 5,
+            numGroups: DEFAULT_GROUP_COUNT,
             playersPerGroup: 6,
             matchesPerPlayer: 4,
             qr2MatchesPerPlayer: 4,
@@ -284,7 +263,10 @@
               tiebreakers: ['wp', 'wins', 'pf', 'pa']
             }
           },
-          groups: JSON.parse(JSON.stringify(DEFAULT_GROUPS)),
+          groups: Array.from({ length: DEFAULT_GROUP_COUNT }, (_, index) => {
+            const id = String.fromCharCode(65 + index);
+            return { id, name: `Group ${id}`, leader: '', players: [] };
+          }),
           qr1Matches: [],
           qr2Pools: { A: [], B: [] },
           qr2Matches: { A: [], B: [] },
@@ -388,6 +370,7 @@
       let syncInFlight = null;
       let syncGeneration = 0;
       let scoreSaveInProgress = false;
+      let checkInSaveInProgress = false;
       let playerData = { loaded: false, loading: false, error: '', tournaments: [], profiles: [] };
       let playerDataPromise = null;
       let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
@@ -914,7 +897,7 @@
         }));
       }
 
-      async function pushToTurso(silent, localFallback = true) {
+      async function pushToTurso(silent, localFallback = true, resetAttendance = false) {
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return true;
         if (syncInFlight) {
@@ -933,7 +916,10 @@
           if (!state.sync.revision) throw new Error('Reload the tournament before saving');
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, {
             method: 'PUT',
-            headers: { ...getSyncHeaders(), 'x-tournament-revision': state.sync.revision },
+            headers: {
+              ...getSyncHeaders(), 'x-tournament-revision': state.sync.revision,
+              ...(resetAttendance ? { 'x-reset-attendance': '1' } : {})
+            },
             body: JSON.stringify({ data: payload })
           });
           const data = await res.json();
@@ -961,7 +947,7 @@
               ? 'Admin sync key rejected. Enter the same ADMIN_SYNC_KEY configured in the backend Cloud Sync settings.'
               : localFallback
                 ? `Cloud sync failed (${err.message}) — saved locally. Note your changes before using Cloud Sync → Pull from DB.`
-                : `Tournament was not created: ${err.message}`;
+                : `${resetAttendance ? 'Tournament reset could not be confirmed' : 'Tournament was not created'}: ${err.message}`;
           showToast(message, 'error');
           return false;
         }
@@ -973,7 +959,7 @@
       async function pullFromTurso(silent) {
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return;
-        if (silent && (scoreSaveInProgress || hasUnsavedScoreEntry() ||
+        if (silent && (scoreSaveInProgress || checkInSaveInProgress || hasUnsavedScoreEntry() ||
             ['pending', 'syncing', 'error'].includes(state.sync.status))) {
           showToast('Local changes are not synced. Review Cloud Sync before reloading.', 'error');
           return;
@@ -1003,7 +989,7 @@
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`);
           const json = await res.json();
           if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-          if (state !== target || syncGeneration !== generation || state.sync.revision !== startingRevision || scoreSaveInProgress ||
+          if (state !== target || syncGeneration !== generation || state.sync.revision !== startingRevision || scoreSaveInProgress || checkInSaveInProgress ||
               (silent && hasUnsavedScoreEntry())) return;
           if (json && json.exists && json.data) {
             const keepAuth = state.auth;
@@ -1054,7 +1040,7 @@
       }
 
       async function refreshLiveScores() {
-        if (liveScoreRefreshInProgress || scoreSaveInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
+        if (liveScoreRefreshInProgress || scoreSaveInProgress || checkInSaveInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
           state.sync?.status !== 'synced' || !state.sync.lastSynced) return;
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return;
@@ -1070,7 +1056,7 @@
           );
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Tournament refresh failed (HTTP ${response.status})`);
-          if (state.tournamentId !== tournamentId || state.sync.revision !== revision || scoreSaveInProgress ||
+          if (state.tournamentId !== tournamentId || state.sync.revision !== revision || scoreSaveInProgress || checkInSaveInProgress ||
               state.sync.status !== 'synced' || isEditingFormField() || hasUnsavedScoreEntry()) return;
           liveScoreRefreshErrorLogged = false;
           const badge = document.getElementById('sync-status-pill');
@@ -1109,32 +1095,61 @@
         }
       }
 
-      async function syncCheckInToServer(playerName, groupName, skill, checkedIn, time, source, walkIn) {
+      function applyCheckInResult(result, tournamentId) {
+        if (state.tournamentId !== tournamentId || !result.data || !result.revision) {
+          throw new Error('Check-in was saved, but the tournament must be reloaded');
+        }
+        state = normalizeTournamentState({
+          ...result.data, tournamentId, auth: state.auth, ui: state.ui,
+          sync: { ...state.sync, status: 'synced', revision: result.revision, lastSynced: result.updatedAt }
+        }, tournamentId);
+        tournamentCatalog.loaded = false;
+        upsertPlayerDataTournament(tournamentId, state, result.updatedAt);
+        saveRegistry();
+      }
+
+      async function syncCheckInToServer(playerName, checkedIn, source, checkedInAt) {
         const apiUrl = getSyncApiUrl();
-        if (!apiUrl) return;
+        const time = checkedInAt || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        if (!apiUrl) {
+          if (!state.checkIns) state.checkIns = {};
+          if (checkedIn) state.checkIns[playerName] = { checkedIn: true, time, source };
+          else delete state.checkIns[playerName];
+          saveState();
+          return;
+        }
+        if (checkInSaveInProgress || scoreSaveInProgress) throw new Error('Wait for the current save to finish');
+        checkInSaveInProgress = true;
+        const app = document.getElementById('app');
+        app.inert = true;
         try {
-          clearTimeout(syncTimer);
-          syncTimer = null;
-          if (!await pushToTurso(true)) return;
-          const target = state;
-          const generation = syncGeneration;
-          const tid = encodeURIComponent(state.tournamentId || 'default');
-          const response = await fetch(`${apiUrl}/api/tournaments/${tid}/checkin`, {
+          if (state.sync.status === 'error') throw new Error('Resolve the tournament sync error before checking in');
+          if (syncTimer || syncInFlight || state.sync.status === 'pending' || state.sync.revision === 'new') {
+            do {
+              clearTimeout(syncTimer);
+              syncTimer = null;
+              if (!await pushToTurso(true)) throw new Error('Tournament changes could not be synced');
+            } while (state.sync.status === 'pending');
+          }
+          if (state.sync.status !== 'synced' || !state.sync.revision) {
+            throw new Error('Reload the tournament before checking in');
+          }
+          const tournamentId = state.tournamentId;
+          const group = state.groups.find(item => item.players.includes(playerName));
+          const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}/checkin`, {
             method: 'POST',
             headers: getSyncHeaders(),
             body: JSON.stringify({
-              playerName, groupName, skill, checkedIn, time, source, walkIn,
+              playerName, groupName: group?.name || null, skill: getPlayerSkill(playerName), checkedIn, time, source,
               playerId: state.playerProfileIds?.[normalizeImportName(playerName)] || ''
             })
           });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Check-in sync failed (HTTP ${response.status})`);
-          if (state === target && generation === syncGeneration && !scoreSaveInProgress) {
-            await pullFromTurso(true);
-          }
-        } catch (err) {
-          console.error('Check-in saved locally but server sync failed:', err);
-          showToast(`Check-in saved locally, but server sync failed: ${err.message}`, 'error');
+          applyCheckInResult(result, tournamentId);
+        } finally {
+          checkInSaveInProgress = false;
+          app.inert = false;
         }
       }
 
@@ -1516,28 +1531,6 @@
         const order = state.config.ranking?.tiebreakers || ['wp', 'wins', 'pf', 'pa'];
         return order.map(k => TIEBREAKER_LABELS[k] || k).join(' → ');
       }
-      function resizeTotalPlayers(targetTotal, rerender) {
-        const total = Math.max(state.groups.length * 4, Math.min(80, targetTotal));
-        const gCount = state.groups.length;
-        const base = Math.floor(total / gCount);
-        const rem = total % gCount;
-        state.config.playersPerGroup = Math.ceil(total / gCount);
-        state.groups.forEach((g, gi) => {
-          const desired = base + (gi < rem ? 1 : 0);
-          while (g.players.length < desired) {
-            g.players.push(`Player ${g.id}${g.players.length + 1}`);
-          }
-          if (g.players.length > desired) {
-            g.players = g.players.slice(0, desired);
-          }
-          if (!g.players.includes(g.leader)) {
-            g.leader = g.players[0] || '';
-          }
-        });
-        saveState();
-        if (rerender !== false) render();
-      }
-
       function buildQR2Schedules(pools) {
         const schedules = {};
         const duplicate = getDuplicateGroupPlayer(pools);
@@ -1723,8 +1716,7 @@
           while (usedNames.has(name.toLowerCase())) {
             name = `Group ${id} (${suffix++})`;
           }
-          const players = Array.from({ length: state.config.playersPerGroup }, (_, i) => `Player ${id}${i + 1}`);
-          state.groups.push({ id, name, leader: players[0], players });
+          state.groups.push({ id, name, leader: '', players: [] });
         }
         if (state.groups.length > count) {
           state.groups = state.groups.slice(0, count);
@@ -2195,20 +2187,6 @@
         return true;
       }
 
-      function markPlayerCheckedIn(name, source, walkIn, checkedInAt) {
-        if (state.auth.role !== 'admin' && state.auth.role !== 'player') return;
-        if (!state.checkIns) state.checkIns = {};
-        const time = checkedInAt || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        state.checkIns[name] = { checkedIn: true, time, source: source || 'qr' };
-        if (state.auth.role === 'player') {
-          saveRegistry();
-          return;
-        }
-        saveState();
-        const grp = state.groups.find(g => g.players.includes(name));
-        syncCheckInToServer(name, grp ? grp.name : null, getPlayerSkill(name), true, time, source || 'qr', Boolean(walkIn));
-      }
-
       window.addEventListener('hashchange', () => {
         if (window.location.hash === '#checkin') {
           state.ui.playerCheckInMode = true;
@@ -2583,7 +2561,7 @@
       }
 
       function hasUnsyncedPlayerDeletionChanges() {
-        return Boolean(syncTimer || syncInFlight || scoreSaveInProgress ||
+        return Boolean(syncTimer || syncInFlight || scoreSaveInProgress || checkInSaveInProgress ||
           Object.values(registry.items || {}).some(tournament =>
             ['pending', 'syncing', 'error'].includes(tournament.sync?.status)));
       }
@@ -3182,11 +3160,11 @@
                     <input id="cfg-num-groups" type="number" min="2" max="8" value="${c.numGroups}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Total Players</label>
-                    <input id="cfg-total-players" type="number" min="${state.groups.length * 4}" max="80" value="${totalPlayers}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
+                    <label for="cfg-total-players" class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Rostered Players</label>
+                    <input id="cfg-total-players" type="number" value="${totalPlayers}" readonly class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
-                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Players / Group</label>
+                    <label class="block text-xs font-medium text-stone-500 dark:text-stone-400 mb-1">Players / Group Target</label>
                     <input id="cfg-players-per-group" type="number" min="4" max="12" value="${c.playersPerGroup}" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm tabular-nums" />
                   </div>
                   <div>
@@ -3276,7 +3254,7 @@
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 class="text-base font-bold">Players &amp; Group Configuration</h2>
-                  <p class="text-xs text-stone-500 dark:text-stone-400">${totalPlayers} registered across ${state.groups.length} groups · Drag a player by the handle to move them, or use the group menu on touch screens. Click ★ to set a leader.</p>
+                  <p class="text-xs text-stone-500 dark:text-stone-400">${totalPlayers} registered across ${state.groups.length} groups · Add players from profiles or import a roster. Drag a player by the handle to move them, or use the group menu on touch screens. Click ★ to set a leader.</p>
                 </div>
                 <div class="flex flex-wrap items-center gap-2">
                   ${state.auth.role === 'admin' ? '<button id="import-roster-btn" class="min-h-11 rounded-lg border border-stone-300 dark:border-stone-700 px-3 py-2 text-xs font-semibold transition hover:bg-cream-100 dark:hover:bg-stone-800">Import players</button>' : ''}
@@ -3387,8 +3365,8 @@
                 <p class="rounded-lg bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">Your roster is ready to generate a schedule.</p>
               ` : `
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-3 py-2">
-                  <p class="text-xs text-amber-700 dark:text-amber-400">${scheduleError ? esc(scheduleError) : invalidGroup ? `${esc(invalidGroup.name)} needs at least 4 players and a group leader.` : 'Add at least two groups before starting.'}</p>
-                  <button type="button" data-setup-step-nav="${scheduleError ? 2 : 3}" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">${scheduleError ? 'Review format &amp; scoring' : 'Review players &amp; groups'}</button>
+                  <p class="text-xs text-amber-700 dark:text-amber-400">${invalidGroup ? `${esc(invalidGroup.name)} needs at least 4 players and a group leader.` : scheduleError ? esc(scheduleError) : 'Add at least two groups before starting.'}</p>
+                  <button type="button" data-setup-step-nav="${invalidGroup || !scheduleError ? 3 : 2}" class="min-h-11 rounded-lg border border-amber-500/30 px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">${invalidGroup || !scheduleError ? 'Review players &amp; groups' : 'Review format &amp; scoring'}</button>
                 </div>
               `}
             </section>
@@ -4697,6 +4675,8 @@
 
       function renderCheckInView() {
         const isAdmin = state.auth.role === 'admin';
+        const ownRosterPlayer = state.auth.role === 'player' ? getOwnPlayerRosterEntry() : null;
+        const ownCheckIn = ownRosterPlayer ? state.checkIns?.[ownRosterPlayer.name] : null;
         const players = getAllImportedPlayers();
         const signedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
         const pendingCount = players.length - signedInCount;
@@ -4727,6 +4707,7 @@
               </div>
               <div class="flex flex-wrap items-center gap-2">
                 ${isAdmin ? '<button id="ci-import-btn" class="px-3.5 py-2 rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 text-xs font-semibold transition">Import Players</button>' : ''}
+                ${ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3.5 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold disabled:opacity-70">${ownCheckIn?.checkedIn ? 'Checked In' : 'Check In'}</button>` : ''}
                 <button id="show-qr-modal-btn" class="px-3.5 py-2 rounded-lg bg-gold-500 hover:bg-gold-400 text-stone-950 text-xs font-bold transition">Show Check-In QR Code</button>
                 <button id="launch-kiosk-btn" class="px-3.5 py-2 rounded-lg border border-stone-300 dark:border-stone-700 hover:bg-cream-100 dark:hover:bg-stone-800 text-xs font-semibold transition">Open Player Sign-In</button>
               </div>
@@ -4960,16 +4941,20 @@
           });
         });
         document.querySelectorAll('[data-player-self-checkin]').forEach(btn => {
-          btn.addEventListener('click', () => {
+          btn.addEventListener('click', async () => {
             const name = btn.getAttribute('data-player-self-checkin');
-            markPlayerCheckedIn(name, 'qr');
-            render();
-            const banner = document.getElementById('checkin-confirm-banner');
-            if (banner) {
-              banner.textContent = `✓ ${name} is signed in!`;
-              banner.classList.remove('hidden');
+            try {
+              await syncCheckInToServer(name, true, 'qr');
+              render();
+              const banner = document.getElementById('checkin-confirm-banner');
+              if (banner) {
+                banner.textContent = `✓ ${name} is signed in!`;
+                banner.classList.remove('hidden');
+              }
+              showToast(`${name} signed in`, 'success');
+            } catch (err) {
+              showToast(`Check-in for ${name} could not be confirmed: ${err.message}. Refresh before retrying.`, 'error');
             }
-            showToast(`${name} signed in`, 'success');
           });
         });
       }
@@ -5217,25 +5202,34 @@
           const button = event.currentTarget;
           const rosterEntry = getOwnPlayerRosterEntry();
           if (!rosterEntry) return;
+          if (checkInSaveInProgress || scoreSaveInProgress) {
+            showToast('Wait for the current save to finish', 'error');
+            return;
+          }
+          if (state.sync.status !== 'synced') {
+            showToast('Reload the tournament before checking in', 'error');
+            return;
+          }
+          checkInSaveInProgress = true;
+          const app = document.getElementById('app');
+          app.inert = true;
           button.disabled = true;
           try {
             const playerName = rosterEntry.name;
-            const result = await requestPlayerApi(`/api/player-auth/tournaments/${encodeURIComponent(state.tournamentId)}/checkin`, {
+            const tournamentId = state.tournamentId;
+            const result = await requestPlayerApi(`/api/player-auth/tournaments/${encodeURIComponent(tournamentId)}/checkin`, {
               method: 'POST',
               body: JSON.stringify({ playerName })
             });
-            markPlayerCheckedIn(playerName, 'player', false, result.time);
+            applyCheckInResult(result, tournamentId);
             render();
             showToast('You are checked in', 'success');
           } catch (err) {
             button.disabled = false;
-            if (err.status === 409 && /already checked in/i.test(err.message)) {
-              markPlayerCheckedIn(rosterEntry.name, 'player');
-              render();
-              showToast('You are already checked in', 'success');
-              return;
-            }
-            showToast(`Could not check in: ${err.message}`, 'error');
+            showToast(`Check-in could not be confirmed: ${err.message}. Refresh before retrying.`, 'error');
+          } finally {
+            checkInSaveInProgress = false;
+            app.inert = false;
           }
         });
       }
@@ -6352,7 +6346,7 @@
         document.getElementById('ci-import-btn')?.addEventListener('click', () => {
           openImportRosterModal();
         });
-        document.getElementById('ci-add-btn')?.addEventListener('click', () => {
+        document.getElementById('ci-add-btn')?.addEventListener('click', async () => {
           const name = document.getElementById('ci-add-name')?.value.trim();
           const gi = Number(document.getElementById('ci-add-group')?.value || 0);
           const skill = document.getElementById('ci-add-skill')?.value || 5;
@@ -6361,10 +6355,15 @@
           state.groups[gi].players.push(name);
           if (!state.groups[gi].leader) state.groups[gi].leader = name;
           setPlayerSkill(name, skill);
-          if (autoSignIn) markPlayerCheckedIn(name, 'desk');
-          else saveState();
-          render();
-          showToast(`Added ${name} to ${state.groups[gi].name}`, 'success');
+          saveState();
+          try {
+            if (autoSignIn) await syncCheckInToServer(name, true, 'desk');
+            render();
+            showToast(`Added ${name} to ${state.groups[gi].name}${autoSignIn ? ' and checked in' : ''}`, 'success');
+          } catch (err) {
+            render();
+            showToast(`Check-in could not be confirmed: ${err.message}. Check the roster and refresh before retrying.`, 'error');
+          }
         });
         document.querySelectorAll('[data-ci-leader]').forEach(btn => {
           btn.addEventListener('click', () => {
@@ -6403,12 +6402,23 @@
           });
         });
         document.querySelectorAll('[data-ci-edit-time]').forEach(inp => {
-          inp.addEventListener('change', () => {
+          inp.addEventListener('change', async () => {
             const name = inp.getAttribute('data-ci-edit-time');
             if (state.checkIns?.[name]) {
-              state.checkIns[name].time = inp.value.trim();
-              saveState();
-              render();
+              const time = inp.value.trim();
+              if (!time) {
+                inp.value = state.checkIns[name].time || '';
+                showToast('Enter a check-in time', 'error');
+                return;
+              }
+              try {
+                await syncCheckInToServer(name, true, state.checkIns[name].source || 'desk', time);
+                render();
+                showToast(`Updated check-in time for ${name}`, 'success');
+              } catch (err) {
+                inp.value = state.checkIns[name]?.time || '';
+                showToast(`Check-in time could not be confirmed: ${err.message}. Refresh before retrying.`, 'error');
+              }
             }
           });
         });
@@ -6423,18 +6433,16 @@
           });
         });
         document.querySelectorAll('[data-toggle-checkin]').forEach(btn => {
-          btn.addEventListener('click', () => {
+          btn.addEventListener('click', async () => {
             const name = btn.getAttribute('data-toggle-checkin');
-            if (!state.checkIns) state.checkIns = {};
-            if (state.checkIns[name]?.checkedIn) {
-              delete state.checkIns[name];
-              saveState();
-              showToast(`Removed check-in for ${name}`);
-            } else {
-              markPlayerCheckedIn(name, 'desk');
-              showToast(`Checked in ${name}`, 'success');
+            const checkedIn = !state.checkIns?.[name]?.checkedIn;
+            try {
+              await syncCheckInToServer(name, checkedIn, 'desk');
+              render();
+              showToast(checkedIn ? `Checked in ${name}` : `Removed check-in for ${name}`, 'success');
+            } catch (err) {
+              showToast(`Check-in for ${name} could not be confirmed: ${err.message}. Refresh before retrying.`, 'error');
             }
-            render();
           });
         });
 
@@ -6541,7 +6549,7 @@
           openModal(`
             <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
               <h3 class="text-base font-bold">Reset Tournament?</h3>
-              <p class="text-xs text-stone-500">This clears all schedules and scores and restores the default 30-player setup.</p>
+              <p class="text-xs text-stone-500">This clears all schedules, scores, roster entries, and attendance. Shared player profiles are not deleted.</p>
               <div class="flex justify-end gap-2">
                 <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
                 <button id="modal-reset-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Reset All</button>
@@ -6549,26 +6557,59 @@
             </div>
           `);
           document.getElementById('modal-cancel').addEventListener('click', closeModal);
-          document.getElementById('modal-reset-confirm').addEventListener('click', async () => {
+          document.getElementById('modal-reset-confirm').addEventListener('click', async event => {
+            const button = event.currentTarget;
+            button.disabled = true;
             const previous = state;
+            if (getSyncApiUrl()) {
+              if (state.sync.status === 'error') {
+                showToast('Resolve the tournament sync error before resetting', 'error');
+                button.disabled = false;
+                return;
+              }
+              if (syncTimer || syncInFlight || state.sync.status === 'pending') {
+                do {
+                  clearTimeout(syncTimer);
+                  syncTimer = null;
+                  if (!await pushToTurso(true)) {
+                    button.disabled = false;
+                    return;
+                  }
+                } while (state.sync.status === 'pending');
+              }
+            }
             if (state.phase === 'completed') {
               try {
                 if ((await getOpenTournaments()).some(tournament => String(tournament.id) !== String(previous.tournamentId))) {
                   showToast('Close or delete the open tournament before reopening this tournament', 'error');
+                  button.disabled = false;
                   return;
                 }
               } catch (err) {
                 showToast(`Could not check open tournaments: ${err.message}`, 'error');
+                button.disabled = false;
                 return;
               }
               if (state !== previous) return;
             }
             state = createDefaultState(previous.tournamentId);
             state.auth = previous.auth;
-            state.sync = previous.sync;
+            state.sync = { ...previous.sync };
             state.ui.activeTab = getRequestedPage();
+            if (getSyncApiUrl()) {
+              syncGeneration++;
+              if (!await pushToTurso(true, false, true)) {
+                state = previous;
+                state.sync.status = 'error';
+                saveRegistry();
+                closeModal();
+                render();
+                return;
+              }
+            } else {
+              saveState();
+            }
             closeModal();
-            saveState();
             render();
             showToast('Tournament reset', 'success');
           });
@@ -6576,13 +6617,11 @@
 
         // Setup bindings
         document.getElementById('cfg-num-groups')?.addEventListener('change', (e) => syncGroupCount(parseInt(e.target.value, 10) || 5));
-        document.getElementById('cfg-total-players')?.addEventListener('change', (e) => {
-          resizeTotalPlayers(parseInt(e.target.value, 10) || state.groups.length * 4);
-        });
         document.getElementById('cfg-players-per-group')?.addEventListener('change', (e) => {
           const ppg = Math.max(4, Math.min(12, parseInt(e.target.value, 10) || 6));
           state.config.playersPerGroup = ppg;
-          resizeTotalPlayers(ppg * state.groups.length);
+          saveState();
+          render();
         });
         document.querySelectorAll('[data-rk-num]').forEach(el => {
           el.addEventListener('change', () => {
@@ -6948,7 +6987,7 @@
             const latestTournament = latestRegistry.items?.[state.tournamentId];
             const localEditsPending = ['pending', 'syncing', 'error'].includes(state.sync?.status) ||
               ['pending', 'syncing'].includes(latestTournament?.sync?.status);
-            if (latestTournament && !localEditsPending && !scoreSaveInProgress &&
+            if (latestTournament && !localEditsPending && !scoreSaveInProgress && !checkInSaveInProgress &&
                 !isEditingFormField() && !hasUnsavedScoreEntry()) {
               const currentUi = state.ui;
               state = normalizeTournamentState({

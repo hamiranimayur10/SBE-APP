@@ -3,6 +3,14 @@
 const PlayerAnalytics = (() => {
   const STAGE_ORDER = { qr1: 1, qr2: 2, semis: 3, finals: 4 };
 
+  function getProfileSkillLevel(profile, isOwnProfile = false) {
+    if (!profile || (profile.visibility?.skill === false && !isOwnProfile)) return null;
+    const skill = profile.skill;
+    if (!Number.isInteger(skill) || skill < 1 || skill > 10) return null;
+    const label = skill <= 5 ? 'Beginner' : skill <= 7 ? 'Intermediate' : 'Advanced';
+    return { skill, label };
+  }
+
   function normalizeName(name) {
     return String(name || '')
       .normalize('NFKD')
@@ -359,9 +367,6 @@ const PlayerAnalytics = (() => {
         0,
         100
       );
-      player.rating = player.performanceIndex >= 90 ? 'Elite'
-        : player.performanceIndex >= 75 ? 'Advanced'
-          : player.performanceIndex >= 60 ? 'Intermediate' : 'Beginner';
       player.profile = profiles.get(player.key) || profileForName(player.name) || { name: player.name, photoUrl: '', age: null, club: '', ranking: '' };
       player.playerId = player.profile.playerId || playerProfileIds.get(player.key) || '';
     });
@@ -573,7 +578,7 @@ const PlayerAnalytics = (() => {
     return badges;
   }
 
-  return { accumulateStandings, buildAnalytics, computeStandings, extractMatchRecords, getBadges, normalizeName };
+  return { accumulateStandings, buildAnalytics, computeStandings, extractMatchRecords, getBadges, getProfileSkillLevel, normalizeName };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = PlayerAnalytics;

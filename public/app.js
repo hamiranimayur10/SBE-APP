@@ -4370,7 +4370,11 @@
           (group.players || []).some(name => window.PlayerAnalytics.normalizeName(analytics.resolveName(name)) === selected.key)
         );
         const partnerships = selected ? analytics.getPartnerships(selected.name) : [];
-        const isOwnProfile = state.auth.role === 'player' && playerAccountProfile && samePlayerIdentity(profile, playerAccountProfile);
+        const isOwnPlayerProfile = candidate => Boolean(
+          state.auth.role === 'player' && playerAccountProfile && samePlayerIdentity(candidate, playerAccountProfile)
+        );
+        const isOwnProfile = isOwnPlayerProfile(profile);
+        const skillLevel = window.PlayerAnalytics.getProfileSkillLevel(profile, isOwnProfile);
         const ownCheckInClosed = state.phase === 'completed';
         const ownRosterParticipant = isOwnProfile ? getOwnPlayerRosterEntry() : null;
         const ownRosterPlayer = ownCheckInClosed ? null : ownRosterParticipant;
@@ -4419,7 +4423,7 @@
                         ${getPlayerAvatar(player.name, player.profile, 'w-9 h-9')}
                         <span class="min-w-0 flex-1">
                           <span class="block truncate text-xs font-semibold">${esc(player.profile.displayName || player.name)}</span>
-                          <span class="block text-[10px] text-stone-500">${player.wins}W · ${player.losses}L · PI ${Math.round(player.performanceIndex)}</span>
+                          <span class="block text-[10px] text-stone-500">${player.wins}W · ${player.losses}L · ${window.PlayerAnalytics.getProfileSkillLevel(player.profile, isOwnPlayerProfile(player.profile))?.label || 'Skill unavailable'}</span>
                         </span>
                       </button>
                     `).join('')}
@@ -4433,7 +4437,7 @@
                       <div class="min-w-0 flex-1">
                         <div class="flex flex-wrap items-center gap-2">
                           <h2 class="text-xl font-extrabold">${esc(publicName)}</h2>
-                          <span class="px-2 py-0.5 rounded-full bg-gold-500/15 text-gold-700 dark:text-gold-400 text-[11px] font-bold">${selected.rating}</span>
+                          <span class="px-2 py-0.5 rounded-full bg-gold-500/15 text-gold-700 dark:text-gold-400 text-[11px] font-bold">${skillLevel?.label || 'Skill unavailable'}</span>
                         </div>
                         <div class="flex flex-wrap gap-x-3 gap-y-1 mt-1 text-xs text-stone-500">
                           ${profileDetail('age', 'Age', profile.age)}
@@ -4508,13 +4512,16 @@
                       <div class="${panelClass} p-4 sm:p-5 space-y-3">
                         <div class="flex items-center justify-between gap-2">
                           <div>
-                            <h3 class="font-bold text-sm">Performance Index</h3>
-                            <p class="text-[11px] text-stone-500 mt-1">Win rate 40% · normalized point diff 20% · normalized titles 20% · form 20%</p>
+                            <h3 class="font-bold text-sm">Skill Level</h3>
+                            <p class="text-[11px] text-stone-500 mt-1">Based on the player's profile skill, not match results or tournament overrides.</p>
                           </div>
-                          <div class="text-2xl font-extrabold tabular-nums">${Math.round(selected.performanceIndex)}</div>
+                          <div class="text-right">
+                            <div class="text-lg font-extrabold">${skillLevel?.label || 'Not available'}</div>
+                            ${skillLevel ? `<div class="text-xs text-stone-500">${skillLevel.skill}/10</div>` : ''}
+                          </div>
                         </div>
-                        <div class="h-2 rounded-full bg-stone-200 dark:bg-stone-800 overflow-hidden"><div class="h-full bg-gold-500 rounded-full" style="width:${selected.performanceIndex}%"></div></div>
-                        <div class="flex justify-between text-[10px] text-stone-500"><span>Beginner &lt;60</span><span>Intermediate 60–74</span><span>Advanced 75–89</span><span>Elite 90+</span></div>
+                        ${skillLevel ? `<div class="h-2 rounded-full bg-stone-200 dark:bg-stone-800 overflow-hidden"><div class="h-full bg-gold-500 rounded-full" style="width:${skillLevel.skill * 10}%"></div></div>` : '<p class="text-xs text-stone-500">A visible profile skill is required to show a level.</p>'}
+                        <div class="flex flex-wrap justify-between gap-2 text-[10px] text-stone-500"><span>Beginner 1–5</span><span>Intermediate 6–7</span><span>Advanced 8–10</span></div>
                       </div>
                     </section>
 
@@ -4572,7 +4579,7 @@
                         <div class="rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 p-3 flex flex-wrap items-center justify-between gap-3">
                           <div>
                             <div class="text-xs font-semibold">Estimated next-match outlook</div>
-                            <div class="text-[10px] text-stone-500 mt-1">Heuristic from the Performance Index and recorded scores; not betting or official ranking advice.</div>
+                            <div class="text-[10px] text-stone-500 mt-1">Heuristic from past match performance and recorded scores; not betting or official ranking advice.</div>
                           </div>
                           ${prediction ? `<div class="text-right text-xs tabular-nums"><div><b>${prediction.winProbabilityA.toFixed(0)}%</b> win chance · expected score <b>${prediction.expectedScoreA}–${prediction.expectedScoreB}</b></div><div class="text-[10px] text-stone-500 mt-1">Upset probability ${prediction.upsetProbability.toFixed(0)}% · sample confidence ${prediction.confidence.toFixed(0)}%</div></div>` : '<span class="text-xs text-stone-500">Select another player</span>'}
                         </div>

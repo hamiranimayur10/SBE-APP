@@ -2,7 +2,19 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { accumulateStandings, buildAnalytics, computeStandings, getBadges } = require('../public/player-analytics');
+const { accumulateStandings, buildAnalytics, computeStandings, getBadges, getProfileSkillLevel } = require('../public/player-analytics');
+
+test('profile skill levels use the 1–10 scale and respect visibility', () => {
+  for (const [skill, label] of [[1, 'Beginner'], [2, 'Beginner'], [3, 'Beginner'], [4, 'Beginner'], [5, 'Beginner'], [6, 'Intermediate'], [7, 'Intermediate'], [8, 'Advanced'], [9, 'Advanced'], [10, 'Advanced']]) {
+    assert.deepEqual(getProfileSkillLevel({ skill }), { skill, label });
+  }
+  for (const skill of [null, undefined, 0, 11, 3.5, '7']) {
+    assert.equal(getProfileSkillLevel({ skill }), null);
+  }
+  const hidden = { skill: 8, visibility: { skill: false } };
+  assert.equal(getProfileSkillLevel(hidden), null);
+  assert.deepEqual(getProfileSkillLevel(hidden, true), { skill: 8, label: 'Advanced' });
+});
 
 test('overall round 1 standings rank WP first without changing configured qualification order', () => {
   const players = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];

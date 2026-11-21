@@ -26,8 +26,10 @@ Page navigation keeps the selected tournament and configured API URL in the quer
    turso db create badminton-tournament
    turso db show badminton-tournament --url
    ```
-3. Add `SBE_TURSO_DATABASE_URL`, `SBE_TURSO_AUTH_TOKEN`, and a strong random `ADMIN_PASSWORD` (16–256 characters) to the Vercel project's **Production** environment variables, then deploy. The API also accepts the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` names. The API creates its tables automatically on first request.
+3. Add `SBE_TURSO_DATABASE_URL_Direct`, `SBE_TURSO_AUTH_TOKEN_Direct`, and a strong random `ADMIN_PASSWORD` (16–256 characters) to the Vercel project's **Production** environment variables, then deploy. The API also accepts the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` names. The API creates its tables automatically on first request.
 4. Open the Vercel URL. Cloud Sync uses the app's same-origin `/api` endpoints by default; no backend URL is needed.
+
+Set both `_Direct` variables to the intended production database before deploying this version. The previous `SBE_` names without `_Direct` are no longer read; each `_Direct` value independently takes precedence over its corresponding legacy `TURSO_` value. Verify any legacy values also refer to the intended database.
 
 Admins sign in with `ADMIN_PASSWORD`, not the old four-digit PIN or sync key. Each browser receives a separate HTTP-only session cookie valid for 30 days; signing out revokes that browser's session. Rotating `ADMIN_PASSWORD` and redeploying invalidates existing sessions. This is a shared admin password, not separate named accounts. Generate a long random value and share it only with trusted admins. Login attempts are limited to ten per 15 minutes across the deployment. Set the password before deploying this version; without it, admin sign-in is unavailable. Guests and players can still view the app.
 
@@ -39,7 +41,7 @@ Existing API clients may continue using `ADMIN_SYNC_KEY` via `x-sync-key`; remov
    npm install
    npm start
    ```
-Without Turso environment variables, local development uses `badminton-backend/local.db`. Copy `badminton-backend/.env.example` to `badminton-backend/.env` and set a strong `ADMIN_PASSWORD`. To use Turso locally, also set `SBE_TURSO_DATABASE_URL` and `SBE_TURSO_AUTH_TOKEN` (or the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`). The example file contains placeholders only. The app and API are available at `http://localhost:3001`. A static preview on port 8080 connects to port 3001 using the legacy PIN and `ADMIN_SYNC_KEY`; open port 3001 directly to use admin sessions.
+Without Turso environment variables, local development uses `badminton-backend/local.db`. Copy `badminton-backend/.env.example` to `badminton-backend/.env` and set a strong `ADMIN_PASSWORD`. To use Turso locally, also set `SBE_TURSO_DATABASE_URL_Direct` and `SBE_TURSO_AUTH_TOKEN_Direct` (or the legacy `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`). The backend reads its own `.env` and inherited process variables; it does not automatically load the root `.env.development.local` file. The example file contains placeholders only. The app and API are available at `http://localhost:3001`. A static preview on port 8080 connects to port 3001 using the legacy PIN and `ADMIN_SYNC_KEY`; open port 3001 directly to use admin sessions.
 
 ## Player accounts and profiles
 Admins can create a player-specific one-use invitation or a reusable invitation in the **Players** section. Share the generated link manually; the app does not send email or SMS. Email invitations require registration with the matching email address. Generic invitations can claim an unclaimed roster player or create a new profile.

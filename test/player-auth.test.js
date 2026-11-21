@@ -49,9 +49,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       ADMIN_SYNC_KEY: 'player-auth-test-admin-key',
       ADMIN_PASSWORD: 'admin-session-test-password',
       PORT: String(port),
-      SBE_TURSO_DATABASE_URL: databaseUrl,
-      SBE_TURSO_AUTH_TOKEN: '',
-      TURSO_DATABASE_URL: '',
+      SBE_TURSO_DATABASE_URL_Direct: databaseUrl,
+      SBE_TURSO_AUTH_TOKEN_Direct: '',
+      TURSO_DATABASE_URL: 'libsql://invalid-test-database.invalid',
       TURSO_AUTH_TOKEN: '',
       VERCEL: ''
     },

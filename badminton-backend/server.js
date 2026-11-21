@@ -26,7 +26,7 @@ class NotFoundError extends Error {}
 
 let db;
 function getDatabaseUrl() {
-  return process.env.SBE_TURSO_DATABASE_URL
+  return process.env.SBE_TURSO_DATABASE_URL_Direct
     || process.env.TURSO_DATABASE_URL
     || (!process.env.VERCEL ? 'file:./badminton-backend/local.db' : '');
 }
@@ -34,9 +34,9 @@ function getDatabaseUrl() {
 function getDb() {
   if (!db) {
     const databaseUrl = getDatabaseUrl();
-    const authToken = process.env.SBE_TURSO_AUTH_TOKEN || process.env.TURSO_AUTH_TOKEN;
+    const authToken = process.env.SBE_TURSO_AUTH_TOKEN_Direct || process.env.TURSO_AUTH_TOKEN;
     if (!databaseUrl || (databaseUrl.startsWith('file:') && process.env.VERCEL) || (!databaseUrl.startsWith('file:') && !authToken)) {
-      throw new Error('Configure SBE_TURSO_DATABASE_URL (or TURSO_DATABASE_URL) and SBE_TURSO_AUTH_TOKEN (or TURSO_AUTH_TOKEN) environment variables.');
+      throw new Error('Configure SBE_TURSO_DATABASE_URL_Direct (or TURSO_DATABASE_URL) and SBE_TURSO_AUTH_TOKEN_Direct (or TURSO_AUTH_TOKEN) environment variables.');
     }
     const options = { url: databaseUrl };
     if (authToken) options.authToken = authToken;

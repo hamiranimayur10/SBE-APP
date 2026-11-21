@@ -30,9 +30,9 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
     env: {
       ...process.env,
       PORT: String(port),
-      SBE_TURSO_DATABASE_URL: databaseUrl,
-      SBE_TURSO_AUTH_TOKEN: '',
-      TURSO_DATABASE_URL: '',
+      SBE_TURSO_DATABASE_URL_Direct: databaseUrl,
+      SBE_TURSO_AUTH_TOKEN_Direct: '',
+      TURSO_DATABASE_URL: 'libsql://invalid-test-database.invalid',
       TURSO_AUTH_TOKEN: '',
       ADMIN_SYNC_KEY: '',
       ADMIN_PASSWORD: '',

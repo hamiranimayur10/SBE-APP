@@ -19,6 +19,8 @@ The shared application code lives in `public/app.js` and is loaded by the dashbo
 
 Page navigation keeps the selected tournament and configured API URL in the query string. The check-in QR code links directly to the check-in page. Logged-in players can check in only their own roster entry from **Attendance** or their profile in **Players**; admins manage attendance on the check-in page.
 
+All app pages request `noindex, nofollow` from search engines. `robots.txt` asks compliant crawlers not to visit `/api/`, while leaving pages crawlable so they can discover the no-index directive. These directives do not provide access control or stop noncompliant bots; previously indexed API URLs may remain listed because crawlers cannot access them to see removal instructions. Search engines may take time to remove indexed pages.
+
 ## Deploy to Vercel
 1. Import this GitHub repository into Vercel with the repository root as the project root.
 2. Create a Turso database:

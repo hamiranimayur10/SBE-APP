@@ -67,6 +67,16 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
     assert.equal(response.status, 200);
     const html = await response.text();
     assert.match(html, /SBE Light Vs Dark Side Tournament/);
+    assert.match(html, /<meta name="robots" content="noindex, nofollow"\s*\/?>/i);
+    const robots = await fetch(`${baseUrl}/robots.txt`);
+    assert.equal(robots.status, 200);
+    assert.match(await robots.text(), /^User-agent: \*\s+Disallow: \/api\/\s*$/i);
+    const pages = (await fs.readdir(path.join(root, 'public'))).filter(name => name.endsWith('.html'));
+    for (const page of pages) {
+      const pageResponse = await fetch(`${baseUrl}/${page}?t=test`);
+      assert.equal(pageResponse.status, 200, page);
+      assert.match(await pageResponse.text(), /<meta name="robots" content="noindex, nofollow"\s*\/?>/i, page);
+    }
     const versions = getAssetVersions();
     assert.ok(html.includes(`app.js?v=${versions['app.js']}`));
     const asset = await fetch(`${baseUrl}/app.js?v=${versions['app.js']}`);

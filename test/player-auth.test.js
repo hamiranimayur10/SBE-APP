@@ -283,6 +283,31 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(versionsAfterScores.tournament, versionsBeforeScores.tournament + 2);
     const bothScores = await api('/api/tournaments/score-test');
     assert.deepEqual(bothScores.body.data.qr1Matches.map(match => match.s2), [10, 11]);
+    const search = await api('/api/player-directory?q=Roster');
+    assert.equal(search.response.status, 200);
+    assert.deepEqual(search.body.players.map(player => player.displayName), ['Roster Alice', 'Roster Bob']);
+    assert.deepEqual(Object.keys(search.body.players[0]).sort(), ['displayName', 'playerId']);
+    assert.deepEqual((await api('/api/player-directory?q=%25')).body.players, []);
+    const aliceId = search.body.players[0].playerId;
+    const bobId = search.body.players[1].playerId;
+    const alicePerformance = await api(`/api/player-performance?id=${aliceId}&tournament=score-test`);
+    assert.equal(alicePerformance.response.status, 200);
+    assert.equal(alicePerformance.body.player.wins, 1);
+    assert.equal(alicePerformance.body.player.results.length, 1);
+    assert.equal(alicePerformance.body.player.results[0].record.id, 'score-test:qr1:m1');
+    assert.equal(alicePerformance.body.comparison, null);
+    assert.equal(Object.hasOwn(alicePerformance.body, 'tournaments'), false);
+    assert.match(alicePerformance.response.headers.get('cache-control'), /no-store/);
+    const completeHistory = (await api('/api/tournament-history/public')).body;
+    const completeAnalytics = buildAnalytics(completeHistory.tournaments, completeHistory.players, 'score-test');
+    const completeAlice = completeAnalytics.getPlayer('Roster Alice');
+    assert.deepEqual(alicePerformance.body.player.results, completeAlice.results);
+    assert.equal(alicePerformance.body.player.rankingPointsEarned, completeAlice.rankingPointsEarned);
+    assert.equal(alicePerformance.body.rank, completeAnalytics.getTournamentRank('Roster Alice', 'score-test'));
+    assert.deepEqual(alicePerformance.body.partnerships, completeAnalytics.getPartnerships('Roster Alice'));
+    const comparison = await api(`/api/player-performance?id=${aliceId}&tournament=score-test&opponent=${bobId}`);
+    assert.equal(comparison.body.comparison.headToHead.totalMeetings, 1);
+    assert.equal(comparison.body.comparison.headToHead.wins, 1);
     const staleSnapshot = await api('/api/tournaments/score-test', {
       method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': createdScoreFixture.body.revision },
       body: JSON.stringify(scoreFixture)
@@ -597,6 +622,18 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const splitPublicHistory = await api('/api/tournament-history/public', { headers: { cookie: playerCookie } });
     assert.equal(Object.hasOwn(splitPublicHistory.body, 'ownPlayer'), false);
     assert.equal(splitPublicHistory.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
+    const renamedSearch = await api('/api/player-directory?q=Ace');
+    assert.ok(renamedSearch.body.players.some(player => player.playerId === update.body.player.playerId));
+    const hiddenNameSearch = await api('/api/player-directory?q=Renamed');
+    assert.equal(hiddenNameSearch.body.players.some(player => player.playerId === update.body.player.playerId), false);
+    const selectedUrl = `/api/player-performance?id=${update.body.player.playerId}`;
+    const privatePerformance = await api(selectedUrl, { headers: { cookie: playerCookie } });
+    const publicPerformance = await api(selectedUrl);
+    assert.equal(privatePerformance.body.player.profile.city, 'Hidden City');
+    assert.equal(publicPerformance.body.player.profile.city, '');
+    assert.equal(publicPerformance.body.player.profile.skill, null);
+    assert.equal(publicPerformance.body.player.name, 'Ace');
+    assert.equal(publicPerformance.body.player.profile.name, 'Ace');
     const anonymousSnapshot = await api('/api/tournament-history');
     assert.equal(anonymousSnapshot.body.ownPlayer, null);
 

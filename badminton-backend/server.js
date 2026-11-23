@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { promisify } = require('util');
 const { isDeepStrictEqual } = require('util');
 const { getAssetVersions } = require('./asset-versions');
+const PlayerAnalytics = require('../public/player-analytics');
 
 const app = express();
 app.use(cors());
@@ -151,6 +152,8 @@ async function initSchema() {
       }
       await getDb().execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_player_id ON player_profiles(player_id)');
       await getDb().execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_player_profiles_player_code ON player_profiles(player_code)');
+      await getDb().execute('CREATE INDEX IF NOT EXISTS idx_player_profiles_search_name ON player_profiles(player_name COLLATE NOCASE)');
+      await getDb().execute('CREATE INDEX IF NOT EXISTS idx_player_profiles_search_nickname ON player_profiles(nickname COLLATE NOCASE)');
       const rosterTransaction = await getDb().transaction('write');
       try {
         const tournamentRows = await rosterTransaction.execute('SELECT id, data FROM tournaments');
@@ -1125,6 +1128,144 @@ async function sendTournamentHistory(req, res, includeOwnPlayer) {
 
 app.get('/api/tournament-history/public', (req, res) => sendTournamentHistory(req, res, false));
 app.get('/api/tournament-history', (req, res) => sendTournamentHistory(req, res, true));
+
+app.get('/api/player-directory', async (req, res) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (query.length > 120) throw new ValidationError('Search must be at most 120 characters');
+    const prefix = `${query.replace(/[\\%_]/g, '\\$&')}%`;
+    const result = await getDb().execute({
+      sql: `SELECT player_id, display_name FROM (
+              SELECT player_id, player_name AS display_name FROM player_profiles
+              WHERE json_extract(visibility, '$.name') IS NOT 0 AND player_name LIKE ? ESCAPE '\\'
+              UNION ALL
+              SELECT player_id, nickname AS display_name FROM player_profiles
+              WHERE json_extract(visibility, '$.name') = 0 AND json_extract(visibility, '$.nickname') IS NOT 0
+                AND nickname != '' AND nickname LIKE ? ESCAPE '\\'
+              UNION ALL
+              SELECT player_id, 'Player' AS display_name FROM player_profiles
+              WHERE json_extract(visibility, '$.name') = 0
+                AND (json_extract(visibility, '$.nickname') = 0 OR nickname = '') AND 'Player' LIKE ? ESCAPE '\\'
+            )
+            ORDER BY display_name COLLATE NOCASE, player_id LIMIT 51`,
+      args: [prefix, prefix, prefix]
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      players: result.rows.slice(0, 50).map(row => ({ playerId: row.player_id, displayName: row.display_name })),
+      hasMore: result.rows.length > 50
+    });
+  } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Player directory search failed:', err);
+    res.status(500).json({ error: 'Player directory search is unavailable' });
+  }
+});
+
+let playerIdentityCache = null;
+app.get('/api/player-performance', async (req, res) => {
+  let transaction;
+  try {
+    const id = typeof req.query.id === 'string' ? req.query.id.trim() : '';
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    const tournamentId = typeof req.query.tournament === 'string' ? req.query.tournament : '';
+    const opponentId = typeof req.query.opponent === 'string' ? req.query.opponent : '';
+    if ((!id && !name) || id.length > 120 || name.length > 120 || tournamentId.length > 120 || opponentId.length > 120) {
+      throw new ValidationError('Select a valid player');
+    }
+    transaction = await getDb().transaction('read');
+    const profileResult = await transaction.execute({
+      sql: id ? 'SELECT * FROM player_profiles WHERE player_id = ?' :
+        'SELECT * FROM player_profiles WHERE player_name = ? COLLATE NOCASE',
+      args: [id || name]
+    });
+    if (!profileResult.rows.length) {
+      await transaction.commit();
+      return res.status(404).json({ error: 'Player profile is unavailable' });
+    }
+    const profileRow = profileResult.rows[0];
+    const versionResult = await transaction.execute('SELECT profiles FROM change_versions WHERE id = 1');
+    if (!versionResult.rows.length) throw new Error('Profile versions are unavailable');
+    const version = Number(versionResult.rows[0].profiles);
+    let identities = playerIdentityCache?.version === version ? playerIdentityCache.rows : null;
+    if (!identities) {
+      const identityResult = await transaction.execute('SELECT player_id, player_name, aliases, visibility FROM player_profiles');
+      identities = identityResult.rows;
+      playerIdentityCache = { version, rows: identities };
+    }
+    const tournamentResult = await transaction.execute(
+      'SELECT id, name, date, phase, data, updated_at FROM tournaments ORDER BY date DESC, updated_at DESC'
+    );
+    const token = getCookie(req, PLAYER_SESSION_COOKIE);
+    let own = false;
+    if (token) {
+      const sessionResult = await transaction.execute({
+        sql: `SELECT a.player_name FROM player_sessions s JOIN player_accounts a ON a.id = s.account_id
+              WHERE s.token_hash = ? AND s.expires_at > ? AND a.must_change_password = 0`,
+        args: [hashToken(token), new Date().toISOString()]
+      });
+      own = sessionResult.rows.length > 0 &&
+        normalizePlayerName(sessionResult.rows[0].player_name) === normalizePlayerName(profileRow.player_name);
+    }
+    await transaction.commit();
+    const profile = serializePlayerProfile(profileRow, !own);
+    const profileList = identities.map(row => {
+      if (row.player_id === profileRow.player_id) return profile;
+      return {
+        playerId: row.player_id,
+        name: row.player_name,
+        aliases: getProfileVisibility(row.visibility).name ? parseJsonField(row.aliases, []) : []
+      };
+    });
+    const tournaments = serializeTournamentHistory(tournamentResult.rows, identities);
+    const analytics = PlayerAnalytics.buildAnalytics(tournaments, profileList, tournamentId);
+    const selected = analytics.getPlayer(profile.name);
+    if (!selected) throw new Error('Selected player analytics are unavailable');
+    const tournament = tournaments.find(item => String(item.id) === tournamentId);
+    const group = tournament?.data?.groups?.find(item =>
+      (item.players || []).some(player => PlayerAnalytics.normalizeName(analytics.resolveName(player)) === selected.key)
+    );
+    const opponent = opponentId && profileList.find(item => item.playerId === opponentId);
+    let responsePlayer = selected;
+    if (!own && profile.visibility.name === false) {
+      const publicName = profile.visibility.nickname === false ? 'Player' : (profile.nickname || 'Player');
+      const publicKey = PlayerAnalytics.normalizeName(publicName);
+      const redactSide = side => side.map(player =>
+        PlayerAnalytics.normalizeName(player) === selected.key ? publicName : player
+      );
+      responsePlayer = {
+        ...selected,
+        key: publicKey,
+        name: publicName,
+        profile: { ...profile, name: publicName, displayName: publicName },
+        results: selected.results.map(result => ({
+          ...result,
+          record: { ...result.record, side1: redactSide(result.record.side1), side2: redactSide(result.record.side2) }
+        }))
+      };
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      player: responsePlayer,
+      rank: analytics.getTournamentRank(profile.name, tournamentId),
+      seed: analytics.getSeedPosition(profile.name, tournamentId),
+      groupName: group?.name || '',
+      partnerships: analytics.getPartnerships(profile.name),
+      comparison: opponent && opponent.playerId !== profile.playerId ? {
+        opponentId: opponent.playerId,
+        headToHead: analytics.getHeadToHead(profile.name, opponent.name),
+        prediction: analytics.getPrediction(profile.name, opponent.name,
+          tournament?.data?.config?.pointsToWin, tournament?.data?.config?.deuceCap)
+      } : null
+    });
+  } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Player performance lookup failed:', err);
+    res.status(500).json({ error: 'Player performance is unavailable' });
+  } finally {
+    if (transaction) transaction.close();
+  }
+});
 
 app.get('/api/player-auth/invites/:token', async (req, res) => {
   try {

@@ -220,6 +220,11 @@
             const ownPlayerCard = state.auth.role === 'player' && page === 'players' && playerAccountProfile;
             if (ownPlayerCard) {
               state.ui.selectedPlayerName = playerAccountProfile.name;
+              playerData.selectedId = playerAccountProfile.playerId;
+              state.ui.selectedPlayerId = playerAccountProfile.playerId;
+              playerData.summary = null;
+              playerData.opponentId = '';
+              playerData.loaded = false;
             }
             if (page === getRequestedPage()) {
               if (ownPlayerCard) render();
@@ -343,10 +348,12 @@
 
       function loadState() {
         let playerParam = '';
+        let playerIdParam = '';
         try {
           const params = new URLSearchParams(window.location.search);
           const tParam = params.get('t');
           playerParam = params.get('player') || '';
+          playerIdParam = params.get('playerId') || '';
           if (tParam && registry.items[tParam]) {
             registry.activeId = tParam;
           } else if (tParam && !registry.items[tParam]) {
@@ -360,9 +367,10 @@
         normalized.ui.activeTab = getRequestedPage();
         normalized.ui.bracketOpen = false;
         if (normalized.auth.role === 'guest' && normalized.ui.activeTab === 'setup') normalized.ui.activeTab = 'dashboard';
-        if (playerParam) {
+        if (playerParam || playerIdParam) {
           normalized.ui.activeTab = 'players';
           normalized.ui.selectedPlayerName = playerParam;
+          normalized.ui.selectedPlayerId = playerIdParam;
         }
         return normalized;
       }
@@ -372,7 +380,11 @@
       let syncGeneration = 0;
       let scoreSaveInProgress = false;
       let checkInSaveInProgress = false;
-      let playerData = { loaded: false, loading: false, error: '', tournaments: [], profiles: [] };
+      let playerData = {
+        loaded: false, loading: false, error: '', tournaments: [], profiles: [],
+        selectedId: '', summary: null, opponentId: '', opponentName: '', directory: [], directoryLoaded: false,
+        directoryError: '', directoryHasMore: false
+      };
       let playerDataPromise = null;
       let tournamentCatalog = { loaded: false, loading: false, error: '', items: [] };
       let tournamentCatalogPromise = null;
@@ -630,7 +642,7 @@
         return result;
       }
 
-      function applyPlayerAccount(profile, mustChangePassword, activeTab) {
+      function applyPlayerAccount(profile, mustChangePassword, activeTab, honorPlayerLink = false) {
         playerAccountProfile = profile;
         playerMustChangePassword = Boolean(mustChangePassword);
         playerAuthError = '';
@@ -638,7 +650,14 @@
         state.auth.loggedIn = true;
         state.auth.role = 'player';
         state.ui.activeTab = activeTab || (state.ui.activeTab === 'setup' ? 'tournaments' : state.ui.activeTab);
-        state.ui.selectedPlayerName = profile.name;
+        const link = honorPlayerLink ? new URLSearchParams(window.location.search) : null;
+        const linkedId = link?.get('playerId') || '';
+        const linkedName = link?.get('player') || '';
+        state.ui.selectedPlayerName = linkedId ? '' : (linkedName || profile.name);
+        state.ui.selectedPlayerId = linkedId || (linkedName ? '' : profile.playerId);
+        playerData.selectedId = state.ui.selectedPlayerId;
+        playerData.summary = null;
+        playerData.opponentId = '';
         playerData.profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
         playerData.profiles.push(profile);
         playerData.loaded = false;
@@ -662,13 +681,17 @@
         }
         playerAccountProfile = null;
         playerMustChangePassword = false;
+        playerData.selectedId = '';
+        playerData.summary = null;
+        playerData.opponentId = '';
+        state.ui.selectedPlayerId = '';
         playerData.loaded = false;
       }
 
       async function restorePlayerSession() {
         try {
           const result = await requestPlayerApi('/api/player-auth/me');
-          applyPlayerAccount(result.player, result.mustChangePassword);
+          applyPlayerAccount(result.player, result.mustChangePassword, undefined, true);
           return true;
         } catch (err) {
           if (err.status === 401 || /HTTP 401/.test(err.message)) {
@@ -729,8 +752,15 @@
         playerData.profiles = profiles;
         playerData.loaded = !getSyncApiUrl();
         try {
-          localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(profiles));
-        } catch (_err) {
+          const cached = JSON.parse(localStorage.getItem(PLAYER_PROFILES_KEY) || '[]');
+          if (!Array.isArray(cached)) throw new Error('Stored profiles are not a list');
+          const merged = cached.filter(item =>
+            !(savedProfile.playerId && item?.playerId === savedProfile.playerId) && !samePlayerIdentity(item, savedProfile)
+          );
+          merged.push(savedProfile);
+          localStorage.setItem(PLAYER_PROFILES_KEY, JSON.stringify(merged));
+        } catch (err) {
+          console.error('Could not cache player profile:', err);
           showToast('Profile saved, but this browser could not cache it locally', 'error');
         }
         return savedProfile;
@@ -849,33 +879,38 @@
             return;
           }
           try {
-            const [historyResponse, ownAccount] = await Promise.all([
-              fetch(`${apiUrl}/api/tournament-history/public`, { cache: 'no-store' }),
-              state.auth.role === 'player' ? requestPlayerApi('/api/player-auth/me') : null
-            ]);
-            let historyJson = await historyResponse.json();
-            if (!historyResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${historyResponse.status})`);
-            if (!Array.isArray(historyJson.tournaments) || !Array.isArray(historyJson.players)) {
-              throw new Error('Invalid player directory response');
+            const id = playerData.selectedId || state.ui.selectedPlayerId || '';
+            const name = state.ui.selectedPlayerName;
+            const opponentId = playerData.opponentId;
+            if (!id && !name) {
+              playerData.summary = null;
+              playerData.profiles = [];
+              playerData.tournaments = [];
+              return;
             }
-            if (ownAccount) {
-              const publicProfile = historyJson.players.find(profile => profile.playerId === ownAccount.player.playerId);
-              if (!publicProfile || publicProfile.revision !== ownAccount.player.revision) {
-                const snapshotResponse = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
-                historyJson = await snapshotResponse.json();
-                if (!snapshotResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${snapshotResponse.status})`);
-                if (!Array.isArray(historyJson.tournaments) || !Array.isArray(historyJson.players) || !historyJson.ownPlayer) {
-                  throw new Error('Player profile changed; reload the player directory');
-                }
-              } else {
-                historyJson.ownPlayer = ownAccount.player;
-              }
+            const tournamentId = String(state.tournamentId || '');
+            const params = new URLSearchParams({ tournament: tournamentId });
+            if (id) params.set('id', id);
+            else params.set('name', name);
+            if (opponentId) params.set('opponent', opponentId);
+            const response = await fetch(`${apiUrl}/api/player-performance?${params}`, { cache: 'no-store' });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || `Player history request failed (HTTP ${response.status})`);
+            if (!result.player?.profile?.playerId || !Array.isArray(result.player.results) || !Array.isArray(result.partnerships)) {
+              throw new Error('Invalid player performance response');
             }
-            playerData.tournaments = historyJson.tournaments;
-            if (state.auth.role === 'player' && historyJson.ownPlayer) playerAccountProfile = historyJson.ownPlayer;
-            playerData.profiles = playerAccountProfile && state.auth.role === 'player'
-              ? [...historyJson.players.filter(profile => profile.playerId !== playerAccountProfile.playerId), playerAccountProfile]
-              : historyJson.players;
+            if (String(state.tournamentId || '') !== tournamentId ||
+                (playerData.selectedId || state.ui.selectedPlayerId || '') !== id || playerData.opponentId !== opponentId ||
+                (!id && state.ui.selectedPlayerName !== name)) return;
+            playerData.selectedId = result.player.profile.playerId;
+            state.ui.selectedPlayerId = playerData.selectedId;
+            state.ui.selectedPlayerName = result.player.name;
+            if (state.auth.role === 'player' && playerAccountProfile?.playerId === result.player.profile.playerId) {
+              playerAccountProfile = result.player.profile;
+            }
+            playerData.summary = result;
+            playerData.profiles = [result.player.profile];
+            playerData.tournaments = [];
           } catch (err) {
             playerData.error = `Could not load current cloud player data: ${err.message}`;
           }
@@ -1519,8 +1554,15 @@
         if (!next) return;
         const keepAuth = state.auth;
         const keepSync = state.sync;
+        const selectedPlayerName = state.ui.selectedPlayerName;
         state = normalizeTournamentState({ ...next, auth: keepAuth, sync: { ...keepSync, ...(next.sync || {}), apiUrl: keepSync.apiUrl, syncKey: keepSync.syncKey, remoteListed: Boolean(next.sync?.remoteListed) } }, id);
         state.ui.activeTab = getRequestedPage();
+        if (state.ui.activeTab === 'players' && getSyncApiUrl()) {
+          state.ui.selectedPlayerName = selectedPlayerName;
+          state.ui.selectedPlayerId = playerData.selectedId;
+          playerData.loaded = false;
+          playerData.summary = null;
+        }
         if (state.auth.role === 'guest' && state.ui.activeTab === 'setup') state.ui.activeTab = 'dashboard';
         window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
         saveRegistry();
@@ -2285,6 +2327,93 @@
         showToast('Simulated remaining matches', 'success');
       }
 
+      async function simulateKnockoutScores(stage) {
+        if (state.auth.role !== 'admin') return;
+        if (hasUnsavedScoreEntry()) {
+          showToast('Save or discard score changes before simulating', 'error');
+          return;
+        }
+        const tournamentId = state.tournamentId;
+        const targets = stage === 'semis'
+          ? Object.entries(state.semis || {}).flatMap(([key, matches]) =>
+            matches.filter(match => !match.completed).map(match => ({ key, id: match.id })))
+          : Object.entries(state.finals || {}).filter(([, final]) => final && !final.completed)
+            .map(([key, final]) => ({ key, id: final.id || key }));
+        let saved = 0;
+        for (const { key, id } of targets) {
+          if (state.tournamentId !== tournamentId) {
+            showToast(`Simulation stopped (${saved} saved): tournament changed`, 'error');
+            return;
+          }
+          const match = stage === 'semis'
+            ? (state.semis[key] || []).find(item => item.id === id)
+            : state.finals[key];
+          if (!match || String(match.id || key) !== String(id)) {
+            showToast(`Simulation stopped (${saved} saved): schedule changed`, 'error');
+            return;
+          }
+          if (match.completed) continue;
+          if (stage === 'semis' && state.finals[key]) {
+            showToast(`Simulation stopped (${saved} saved): Group ${key} already has a final`, 'error');
+            return;
+          }
+          let score;
+          if (stage === 'semis') {
+            const [s1, s2] = randomValidScore();
+            score = { s1, s2 };
+          } else {
+            if (!Array.isArray(match.games) || match.games.some(game =>
+              !game || !((game.s1 === null && game.s2 === null) ||
+                isValidSingleScore(game.s1, game.s2, state.config.pointsToWin, state.config.deuceCap)))) {
+              showToast(`Simulation stopped (${saved} saved): Group ${key} has invalid final scores`, 'error');
+              return;
+            }
+            const games = match.games.map(game => ({ s1: game.s1, s2: game.s2 }));
+            let wins1 = games.filter(game => game.s1 !== null && game.s1 > game.s2).length;
+            let wins2 = games.filter(game => game.s2 !== null && game.s2 > game.s1).length;
+            const needed = match.format === 'bo3' ? 2 : 1;
+            for (const game of games) {
+              if (wins1 >= needed || wins2 >= needed) break;
+              if (game.s1 !== null || game.s2 !== null) continue;
+              [game.s1, game.s2] = randomValidScore();
+              if (game.s1 > game.s2) wins1++; else wins2++;
+            }
+            if (wins1 < needed && wins2 < needed) {
+              showToast(`Simulation stopped (${saved} saved): Group ${key} has invalid final scores`, 'error');
+              return;
+            }
+            score = { games };
+          }
+          const scores = stage === 'semis' ? [score] : score.games.filter(game => game.s1 !== null);
+          if (scores.some(game => !isValidSingleScore(game.s1, game.s2, state.config.pointsToWin, state.config.deuceCap))) {
+            showToast(`Simulation stopped (${saved} saved): invalid scoring configuration`, 'error');
+            return;
+          }
+          if (getSyncApiUrl()) {
+            const expectedMatch = JSON.parse(JSON.stringify(match));
+            const listKey = stage === 'semis' ? `semi_${key}` : `final_${key}`;
+            if (!await saveMatchScore(listKey, id, expectedMatch, score, null)) {
+              showToast(`Simulation stopped (${saved} saved); review the save error`, 'error');
+              return;
+            }
+          } else {
+            if (stage === 'semis') Object.assign(match, score);
+            else {
+              match.games = score.games;
+              const wins1 = score.games.filter(game => game.s1 !== null && game.s1 > game.s2).length;
+              const wins2 = score.games.filter(game => game.s2 !== null && game.s2 > game.s1).length;
+              match.winner = wins1 > wins2 ? match.t1 : match.t2;
+            }
+            match.completed = true;
+            match.completedAt = new Date().toISOString();
+            saveState();
+            render();
+          }
+          saved++;
+        }
+        showToast(`Simulated ${saved} remaining ${saved === 1 ? 'match' : 'matches'}`, 'success');
+      }
+
       function confirmScoreCorrection(listKey, save, isCurrent) {
         let affected = '';
         let reset;
@@ -2985,12 +3114,17 @@
               refreshError = err.message;
               console.error('Players were deleted, but anonymized tournaments could not be reloaded:', err);
             }
+            state.ui.selectedPlayerName = '';
+            state.ui.selectedPlayerId = '';
+            state.ui.headToHeadOpponent = '';
+            playerData.selectedId = '';
+            playerData.summary = null;
+            playerData.opponentId = '';
             playerData.loaded = false;
             await loadPlayerData(true);
-            state.ui.selectedPlayerName = '';
-            state.ui.headToHeadOpponent = '';
             const currentUrl = new URL(window.location.href);
             currentUrl.searchParams.delete('player');
+            currentUrl.searchParams.delete('playerId');
             history.replaceState(null, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
             saveRegistry();
             render();
@@ -3049,12 +3183,17 @@
               refreshError = err.message;
               console.error('Player was deleted, but anonymized tournaments could not be reloaded:', err);
             }
+            state.ui.selectedPlayerName = '';
+            state.ui.selectedPlayerId = '';
+            state.ui.headToHeadOpponent = '';
+            playerData.selectedId = '';
+            playerData.summary = null;
+            playerData.opponentId = '';
             playerData.loaded = false;
             await loadPlayerData(true);
-            state.ui.selectedPlayerName = '';
-            state.ui.headToHeadOpponent = '';
             const currentUrl = new URL(window.location.href);
             currentUrl.searchParams.delete('player');
+            currentUrl.searchParams.delete('playerId');
             history.replaceState(null, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
             saveRegistry();
             render();
@@ -3874,6 +4013,7 @@
                   const match = roundMatches.find(item => item.court === court);
                   return match
                     ? renderMatchCard(match, listKey, ++matchNumber)
+                    : court === 2 ? ''
                     : `<div class="rounded-xl border border-dashed border-stone-300 dark:border-stone-700 p-3.5 text-xs text-stone-400">Court ${court} · no compatible match in this slot</div>`;
                 }).join('')}
               </div>
@@ -4093,6 +4233,11 @@
         const readyToComplete = isAdmin && TournamentDraw.isTournamentReadyToComplete(state);
         return `
           <div class="space-y-5">
+            ${isAdmin && finalKeys.some(k => !state.finals[k].completed) ? `
+              <div class="flex justify-end">
+                <button id="sim-finals-btn" type="button" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>
+              </div>
+            ` : ''}
             ${isAdmin && state.phase !== 'completed' ? `
               <div class="rounded-xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-4 flex flex-wrap items-center justify-between gap-3">
                 <p class="text-xs text-stone-500">${readyToComplete ? 'All matches are complete. Mark the tournament done to move it to Past Tournaments and close player check-in.' : 'Complete all qualifying matches, semi-finals, and finals before marking the tournament done.'}</p>
@@ -4577,6 +4722,10 @@
                 onSaved(savedProfile);
               } else {
                 state.ui.selectedPlayerName = savedProfile.name;
+                state.ui.selectedPlayerId = savedProfile.playerId;
+                playerData.selectedId = savedProfile.playerId;
+                playerData.summary = null;
+                playerData.opponentId = '';
                 state.ui.headToHeadOpponent = '';
                 playerData.error = '';
                 saveRegistry();
@@ -4700,34 +4849,38 @@
       }
 
       function renderPlayerProfilesView() {
-        const analytics = window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId);
-        const directory = [...analytics.players]
+        const cloud = Boolean(getSyncApiUrl());
+        const analytics = cloud ? null : window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId);
+        const directory = cloud ? playerData.directory.map(item => ({
+          key: item.playerId, name: item.displayName, profile: { displayName: item.displayName }
+        })) : [...analytics.players]
           .filter(player => !isAnonymizedPlayerName(player.name) &&
             (!getSyncApiUrl() || playerData.profiles.some(profile => samePlayerIdentity(profile, { name: player.name }))))
           .sort((a, b) => a.name.localeCompare(b.name));
         const playerSearch = (state.ui.playerSearch || '').toLocaleLowerCase().trim();
-        const requestedPlayer = analytics.getPlayer(state.ui.selectedPlayerName);
-        const selected = directory.find(player => player.key === requestedPlayer?.key) || directory[0] || null;
-        const opponent = directory.find(player =>
+        const requestedPlayer = cloud ? playerData.summary?.player : analytics.getPlayer(state.ui.selectedPlayerName);
+        const selected = cloud ? requestedPlayer : directory.find(player => player.key === requestedPlayer?.key) || directory[0] || null;
+        const opponent = cloud ? (playerData.opponentId ? { key: playerData.opponentId, name: playerData.opponentName } : null) : directory.find(player =>
           player.key !== selected?.key && player.key === window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent)
         ) || directory.find(player => player.key !== selected?.key) || null;
-        const headToHead = selected && opponent ? analytics.getHeadToHead(selected.name, opponent.name) : null;
-        const prediction = selected && opponent
+        const headToHead = cloud ? playerData.summary?.comparison?.headToHead :
+          selected && opponent ? analytics.getHeadToHead(selected.name, opponent.name) : null;
+        const prediction = cloud ? playerData.summary?.comparison?.prediction : selected && opponent
           ? analytics.getPrediction(selected.name, opponent.name, state.config.pointsToWin, state.config.deuceCap)
           : null;
         const profile = selected?.profile || {};
         const badges = window.PlayerAnalytics.getBadges(selected);
         const matchHistory = selected ? [...selected.results].reverse() : [];
-        const tournamentRank = selected ? analytics.getTournamentRank(selected.name, state.tournamentId) : null;
-        const seedPosition = selected ? analytics.getSeedPosition(selected.name, state.tournamentId) : null;
+        const tournamentRank = cloud ? playerData.summary?.rank : selected ? analytics.getTournamentRank(selected.name, state.tournamentId) : null;
+        const seedPosition = cloud ? playerData.summary?.seed : selected ? analytics.getSeedPosition(selected.name, state.tournamentId) : null;
         const playerState = playerData.tournaments.find(tournament =>
           String(tournament.id || tournament.tournamentId) === String(state.tournamentId)
         );
         const groups = playerState?.data?.groups || [];
-        const playerGroup = selected && groups.find(group =>
+        const playerGroup = !cloud && selected && groups.find(group =>
           (group.players || []).some(name => window.PlayerAnalytics.normalizeName(analytics.resolveName(name)) === selected.key)
         );
-        const partnerships = selected ? analytics.getPartnerships(selected.name) : [];
+        const partnerships = cloud ? (playerData.summary?.partnerships || []) : selected ? analytics.getPartnerships(selected.name) : [];
         const isOwnPlayerProfile = candidate => Boolean(
           state.auth.role === 'player' && playerAccountProfile && samePlayerIdentity(candidate, playerAccountProfile)
         );
@@ -4767,24 +4920,22 @@
             </div>
             ${playerData.error ? `<div role="status" class="p-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-xs text-amber-700 dark:text-amber-300">${esc(playerData.error)}. Previously loaded results may be out of date.</div>` : ''}
             ${playerData.loading ? `<div class="p-3 rounded-lg ${panelClass} text-xs text-stone-500">Loading player history…</div>` : ''}
-            ${directory.length === 0 && !playerData.loading ? renderEmptyState('No players found', 'Add players to a tournament roster or create a player profile as an admin.') : `
+            ${!cloud && directory.length === 0 && !playerData.loading ? renderEmptyState('No players found', 'Add players to a tournament roster or create a player profile as an admin.') : `
               <div class="grid grid-cols-1 lg:grid-cols-[260px_minmax(0,1fr)] gap-5 items-start">
                 <aside class="${panelClass} p-4 space-y-3">
                   <div class="flex items-center justify-between">
                     <h2 class="font-bold text-sm">Player Directory</h2>
-                    <span class="text-[11px] text-stone-500">${directory.length} players</span>
+                    <span class="text-[11px] text-stone-500">${cloud ? 'Search to browse' : `${directory.length} players`}</span>
                   </div>
-                  <input id="player-directory-search" type="search" value="${esc(state.ui.playerSearch || '')}" placeholder="Search players…" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
-                  <div class="max-h-[28rem] overflow-y-auto space-y-1">
+                  <input id="player-directory-search" type="search" autocomplete="off" value="${esc(state.ui.playerSearch || '')}" placeholder="Search players…" aria-label="Search players" aria-controls="player-directory-results" class="w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" />
+                  <div id="player-directory-results" class="max-h-[28rem] overflow-y-auto space-y-1">
                     ${directory.map(player => `
-                      <button data-player-select="${esc(player.name)}" data-player-directory-name="${esc((player.profile.displayName || player.name).toLocaleLowerCase())}" class="w-full flex items-center gap-2.5 text-left p-2 rounded-lg transition ${playerSearch && !(player.profile.displayName || player.name).toLocaleLowerCase().includes(playerSearch) ? 'hidden' : ''} ${player.key === selected?.key ? 'bg-gold-500/15 border border-gold-500/30' : 'hover:bg-cream-100 dark:hover:bg-stone-800 border border-transparent'}">
-                        ${getPlayerAvatar(player.name, player.profile, 'w-9 h-9')}
-                        <span class="min-w-0 flex-1">
-                          <span class="block truncate text-xs font-semibold">${esc(player.profile.displayName || player.name)}</span>
-                          <span class="block text-[10px] text-stone-500">${player.wins}W · ${player.losses}L · ${window.PlayerAnalytics.getProfileSkillLevel(player.profile, isOwnPlayerProfile(player.profile))?.label || 'Skill unavailable'}</span>
-                        </span>
+                      <button ${cloud ? `data-player-select-id="${esc(player.key)}"` : `data-player-select="${esc(player.name)}"`} data-player-directory-name="${esc((player.profile.displayName || player.name).toLocaleLowerCase())}" class="w-full text-left p-2 rounded-lg text-xs font-semibold hover:bg-cream-100 dark:hover:bg-stone-800 ${!cloud && playerSearch && !(player.profile.displayName || player.name).toLocaleLowerCase().includes(playerSearch) ? 'hidden' : ''}">
+                        ${esc(player.profile.displayName || player.name)}
                       </button>
                     `).join('')}
+                    ${cloud && playerData.directoryHasMore ? '<p class="text-xs text-stone-500">Showing the first 50 players. Type a name to narrow the results.</p>' : ''}
+                    ${cloud && playerData.directoryError ? `<p role="alert" class="text-xs text-red-600">${esc(playerData.directoryError)}</p>` : ''}
                   </div>
                 </aside>
 
@@ -4846,7 +4997,7 @@
                       </div>
                       <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
                         ${metricCard('Tournament Rank', tournamentRank ? `#${tournamentRank}` : '—', state.config.name)}
-                        ${metricCard('Seed Position', seedPosition ? `#${seedPosition.position}` : '—', seedPosition ? `${playerGroup?.name || 'QR1 group'} · ${seedPosition.total} players` : 'Available after QR1')}
+                        ${metricCard('Seed Position', seedPosition ? `#${seedPosition.position}` : '—', seedPosition ? `${(cloud ? playerData.summary?.groupName : playerGroup?.name) || 'QR1 group'} · ${seedPosition.total} players` : 'Available after QR1')}
                         ${metricCard('Ranking Points Earned', Math.round(selected.rankingPointsEarned))}
                         ${metricCard('Titles Won', selected.titlesWon)}
                         ${metricCard('Finals Reached', selected.finalsReached)}
@@ -4921,8 +5072,10 @@
                           <h3 class="font-bold text-sm">Head-to-Head &amp; Match Forecast</h3>
                           <p class="text-[11px] text-stone-500 mt-1">Includes singles and opposing doubles matchups.</p>
                         </div>
-                        <select id="head-to-head-opponent" class="max-w-48 px-2.5 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" ${directory.length < 2 ? 'disabled' : ''}>
-                          ${directory.filter(player => player.key !== selected.key).map(player => `<option value="${esc(player.name)}" ${player.key === opponent?.key ? 'selected' : ''}>${esc(player.profile.displayName || player.name)}</option>`).join('')}
+                        <select id="head-to-head-opponent" class="max-w-48 px-2.5 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-xs" ${!cloud && directory.length < 2 ? 'disabled' : ''}>
+                          ${cloud ? '<option value="">Search for an opponent</option>' : ''}
+                          ${cloud && opponent && !directory.some(player => player.key === opponent.key) ? `<option value="${esc(opponent.key)}" selected>${esc(opponent.name)}</option>` : ''}
+                          ${directory.filter(player => player.key !== (cloud ? playerData.selectedId : selected.key)).map(player => `<option value="${esc(cloud ? player.key : player.name)}" ${player.key === opponent?.key ? 'selected' : ''}>${esc(player.profile.displayName || player.name)}</option>`).join('')}
                         </select>
                       </div>
                       ${opponent && headToHead ? `
@@ -4970,11 +5123,121 @@
                       </div>
                     </section>
                   </div>
-                ` : ''}
+                ` : cloud && !playerData.loading ? '<p class="text-sm text-stone-500">Search for and select a player to view their performance.</p>' : ''}
               </div>
             `}
           </section>
         `;
+      }
+
+      function bindPlayerDirectory() {
+        const search = document.getElementById('player-directory-search');
+        const results = document.getElementById('player-directory-results');
+        if (!search || !results) return;
+        const cloud = Boolean(getSyncApiUrl());
+        let timer = null;
+        let requestNumber = 0;
+        const updateSearch = async () => {
+          const query = search.value.trim();
+          const request = ++requestNumber;
+          try {
+            const response = await fetch(`${getSyncApiUrl()}/api/player-directory?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || `Player search failed (HTTP ${response.status})`);
+            if (!Array.isArray(result.players)) throw new Error('Invalid player search response');
+            if (!search.isConnected || request !== requestNumber || query !== search.value.trim()) return;
+            playerData.directory = result.players;
+            playerData.directoryLoaded = true;
+            playerData.directoryHasMore = Boolean(result.hasMore);
+            playerData.directoryError = '';
+            results.innerHTML = result.players.map(player =>
+              `<button type="button" data-player-select-id="${esc(player.playerId)}" data-player-directory-name="${esc(player.displayName.toLocaleLowerCase())}" class="w-full text-left p-2 rounded-lg text-xs font-semibold hover:bg-cream-100 dark:hover:bg-stone-800">${esc(player.displayName)}</button>`
+            ).join('') || '<p class="text-xs text-stone-500">No matching players.</p>';
+            if (result.hasMore) results.insertAdjacentHTML('beforeend', '<p class="text-xs text-stone-500">Showing the first 50 players. Type a name to narrow the results.</p>');
+            const opponent = document.getElementById('head-to-head-opponent');
+            if (opponent) {
+              const choices = result.players.filter(player => player.playerId !== playerData.selectedId);
+              const existing = playerData.opponentId && !choices.some(player => player.playerId === playerData.opponentId)
+                ? [{ playerId: playerData.opponentId, displayName: playerData.opponentName }] : [];
+              opponent.innerHTML = '<option value="">Search for an opponent</option>' +
+                [...existing, ...choices].map(player =>
+                  `<option value="${esc(player.playerId)}">${esc(player.displayName)}</option>`
+                ).join('');
+              opponent.value = playerData.opponentId;
+            }
+
+          } catch (err) {
+            if (!search.isConnected || request !== requestNumber) return;
+            playerData.directoryError = `Could not search players: ${err.message}`;
+            results.innerHTML = `<p role="alert" class="text-xs text-red-600">${esc(playerData.directoryError)}</p>`;
+          }
+        };
+        search.addEventListener('focus', () => {
+          if (cloud && !playerData.directoryLoaded) updateSearch();
+        });
+        search.addEventListener('input', event => {
+          state.ui.playerSearch = event.target.value;
+          if (cloud) {
+            requestNumber++;
+            clearTimeout(timer);
+            timer = setTimeout(updateSearch, 250);
+          } else {
+            const query = state.ui.playerSearch.toLocaleLowerCase().trim();
+            results.querySelectorAll('[data-player-directory-name]').forEach(button => {
+              button.classList.toggle('hidden', Boolean(query && !button.getAttribute('data-player-directory-name').includes(query)));
+            });
+          }
+        });
+        results.addEventListener('click', async event => {
+          const button = event.target.closest('[data-player-select-id], [data-player-select]');
+          if (!button || !results.contains(button)) return;
+          if (cloud) {
+            playerData.selectedId = button.getAttribute('data-player-select-id');
+            state.ui.selectedPlayerId = playerData.selectedId;
+            playerData.opponentId = '';
+            playerData.opponentName = '';
+            playerData.summary = null;
+            state.ui.selectedPlayerName = '';
+            const loading = loadPlayerData(true);
+            render();
+            await loading;
+            saveRegistry();
+            render();
+          } else {
+            state.ui.selectedPlayerName = button.getAttribute('data-player-select');
+            if (window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent) === window.PlayerAnalytics.normalizeName(state.ui.selectedPlayerName)) {
+              state.ui.headToHeadOpponent = '';
+            }
+            saveRegistry();
+            render();
+          }
+        });
+        document.getElementById('head-to-head-opponent')?.addEventListener('change', async event => {
+          if (cloud) {
+            playerData.opponentId = event.target.value;
+            playerData.opponentName = event.target.selectedOptions[0]?.textContent || '';
+            const loading = loadPlayerData(true);
+            render();
+            await loading;
+            render();
+          } else {
+            state.ui.headToHeadOpponent = event.target.value;
+            saveRegistry();
+            render();
+          }
+        });
+      }
+
+      async function getSelectedAdminPlayer(name) {
+        const profiles = getSyncApiUrl()
+          ? (await requestAdminApi('/api/player-import/directory')).profiles
+          : getLocalPlayerProfiles();
+        const profile = profiles.find(item =>
+          (playerData.selectedId && item.playerId === playerData.selectedId) ||
+          (!playerData.selectedId && samePlayerIdentity(item, { name }))
+        );
+        if (!profile) throw new Error('Player profile no longer exists; refresh the directory');
+        return profile;
       }
 
       function renderPlayerCheckInScreen() {
@@ -5478,7 +5741,7 @@
 
       function applyPlayerReadOnlyControls() {
         const safeSelectors = [
-          '[data-tab]', '[data-player-select]', '#open-bracket-btn', '#player-refresh-btn',
+          '[data-tab]', '[data-player-select]', '[data-player-select-id]', '#open-bracket-btn', '#player-refresh-btn',
           '[data-qr1-filter]', '[data-match-toggle-all]',
           '#player-directory-search', '#head-to-head-opponent', '#player-share-btn',
           '#player-edit-own-profile-btn', '#player-change-password-btn', '#player-delete-own-account-btn',
@@ -5528,25 +5791,7 @@
           await loadTournamentCatalog(true);
           render();
         });
-        document.getElementById('player-directory-search')?.addEventListener('input', event => {
-          const query = event.target.value.toLocaleLowerCase().trim();
-          document.querySelectorAll('[data-player-directory-name]').forEach(button => {
-            button.classList.toggle('hidden', Boolean(query && !button.getAttribute('data-player-directory-name').includes(query)));
-          });
-        });
-        document.querySelectorAll('[data-player-select]').forEach(button => {
-          button.addEventListener('click', () => {
-            state.ui.selectedPlayerName = button.getAttribute('data-player-select');
-            if (window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent) === window.PlayerAnalytics.normalizeName(state.ui.selectedPlayerName)) {
-              state.ui.headToHeadOpponent = '';
-            }
-            render();
-          });
-        });
-        document.getElementById('head-to-head-opponent')?.addEventListener('change', event => {
-          state.ui.headToHeadOpponent = event.target.value;
-          render();
-        });
+        bindPlayerDirectory();
         document.querySelectorAll('[data-player-photo]').forEach(image => {
           image.addEventListener('error', () => image.remove(), { once: true });
         });
@@ -5557,7 +5802,10 @@
         });
         document.getElementById('player-share-btn')?.addEventListener('click', () => {
           const shareUrl = new URL(window.location.href);
-          shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
+          shareUrl.searchParams.delete('player');
+          shareUrl.searchParams.delete('playerId');
+          if (getSyncApiUrl() && playerData.selectedId) shareUrl.searchParams.set('playerId', playerData.selectedId);
+          else shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
           if (navigator.clipboard?.writeText) {
             navigator.clipboard.writeText(shareUrl.toString())
               .then(() => showToast('Player card link copied', 'success'))
@@ -5661,11 +5909,12 @@
       }
 
       async function openPlayerInvitesModal() {
-        await loadPlayerData();
-        const playerNames = [...new Set([
-          ...playerData.profiles.map(profile => profile.name),
-          ...window.PlayerAnalytics.buildAnalytics(playerData.tournaments, playerData.profiles, state.tournamentId).players.map(player => player.name)
-        ])].sort((a, b) => a.localeCompare(b));
+        const playerNames = getSyncApiUrl()
+          ? (await requestAdminApi('/api/player-import/directory')).rosterNames
+          : [...new Set([
+            ...getLocalPlayerProfiles().map(profile => profile.name),
+            ...window.PlayerAnalytics.buildAnalytics(getLocalPlayerTournaments(), getLocalPlayerProfiles(), state.tournamentId).players.map(player => player.name)
+          ])].sort((a, b) => a.localeCompare(b));
         let inviteList = [];
         let listError = '';
         try {
@@ -6854,28 +7103,7 @@
           });
         });
 
-        document.getElementById('player-directory-search')?.addEventListener('input', (event) => {
-          state.ui.playerSearch = event.target.value;
-          const query = state.ui.playerSearch.toLocaleLowerCase().trim();
-          document.querySelectorAll('[data-player-directory-name]').forEach(button => {
-            button.classList.toggle('hidden', Boolean(query && !button.getAttribute('data-player-directory-name').includes(query)));
-          });
-        });
-        document.querySelectorAll('[data-player-select]').forEach(button => {
-          button.addEventListener('click', () => {
-            state.ui.selectedPlayerName = button.getAttribute('data-player-select');
-            if (window.PlayerAnalytics.normalizeName(state.ui.headToHeadOpponent) === window.PlayerAnalytics.normalizeName(state.ui.selectedPlayerName)) {
-              state.ui.headToHeadOpponent = '';
-            }
-            saveRegistry();
-            render();
-          });
-        });
-        document.getElementById('head-to-head-opponent')?.addEventListener('change', event => {
-          state.ui.headToHeadOpponent = event.target.value;
-          saveRegistry();
-          render();
-        });
+        bindPlayerDirectory();
         document.querySelectorAll('[data-player-photo]').forEach(image => {
           image.addEventListener('error', () => image.remove(), { once: true });
         });
@@ -6894,34 +7122,43 @@
         document.getElementById('player-edit-profile-btn')?.addEventListener('click', async event => {
           const selectedName = event.currentTarget.getAttribute('data-player-edit-name') || state.ui.selectedPlayerName;
           try {
-            const profiles = getSyncApiUrl()
-              ? (await requestAdminApi('/api/player-import/directory')).profiles
-              : getLocalPlayerProfiles();
-            const profile = profiles.find(item => samePlayerIdentity(item, { name: selectedName }));
-            if (!profile) throw new Error('Player profile no longer exists; refresh the directory');
-            renderPlayerProfileEditor(profile);
+            renderPlayerProfileEditor(await getSelectedAdminPlayer(selectedName));
           } catch (err) {
             showToast(`Could not load player profile: ${err.message}`, 'error');
           }
         });
-        document.getElementById('player-reset-password-btn')?.addEventListener('click', event => {
-          resetPlayerPassword(event.currentTarget.getAttribute('data-player-account-name'));
-        });
-        document.getElementById('player-delete-account-btn')?.addEventListener('click', event => {
-          confirmAdminDeletePlayerLogin(event.currentTarget.getAttribute('data-player-account-name'));
-        });
-        document.getElementById('player-delete-profile-btn')?.addEventListener('click', event => {
-          const name = event.currentTarget.getAttribute('data-player-delete-name');
-          const profile = playerData.profiles.find(item => samePlayerIdentity(item, { name }));
-          if (!profile?.playerId || !profile.revision) {
-            showToast('Reload the player directory before deleting this profile', 'error');
-            return;
+        document.getElementById('player-reset-password-btn')?.addEventListener('click', async event => {
+          try {
+            const profile = await getSelectedAdminPlayer(event.currentTarget.getAttribute('data-player-account-name'));
+            resetPlayerPassword(profile.name);
+          } catch (err) {
+            showToast(`Could not load player profile: ${err.message}`, 'error');
           }
-          confirmAdminDeletePlayerProfile(profile);
+        });
+        document.getElementById('player-delete-account-btn')?.addEventListener('click', async event => {
+          try {
+            const profile = await getSelectedAdminPlayer(event.currentTarget.getAttribute('data-player-account-name'));
+            confirmAdminDeletePlayerLogin(profile.name);
+          } catch (err) {
+            showToast(`Could not load player profile: ${err.message}`, 'error');
+          }
+        });
+        document.getElementById('player-delete-profile-btn')?.addEventListener('click', async event => {
+          const name = event.currentTarget.getAttribute('data-player-delete-name');
+          try {
+            const profile = await getSelectedAdminPlayer(name);
+            if (!profile.playerId || !profile.revision) throw new Error('Reload the player directory before deleting this profile');
+            confirmAdminDeletePlayerProfile(profile);
+          } catch (err) {
+            showToast(`Could not load player profile: ${err.message}`, 'error');
+          }
         });
         document.getElementById('player-share-btn')?.addEventListener('click', () => {
           const shareUrl = new URL(window.location.href);
-          shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
+          shareUrl.searchParams.delete('player');
+          shareUrl.searchParams.delete('playerId');
+          if (getSyncApiUrl() && playerData.selectedId) shareUrl.searchParams.set('playerId', playerData.selectedId);
+          else shareUrl.searchParams.set('player', state.ui.selectedPlayerName);
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(shareUrl.toString())
               .then(() => showToast('Player card link copied', 'success'))
@@ -7206,8 +7443,9 @@
         document.getElementById('advance-qr2-btn')?.addEventListener('click', advanceToQR2);
         document.getElementById('sim-qr2-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.qr2Matches || {}).flat()));
         document.getElementById('advance-semis-btn')?.addEventListener('click', advanceToSemis);
-        document.getElementById('sim-semis-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.semis || {}).flat()));
+        document.getElementById('sim-semis-btn')?.addEventListener('click', () => simulateKnockoutScores('semis'));
         document.getElementById('advance-finals-btn')?.addEventListener('click', advanceToFinals);
+        document.getElementById('sim-finals-btn')?.addEventListener('click', () => simulateKnockoutScores('finals'));
 
         document.getElementById('add-qr2-pool-btn')?.addEventListener('click', () => {
           const existing = Object.keys(state.qr2Pools || {});
@@ -7458,10 +7696,10 @@
             state.ui.activeTab !== 'players' ||
             !getSyncApiUrl() || playerData.loading || isEditingFormField() ||
             !document.getElementById('modal-root').classList.contains('hidden')) return null;
-        const before = JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error]);
+        const before = JSON.stringify([playerData.tournaments, playerData.profiles, playerData.summary, playerData.error]);
         await loadPlayerData(true);
         if (state.ui.activeTab === 'players' &&
-            before !== JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error])) render();
+            before !== JSON.stringify([playerData.tournaments, playerData.profiles, playerData.summary, playerData.error])) render();
         return !playerData.error;
       }
 
@@ -7476,6 +7714,7 @@
       let seenTournamentVersion = null;
       let seenCatalogVersion = null;
       let seenPlayerVersions = null;
+      let seenDirectoryVersion = null;
       let nextScoreCheck = 0;
       let nextCatalogCheck = 0;
       let nextPlayerCheck = 0;
@@ -7506,6 +7745,7 @@
             seenTournamentId = '';
             seenCatalogVersion = null;
             seenPlayerVersions = null;
+            seenDirectoryVersion = null;
           }
           if (seenTournamentId !== tournamentId) {
             seenTournamentId = tournamentId;
@@ -7520,6 +7760,14 @@
             throw new Error('Invalid change versions from backend');
           }
           if (getSyncApiUrl() !== apiUrl || String(state.tournamentId || 'default') !== tournamentId || !state.auth.loggedIn) return;
+          if (seenDirectoryVersion !== null && seenDirectoryVersion !== versions.profiles) {
+            playerData.directory = [];
+            playerData.directoryLoaded = false;
+            playerData.directoryHasMore = false;
+            const results = document.getElementById('player-directory-results');
+            if (results) results.innerHTML = '<p class="text-xs text-stone-500">Player list changed. Search again to refresh it.</p>';
+          }
+          seenDirectoryVersion = versions.profiles;
           const now = Date.now();
           if (force || now >= nextScoreCheck) {
             nextScoreCheck = now + 5000;

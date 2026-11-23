@@ -41,6 +41,13 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     sql: 'INSERT INTO player_profiles (player_name, updated_at) VALUES (?, ?)',
     args: ['Legacy Player', new Date().toISOString()]
   });
+  await seedClient.execute('CREATE TABLE admin_sessions (token_hash TEXT PRIMARY KEY, credential_tag TEXT NOT NULL, expires_at TEXT NOT NULL)');
+  await seedClient.execute("INSERT INTO admin_sessions VALUES ('legacy-admin', 'legacy', '2099-01-01T00:00:00.000Z')");
+  await seedClient.execute("INSERT INTO admin_sessions VALUES ('expired-admin', 'legacy', '2000-01-01T00:00:00.000Z')");
+  await seedClient.execute(`CREATE TABLE player_sessions (
+    token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+  )`);
+  await seedClient.execute("INSERT INTO player_sessions VALUES ('legacy-player', 'legacy', '2099-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')");
   await seedClient.close();
   const child = spawn(process.execPath, [path.join(root, 'badminton-backend', 'server.js')], {
     cwd: root,
@@ -83,6 +90,17 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     }
     assert.equal(healthy, true, `Test backend did not become ready:\n${output}`);
 
+    const migrationDb = createClient({ url: databaseUrl });
+    const migratedAdminSessions = await migrationDb.execute('SELECT token_hash, expires_at FROM admin_sessions');
+    const migratedPlayerSessions = await migrationDb.execute('SELECT expires_at FROM player_sessions');
+    const adminDeadlines = Object.fromEntries(migratedAdminSessions.rows.map(row => [row.token_hash, row.expires_at]));
+    for (const deadline of [adminDeadlines['legacy-admin'], migratedPlayerSessions.rows[0].expires_at]) {
+      assert.ok(Date.parse(deadline) > Date.now() + 7190000);
+      assert.ok(Date.parse(deadline) <= Date.now() + 7200000);
+    }
+    assert.equal(adminDeadlines['expired-admin'], '2000-01-01T00:00:00.000Z');
+    migrationDb.close();
+
     const migratedDirectory = await api('/api/player-import/directory', { headers: adminHeaders });
     assert.equal(migratedDirectory.response.status, 200);
     const migratedProfile = migratedDirectory.body.profiles.find(player => player.name === 'Legacy Player');
@@ -112,12 +130,38 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const setAdminCookie = firstAdmin.response.headers.get('set-cookie');
     assert.match(setAdminCookie, /HttpOnly/);
     assert.match(setAdminCookie, /SameSite=Strict/);
+    assert.match(setAdminCookie, /Max-Age=7200/);
     const adminCookie = setAdminCookie.split(';')[0];
     const secondAdmin = await adminLogin('admin-session-test-password');
     assert.equal(secondAdmin.response.status, 200);
     const secondAdminCookie = secondAdmin.response.headers.get('set-cookie').split(';')[0];
     assert.notEqual(adminCookie, secondAdminCookie);
-    assert.equal((await api('/api/admin-auth/me', { headers: { cookie: adminCookie } })).response.status, 200);
+    const adminSessionDb = createClient({ url: databaseUrl });
+    const firstAdminHash = crypto.createHash('sha256').update(adminCookie.split('=')[1]).digest('hex');
+    const earlierExpiry = new Date(Date.now() + 3600000).toISOString();
+    await adminSessionDb.execute({ sql: 'UPDATE admin_sessions SET expires_at = ? WHERE token_hash = ?', args: [earlierExpiry, firstAdminHash] });
+    const adminMe = await api('/api/admin-auth/me', { headers: { cookie: adminCookie } });
+    assert.equal(adminMe.response.status, 200);
+    assert.equal(adminMe.body.expiresAt, earlierExpiry);
+    assert.equal((await api('/api/admin-auth/activity', { method: 'POST', headers: { cookie: adminCookie } })).response.status, 403);
+    const adminActivity = await api('/api/admin-auth/activity', { method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie } });
+    assert.equal(adminActivity.response.status, 200);
+    assert.ok(Date.parse(adminActivity.body.expiresAt) > Date.now() + 7190000);
+    assert.match(adminActivity.response.headers.get('set-cookie'), /Max-Age=7200/);
+    await adminSessionDb.execute({ sql: 'UPDATE admin_sessions SET expires_at = ? WHERE token_hash = ?', args: [earlierExpiry, firstAdminHash] });
+    const delayedAdminActivity = await api('/api/admin-auth/activity', {
+      method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie }, body: JSON.stringify({ idleMs: 30000 })
+    });
+    assert.ok(Date.parse(delayedAdminActivity.body.expiresAt) <= Date.now() + 7170000);
+    assert.ok(Date.parse(delayedAdminActivity.body.expiresAt) > Date.now() + 7160000);
+    const olderAdminActivity = await api('/api/admin-auth/activity', {
+      method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie }, body: JSON.stringify({ idleMs: 60000 })
+    });
+    assert.equal(olderAdminActivity.body.expiresAt, delayedAdminActivity.body.expiresAt);
+    assert.equal((await api('/api/admin-auth/activity', {
+      method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie }, body: JSON.stringify({ idleMs: -1 })
+    })).response.status, 400);
+    adminSessionDb.close();
     assert.equal((await api('/api/player-invites', { headers: { cookie: adminCookie } })).response.status, 200);
     const blockedCsrf = await api('/api/player-invites', {
       method: 'POST',
@@ -136,9 +180,14 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(adminLogout.response.status, 200);
     assert.equal((await api('/api/admin-auth/me', { headers: { cookie: adminCookie } })).response.status, 401);
+    assert.equal((await api('/api/admin-auth/activity', { method: 'POST', headers: { ...adminLoginHeaders, cookie: adminCookie } })).response.status, 401);
     assert.equal((await api('/api/player-invites', { headers: { cookie: adminCookie } })).response.status, 401);
     assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 200);
 
+    const versionsBeforeCreate = await api('/api/changes/auth-test');
+    assert.equal(versionsBeforeCreate.response.status, 200);
+    assert.equal(versionsBeforeCreate.body.tournament, 0);
+    assert.match(versionsBeforeCreate.response.headers.get('cache-control'), /s-maxage=2/);
     const savedTournament = await api('/api/tournaments/auth-test', {
       method: 'PUT',
       headers: { ...adminHeaders, 'x-tournament-revision': 'new' },
@@ -150,11 +199,24 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       })
     });
     assert.equal(savedTournament.response.status, 200);
+    const versionsAfterCreate = (await api('/api/changes/auth-test')).body;
+    assert.equal(versionsAfterCreate.tournament, 1);
+    assert.ok(versionsAfterCreate.tournaments > versionsBeforeCreate.body.tournaments);
+    assert.ok(versionsAfterCreate.profiles > versionsBeforeCreate.body.profiles);
     assert.match(savedTournament.body.playerProfileIds['roster alice'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(savedTournament.body.playerProfileIds['roster bob'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     const publicTournamentHistory = await api('/api/tournament-history');
     assert.equal(publicTournamentHistory.response.status, 200);
     assert.ok(publicTournamentHistory.body.tournaments.some(tournament => tournament.id === 'auth-test'));
+    const publicHistory = await api('/api/tournament-history/public');
+    assert.deepEqual(publicHistory.body.players, publicTournamentHistory.body.players);
+    assert.deepEqual(publicHistory.body.tournaments, publicTournamentHistory.body.tournaments);
+    assert.equal(Object.hasOwn(publicHistory.body, 'ownPlayer'), false);
+    assert.match(publicHistory.response.headers.get('cache-control'), /no-store/);
+    const catalog = await api('/api/tournament-catalog');
+    const catalogEntry = catalog.body.tournaments.find(tournament => tournament.id === 'auth-test');
+    assert.deepEqual(catalogEntry.stats, { players: 2, groups: 1, matches: 0, completedMatches: 0 });
+    assert.equal(catalogEntry.data, undefined);
 
     const unchangedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
     assert.equal(unchangedTournament.response.status, 200);
@@ -170,6 +232,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     const changedTournament = await api(`/api/tournaments/auth-test?since=${encodeURIComponent(savedTournament.body.updatedAt)}`);
     assert.equal(updatedTournament.response.status, 200);
+    assert.equal((await api('/api/changes/auth-test')).body.tournament, versionsAfterCreate.tournament + 1);
     assert.equal(changedTournament.body.unchanged, undefined);
     assert.equal(changedTournament.body.data.config.name, 'Auth Test Updated');
 
@@ -211,10 +274,13 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     const deniedScore = await patchScore('m1', { listKey: 'qr1', expectedMatch: matches[0], s1: 21, s2: 12 }, { 'content-type': 'application/json' });
     assert.equal(deniedScore.response.status, 401);
+    const versionsBeforeScores = (await api('/api/changes/score-test')).body;
     const scoreResults = await Promise.all(matches.map((match, index) => patchScore(match.id, {
       listKey: 'qr1', expectedMatch: match, s1: 21, s2: 10 + index
     })));
     assert.deepEqual(scoreResults.map(result => result.response.status), [200, 200]);
+    const versionsAfterScores = (await api('/api/changes/score-test')).body;
+    assert.equal(versionsAfterScores.tournament, versionsBeforeScores.tournament + 2);
     const bothScores = await api('/api/tournaments/score-test');
     assert.deepEqual(bothScores.body.data.qr1Matches.map(match => match.s2), [10, 11]);
     const staleSnapshot = await api('/api/tournaments/score-test', {
@@ -222,6 +288,14 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       body: JSON.stringify(scoreFixture)
     });
     assert.equal(staleSnapshot.response.status, 409);
+    assert.deepEqual((await api('/api/changes/score-test')).body, versionsAfterScores);
+    const rollbackDb = createClient({ url: databaseUrl });
+    const rollbackTransaction = await rollbackDb.transaction('write');
+    await rollbackTransaction.execute("UPDATE tournaments SET name = 'Rolled back' WHERE id = 'score-test'");
+    await rollbackTransaction.rollback();
+    rollbackTransaction.close();
+    rollbackDb.close();
+    assert.deepEqual((await api('/api/changes/score-test')).body, versionsAfterScores);
     const missingRevision = await api('/api/tournaments/score-test', {
       method: 'PUT', headers: adminHeaders, body: JSON.stringify(scoreFixture)
     });
@@ -289,8 +363,12 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(correction.response.status, 200);
     assert.equal(correction.body.data.finals.A, null);
     assert.deepEqual(correction.body.data.qr2Pools.A, []);
+    const beforeScoreFixtureDelete = (await api('/api/changes/score-test')).body;
     const removeScoreFixture = await api('/api/tournaments/score-test', { method: 'DELETE', headers: adminHeaders });
     assert.equal(removeScoreFixture.response.status, 200);
+    const afterScoreFixtureDelete = (await api('/api/changes/score-test')).body;
+    assert.equal(afterScoreFixtureDelete.tournament, beforeScoreFixtureDelete.tournament + 1);
+    assert.ok(afterScoreFixtureDelete.tournaments > beforeScoreFixtureDelete.tournaments);
     assert.equal((await api('/api/tournaments/score-test')).body.exists, false);
     const saveDeletedTournament = await api('/api/tournaments/score-test', {
       method: 'PUT',
@@ -440,7 +518,32 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(registration.response.status, 201);
     assert.match(registration.body.player.playerCode, /^\d{6}$/);
+    assert.match(registration.response.headers.get('set-cookie'), /Max-Age=7200/);
     const playerCookie = registration.response.headers.get('set-cookie').split(';')[0];
+    const playerSessionDb = createClient({ url: databaseUrl });
+    const playerHash = crypto.createHash('sha256').update(playerCookie.split('=')[1]).digest('hex');
+    const playerEarlierExpiry = new Date(Date.now() + 3600000).toISOString();
+    await playerSessionDb.execute({ sql: 'UPDATE player_sessions SET expires_at = ? WHERE token_hash = ?', args: [playerEarlierExpiry, playerHash] });
+    const playerMe = await api('/api/player-auth/me', { headers: { cookie: playerCookie } });
+    assert.equal(playerMe.response.status, 200);
+    assert.equal(playerMe.body.expiresAt, playerEarlierExpiry);
+    await api('/api/tournament-history', { headers: { cookie: playerCookie } });
+    assert.equal((await api('/api/player-auth/me', { headers: { cookie: playerCookie } })).body.expiresAt, playerEarlierExpiry);
+    assert.equal((await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: playerCookie } })).response.status, 403);
+    const playerActivity = await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: playerCookie, 'x-sbe-player-request': '1' } });
+    assert.equal(playerActivity.response.status, 200);
+    assert.ok(Date.parse(playerActivity.body.expiresAt) > Date.now() + 7190000);
+    assert.match(playerActivity.response.headers.get('set-cookie'), /Max-Age=7200/);
+    const expiringPlayer = await api('/api/player-auth/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'invited@example.com', password: 'a-secure-test-password' })
+    });
+    assert.equal(expiringPlayer.response.status, 200);
+    const expiringCookie = expiringPlayer.response.headers.get('set-cookie').split(';')[0];
+    const expiringHash = crypto.createHash('sha256').update(expiringCookie.split('=')[1]).digest('hex');
+    await playerSessionDb.execute({ sql: 'UPDATE player_sessions SET expires_at = ? WHERE token_hash = ?', args: ['2000-01-01T00:00:00.000Z', expiringHash] });
+    assert.equal((await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: expiringCookie, 'x-sbe-player-request': '1' } })).response.status, 401);
+    playerSessionDb.close();
 
     const reuseInvite = await api('/api/player-auth/register', {
       method: 'POST',
@@ -449,6 +552,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(reuseInvite.response.status, 404);
 
+    const beforeProfileUpdate = (await api('/api/changes/auth-test')).body;
     const update = await api('/api/player-auth/me', {
       method: 'PUT',
       headers: { 'content-type': 'application/json', cookie: playerCookie, 'x-player-revision': registration.body.player.revision },
@@ -465,6 +569,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       })
     });
     assert.equal(update.response.status, 200);
+    assert.ok((await api('/api/changes/auth-test')).body.profiles > beforeProfileUpdate.profiles);
     assert.equal(update.body.player.name, 'Renamed Player');
     assert.equal(update.body.player.nickname, 'Ace');
     assert.equal(update.body.player.age, null);
@@ -489,6 +594,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(ownSnapshot.body.ownPlayer.city, 'Hidden City');
     assert.equal(ownSnapshot.body.ownPlayer.skill, 8);
     assert.equal(ownSnapshot.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
+    const splitPublicHistory = await api('/api/tournament-history/public', { headers: { cookie: playerCookie } });
+    assert.equal(Object.hasOwn(splitPublicHistory.body, 'ownPlayer'), false);
+    assert.equal(splitPublicHistory.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
     const anonymousSnapshot = await api('/api/tournament-history');
     assert.equal(anonymousSnapshot.body.ownPlayer, null);
 
@@ -642,6 +750,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       args: ['old-credential', secondTokenHash]
     });
     assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 401);
+    assert.equal((await api('/api/admin-auth/activity', { method: 'POST', headers: { ...adminLoginHeaders, cookie: secondAdminCookie } })).response.status, 401);
     await sessionDb.execute({
       sql: 'UPDATE admin_sessions SET credential_tag = ? WHERE token_hash = ?',
       args: [crypto.createHmac('sha256', 'admin-session-test-password').update('sbe-admin-session-v1').digest('hex'), secondTokenHash]
@@ -652,6 +761,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       args: ['2000-01-01T00:00:00.000Z', secondTokenHash]
     });
     assert.equal((await api('/api/admin-auth/me', { headers: { cookie: secondAdminCookie } })).response.status, 401);
+    assert.equal((await api('/api/admin-auth/activity', { method: 'POST', headers: { ...adminLoginHeaders, cookie: secondAdminCookie } })).response.status, 401);
     for (let attempt = 0; attempt < 10; attempt++) {
       assert.equal((await adminLogin('wrong-password')).response.status, 401);
     }
@@ -677,12 +787,14 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(guestCheckIn.response.status, 401);
 
+    const beforeAdminCheckIn = (await api('/api/changes/auth-test')).body;
     const adminCheckIn = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
       headers: adminHeaders,
       body: JSON.stringify({ playerName: 'Roster Bob' })
     });
     assert.equal(adminCheckIn.response.status, 200);
+    assert.equal((await api('/api/changes/auth-test')).body.tournament, beforeAdminCheckIn.tournament + 1);
     assert.equal(adminCheckIn.body.data.checkIns['Roster Bob'].checkedIn, true);
     assert.match(adminCheckIn.body.revision, /^[0-9a-f]{64}$/);
 
@@ -810,6 +922,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
       headers: { cookie: changedPasswordCookie }
     });
     assert.equal(logout.response.status, 200);
+    assert.equal((await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: changedPasswordCookie, 'x-sbe-player-request': '1' } })).response.status, 401);
     const missingSession = await api('/api/player-auth/me');
     assert.equal(missingSession.response.status, 401);
 
@@ -835,6 +948,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(temporaryLogin.response.status, 200);
     assert.equal(temporaryLogin.body.mustChangePassword, true);
     const temporaryCookie = temporaryLogin.response.headers.get('set-cookie').split(';')[0];
+    assert.equal((await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: temporaryCookie, 'x-sbe-player-request': '1' } })).response.status, 200);
     const blockedUntilPasswordChange = await api('/api/player-auth/tournaments/auth-test/checkin', {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: temporaryCookie },
@@ -1214,8 +1328,26 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     });
     assert.equal(staleCheckins.rows.length, 0);
 
-    const beforeReset = await api('/api/tournaments/auth-test');
+    let beforeReset = await api('/api/tournaments/auth-test');
     assert.ok(beforeReset.body.data.checkIns['Roster Alice']);
+    const matchesReset = await api('/api/tournaments/auth-test', {
+      method: 'PUT',
+      headers: { ...adminHeaders, 'x-tournament-revision': beforeReset.body.revision },
+      body: JSON.stringify({
+        ...beforeReset.body.data, phase: 'setup', qr1Matches: [],
+        qr2Pools: {}, qr2Matches: {}, semis: {}, finals: {}
+      })
+    });
+    assert.equal(matchesReset.response.status, 200);
+    const afterMatchesReset = await api('/api/tournaments/auth-test');
+    for (const field of ['config', 'groups', 'playerSkills', 'checkIns']) {
+      assert.deepEqual(afterMatchesReset.body.data[field], beforeReset.body.data[field]);
+    }
+    assert.equal((await finalDb.execute({
+      sql: 'SELECT player_name FROM player_checkins WHERE tournament_id = ?',
+      args: ['auth-test']
+    })).rows.length, 1);
+    beforeReset = afterMatchesReset;
     const invalidReset = await api('/api/tournaments/auth-test', {
       method: 'PUT',
       headers: { ...adminHeaders, 'x-tournament-revision': beforeReset.body.revision, 'x-reset-attendance': '1' },

@@ -383,6 +383,173 @@
       let playerInviteError = '';
       let playerAuthError = '';
       let adminAuthError = '';
+      let sessionExpiryTimer = null;
+      let sessionActivityTimer = null;
+      let sessionActivityInFlight = false;
+      let sessionActivityQueued = false;
+      let lastSessionActivityRequest = 0;
+      let lastSessionActivityAt = 0;
+      const expiredScoreDraftKey = 'sbe-expired-score-draft';
+      let expiredScoreDraft = null;
+
+      function preserveScoreDraft() {
+        const entries = [...document.querySelectorAll('[data-score-input], [data-final-input]')]
+          .filter(input => input.value !== input.defaultValue)
+          .map(input => ({
+            attribute: input.hasAttribute('data-score-input') ? 'data-score-input' : 'data-final-input',
+            key: input.getAttribute(input.hasAttribute('data-score-input') ? 'data-score-input' : 'data-final-input'),
+            value: input.value
+          }));
+        if (!entries.length) return true;
+        expiredScoreDraft = { tournamentId: state.tournamentId, entries };
+        try {
+          sessionStorage.setItem(expiredScoreDraftKey, JSON.stringify(expiredScoreDraft));
+          return true;
+        } catch (err) {
+          console.error('Could not persist unsaved score entries:', err);
+          return false;
+        }
+      }
+
+      function restoreScoreDraft() {
+        if (!expiredScoreDraft) {
+          try {
+            expiredScoreDraft = JSON.parse(sessionStorage.getItem(expiredScoreDraftKey) || 'null');
+          } catch (err) {
+            console.error('Could not load unsaved score entries:', err);
+            return;
+          }
+        }
+        if (!expiredScoreDraft || expiredScoreDraft.tournamentId !== state.tournamentId ||
+            !Array.isArray(expiredScoreDraft.entries)) return;
+        const inputs = [...document.querySelectorAll('[data-score-input], [data-final-input]')];
+        expiredScoreDraft.entries = expiredScoreDraft.entries.filter(entry => {
+          const input = inputs.find(item => item.getAttribute(entry.attribute) === entry.key);
+          if (!input) return true;
+          input.value = entry.value;
+          const details = input.closest('details');
+          if (details) details.open = true;
+          return false;
+        });
+        try {
+          if (expiredScoreDraft.entries.length) sessionStorage.setItem(expiredScoreDraftKey, JSON.stringify(expiredScoreDraft));
+          else {
+            sessionStorage.removeItem(expiredScoreDraftKey);
+            expiredScoreDraft = null;
+          }
+        } catch (err) {
+          console.error('Could not update unsaved score entries:', err);
+        }
+      }
+
+      function setSessionExpiry(expiresAt) {
+        const deadline = Date.parse(expiresAt);
+        if (!Number.isFinite(deadline)) throw new Error('Invalid session expiry returned by the backend');
+        clearTimeout(sessionExpiryTimer);
+        sessionExpiryTimer = setTimeout(checkSessionExpiry, Math.max(0, deadline - Date.now()));
+      }
+
+      function expireSession() {
+        clearTimeout(sessionActivityTimer);
+        clearTimeout(sessionExpiryTimer);
+        sessionActivityQueued = false;
+        clearTimeout(syncTimer);
+        syncTimer = null;
+        let scoreDraftPersisted = true;
+        if (state.auth.role === 'player') clearPlayerAccountProfile();
+        else if (state.auth.role === 'admin') scoreDraftPersisted = preserveScoreDraft();
+        if (state.sync.status === 'pending' || state.sync.status === 'syncing') state.sync.status = 'error';
+        state.auth.loggedIn = false;
+        state.auth.role = 'guest';
+        state.ui.playerCheckInMode = false;
+        delete state.auth.localExpiresAt;
+        saveRegistry();
+        closeModal();
+        render();
+        showToast(scoreDraftPersisted
+          ? 'Your session expired after inactivity. Sign in again.'
+          : 'Your session expired. Unsaved scores are kept in this tab only; sign in without reloading.', 'error');
+      }
+
+      async function checkSessionExpiry() {
+        if (!state.auth.loggedIn || !['admin', 'player'].includes(state.auth.role)) return;
+        const role = state.auth.role;
+        if (role === 'admin' && !usesAdminSession()) {
+          if (Date.now() >= Number(state.auth.localExpiresAt || 0)) expireSession();
+          else setSessionExpiry(new Date(state.auth.localExpiresAt).toISOString());
+          return;
+        }
+        try {
+          if (role === 'admin') await requestAdminSession('/api/admin-auth/me');
+          else await requestPlayerApi('/api/player-auth/me');
+        } catch (err) {
+          if (state.auth.role !== role || !state.auth.loggedIn) return;
+          if (err.status === 401) expireSession();
+          else {
+            console.error('Could not verify session expiry:', err);
+            expireSession();
+            showToast(`Could not verify session: ${err.message}`, 'error');
+          }
+        }
+      }
+
+      async function sendSessionActivity() {
+        if (sessionActivityInFlight || !sessionActivityQueued || !state.auth.loggedIn ||
+            !['admin', 'player'].includes(state.auth.role)) return;
+        const role = state.auth.role;
+        sessionActivityQueued = false;
+        sessionActivityInFlight = true;
+        lastSessionActivityRequest = Date.now();
+        try {
+          if (role === 'admin' && !usesAdminSession()) {
+            if (Date.now() >= Number(state.auth.localExpiresAt || 0)) {
+              expireSession();
+              return;
+            }
+            state.auth.localExpiresAt = lastSessionActivityAt + 2 * 60 * 60 * 1000;
+            setSessionExpiry(new Date(state.auth.localExpiresAt).toISOString());
+            saveRegistry();
+          } else if (role === 'admin') {
+            await requestAdminSession('/api/admin-auth/activity', {
+              method: 'POST',
+              body: JSON.stringify({ idleMs: Math.max(0, Date.now() - lastSessionActivityAt) })
+            });
+          } else {
+            await requestPlayerApi('/api/player-auth/activity', {
+              method: 'POST', headers: { 'x-sbe-player-request': '1' },
+              body: JSON.stringify({ idleMs: Math.max(0, Date.now() - lastSessionActivityAt) })
+            });
+          }
+        } catch (err) {
+          if (state.auth.role === role && state.auth.loggedIn) {
+            if (err.status === 401) expireSession();
+            else {
+              console.error('Could not update session activity:', err);
+              showToast(`Could not update session activity: ${err.message}`, 'error');
+            }
+          }
+        } finally {
+          sessionActivityInFlight = false;
+          if (sessionActivityQueued) scheduleSessionActivity();
+        }
+      }
+
+      function scheduleSessionActivity() {
+        if (!state.auth.loggedIn || !['admin', 'player'].includes(state.auth.role)) return;
+        clearTimeout(sessionActivityTimer);
+        const delay = Math.max(0, 30000 - (Date.now() - lastSessionActivityRequest));
+        sessionActivityTimer = setTimeout(sendSessionActivity, delay);
+      }
+
+      ['pointerdown', 'keydown', 'input', 'wheel'].forEach(type => {
+        document.addEventListener(type, event => {
+          if (event.isTrusted && state.auth.loggedIn && ['admin', 'player'].includes(state.auth.role)) {
+            lastSessionActivityAt = Date.now();
+            sessionActivityQueued = true;
+            scheduleSessionActivity();
+          }
+        }, { passive: true });
+      });
 
       function getSyncHeaders() {
         const headers = { 'Content-Type': 'application/json', 'x-sbe-admin-request': '1' };
@@ -422,6 +589,9 @@
           error.status = response.status;
           throw error;
         }
+        if (result.expiresAt && ['/api/admin-auth/login', '/api/admin-auth/me', '/api/admin-auth/activity'].includes(path)) {
+          setSessionExpiry(result.expiresAt);
+        }
         return result;
       }
 
@@ -450,6 +620,13 @@
           error.status = response.status;
           throw error;
         }
+        if (result.expiresAt && ['/api/player-auth/login', '/api/player-auth/register', '/api/player-auth/me', '/api/player-auth/activity'].includes(path)) {
+          setSessionExpiry(result.expiresAt);
+        }
+        if (options?.method && options.method !== 'GET' &&
+            !['/api/player-auth/login', '/api/player-auth/register', '/api/player-auth/logout', '/api/player-auth/activity'].includes(path)) {
+          scheduleChangeRefresh();
+        }
         return result;
       }
 
@@ -465,6 +642,7 @@
         playerData.profiles = playerData.profiles.filter(item => !samePlayerIdentity(item, profile));
         playerData.profiles.push(profile);
         playerData.loaded = false;
+        scheduleChangeRefresh();
       }
 
       function clearPlayerAccountProfile() {
@@ -501,6 +679,10 @@
           } else {
             console.error('Could not restore player session:', err);
             playerAuthError = `Player session could not be restored: ${err.message}`;
+            clearPlayerAccountProfile();
+            state.auth.loggedIn = false;
+            state.auth.role = 'guest';
+            saveRegistry();
           }
           return false;
         }
@@ -667,11 +849,27 @@
             return;
           }
           try {
-            const historyResponse = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
-            const historyJson = await historyResponse.json();
+            const [historyResponse, ownAccount] = await Promise.all([
+              fetch(`${apiUrl}/api/tournament-history/public`, { cache: 'no-store' }),
+              state.auth.role === 'player' ? requestPlayerApi('/api/player-auth/me') : null
+            ]);
+            let historyJson = await historyResponse.json();
             if (!historyResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${historyResponse.status})`);
             if (!Array.isArray(historyJson.tournaments) || !Array.isArray(historyJson.players)) {
               throw new Error('Invalid player directory response');
+            }
+            if (ownAccount) {
+              const publicProfile = historyJson.players.find(profile => profile.playerId === ownAccount.player.playerId);
+              if (!publicProfile || publicProfile.revision !== ownAccount.player.revision) {
+                const snapshotResponse = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
+                historyJson = await snapshotResponse.json();
+                if (!snapshotResponse.ok) throw new Error(historyJson.error || `History request failed (HTTP ${snapshotResponse.status})`);
+                if (!Array.isArray(historyJson.tournaments) || !Array.isArray(historyJson.players) || !historyJson.ownPlayer) {
+                  throw new Error('Player profile changed; reload the player directory');
+                }
+              } else {
+                historyJson.ownPlayer = ownAccount.player;
+              }
             }
             playerData.tournaments = historyJson.tournaments;
             if (state.auth.role === 'player' && historyJson.ownPlayer) playerAccountProfile = historyJson.ownPlayer;
@@ -714,7 +912,7 @@
             return;
           }
           try {
-            const response = await fetch(`${apiUrl}/api/tournament-history`, { cache: 'no-store' });
+            const response = await fetch(`${apiUrl}/api/tournament-catalog`, { cache: 'no-store' });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Tournament history request failed (HTTP ${response.status})`);
             if (!Array.isArray(result.tournaments)) throw new Error('Invalid tournament history response');
@@ -723,7 +921,7 @@
               id: String(tournament.id),
               name: tournament.name || tournament.data?.config?.name || 'Tournament',
               date: tournament.date || tournament.data?.config?.date || '',
-              venue: tournament.data?.config?.venue || '',
+              venue: tournament.venue || tournament.data?.config?.venue || '',
               phase: tournament.phase || tournament.data?.phase || 'setup'
             }));
           } catch (err) {
@@ -803,6 +1001,7 @@
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Profile save failed (HTTP ${response.status})`);
           savedProfile = result.player;
+          scheduleChangeRefresh();
         }
         return cachePlayerProfile(savedProfile);
       }
@@ -903,7 +1102,7 @@
         }));
       }
 
-      async function pushToTurso(silent, localFallback = true, resetAttendance = false) {
+      async function pushToTurso(silent, localFallback = true, resettingMatches = false) {
         const apiUrl = getSyncApiUrl();
         if (!apiUrl) return true;
         if (syncInFlight) {
@@ -922,10 +1121,7 @@
           if (!state.sync.revision) throw new Error('Reload the tournament before saving');
           const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, {
             method: 'PUT',
-            headers: {
-              ...getSyncHeaders(), 'x-tournament-revision': state.sync.revision,
-              ...(resetAttendance ? { 'x-reset-attendance': '1' } : {})
-            },
+            headers: { ...getSyncHeaders(), 'x-tournament-revision': state.sync.revision },
             body: JSON.stringify({ data: payload })
           });
           const data = await res.json();
@@ -939,6 +1135,7 @@
           state.sync.status = generation === syncGeneration ? 'synced' : 'pending';
           state.sync.lastSynced = data.updatedAt || new Date().toISOString();
           saveRegistry();
+          scheduleChangeRefresh();
           const badge = document.getElementById('sync-status-pill');
           if (badge) badge.textContent = state.sync.status === 'synced' ? 'Cloud Synced' : 'Sync Pending';
           if (!silent) showToast('Saved to Turso DB', 'success');
@@ -953,7 +1150,7 @@
               ? 'Admin sync key rejected. Enter the same ADMIN_SYNC_KEY configured in the backend Cloud Sync settings.'
               : localFallback
                 ? `Cloud sync failed (${err.message}) — saved locally. Note your changes before using Cloud Sync → Pull from DB.`
-                : `${resetAttendance ? 'Tournament reset could not be confirmed' : 'Tournament was not created'}: ${err.message}`;
+                : `${resettingMatches ? 'Match reset could not be confirmed' : 'Tournament was not created'}: ${err.message}`;
           showToast(message, 'error');
           return false;
         }
@@ -1053,9 +1250,9 @@
 
       async function refreshLiveScores() {
         if (liveScoreRefreshInProgress || scoreSaveInProgress || checkInSaveInProgress || document.visibilityState === 'hidden' || isEditingFormField() || hasUnsavedScoreEntry() ||
-          state.sync?.status !== 'synced' || !state.sync.lastSynced) return;
+          state.sync?.status !== 'synced' || !state.sync.lastSynced) return null;
         const apiUrl = getSyncApiUrl();
-        if (!apiUrl) return;
+        if (!apiUrl) return null;
 
         liveScoreRefreshInProgress = true;
         try {
@@ -1069,15 +1266,15 @@
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Tournament refresh failed (HTTP ${response.status})`);
           if (state.tournamentId !== tournamentId || state.sync.revision !== revision || scoreSaveInProgress || checkInSaveInProgress ||
-              state.sync.status !== 'synced' || isEditingFormField() || hasUnsavedScoreEntry()) return;
+              state.sync.status !== 'synced' || isEditingFormField() || hasUnsavedScoreEntry()) return null;
           liveScoreRefreshErrorLogged = false;
           const badge = document.getElementById('sync-status-pill');
           if (badge) badge.textContent = 'Cloud Synced';
           if (!result.exists) {
             await refreshTournamentList(true);
-            return;
+            return null;
           }
-          if (result.unchanged || !result.data) return;
+          if (result.unchanged || !result.data) return true;
 
           const keepAuth = state.auth;
           const keepUi = state.ui;
@@ -1099,6 +1296,7 @@
           tournamentCatalog.loaded = false;
           saveRegistry();
           render();
+          return true;
         } catch (err) {
           if (!liveScoreRefreshErrorLogged) {
             console.error('Live score refresh failed:', err);
@@ -1106,6 +1304,7 @@
             if (badge) badge.textContent = 'Live Update Error';
             liveScoreRefreshErrorLogged = true;
           }
+          return false;
         } finally {
           liveScoreRefreshInProgress = false;
         }
@@ -1114,14 +1313,13 @@
       let tournamentListRefreshInProgress = false;
       let tournamentListRefreshErrorLogged = false;
       let tournamentListRenderPending = false;
-      let tournamentListCatalogSignature = null;
       let deletedTournamentNotice = '';
 
       async function refreshTournamentList(force = false) {
         if (tournamentListRefreshInProgress || !state.auth.loggedIn ||
-            (!force && document.visibilityState === 'hidden')) return;
+            (!force && document.visibilityState === 'hidden')) return null;
         const apiUrl = getSyncApiUrl();
-        if (!apiUrl) return;
+        if (!apiUrl) return null;
         const target = state;
         const generation = syncGeneration;
         tournamentListRefreshInProgress = true;
@@ -1130,7 +1328,7 @@
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Tournament list request failed (HTTP ${response.status})`);
           if (!Array.isArray(result.tournaments)) throw new Error('Invalid tournament list response');
-          if (state !== target || syncGeneration !== generation) return;
+          if (state !== target || syncGeneration !== generation) return null;
           tournamentListRefreshErrorLogged = false;
           const remote = new Map(result.tournaments.map(tournament => [String(tournament.id), tournament]));
           const previousIds = remoteTournamentIds;
@@ -1166,6 +1364,7 @@
                 showToast('This tournament was deleted in another session. Your edits have not been replaced; copy them before leaving, as they cannot be synced to the deleted tournament.', 'error');
                 deletedTournamentNotice = activeId;
               }
+              return null;
             } else {
               const next = result.tournaments[0];
               let nextData;
@@ -1175,7 +1374,7 @@
                 const nextResponse = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(next.id)}`, { cache: 'no-store' });
                 const nextResult = await nextResponse.json();
                 if (!nextResponse.ok) throw new Error(nextResult.error || `Tournament request failed (HTTP ${nextResponse.status})`);
-                if (!nextResult.exists || !nextResult.data || !nextResult.revision) return;
+                if (!nextResult.exists || !nextResult.data || !nextResult.revision) return null;
                 nextData = nextResult.data;
                 nextRevision = nextResult.revision;
                 nextUpdatedAt = nextResult.updatedAt;
@@ -1184,7 +1383,7 @@
               }
               if (state !== target || syncGeneration !== generation || target.sync.status !== 'synced' ||
                   scoreSaveInProgress || checkInSaveInProgress || isEditingFormField() || hasUnsavedScoreEntry() ||
-                  !document.getElementById('modal-root').classList.contains('hidden')) return;
+                  !document.getElementById('modal-root').classList.contains('hidden')) return null;
               const nextId = next ? String(next.id) : nextData.tournamentId;
               const nextUi = { ...target.ui };
               if (next) delete nextUi.emptyTournament;
@@ -1202,6 +1401,7 @@
               window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
               deletedTournamentNotice = '';
               changed = true;
+              render();
               showToast('The selected tournament was deleted in another session.', 'error');
             }
           } else {
@@ -1217,22 +1417,25 @@
             render();
           }
 
-          const signature = JSON.stringify(result.tournaments.map(tournament =>
-            [String(tournament.id), tournament.updated_at, tournament.name, tournament.phase]));
+          if (tournamentListRenderPending ||
+              (state.ui.activeTab === 'tournaments' &&
+               (tournamentCatalog.loading || isEditingFormField() || modalOpen))) return null;
           if (state.ui.activeTab === 'tournaments' && !tournamentCatalog.loading &&
-              !isEditingFormField() && !modalOpen && signature !== tournamentListCatalogSignature) {
+              !isEditingFormField() && !modalOpen) {
             const before = JSON.stringify([tournamentCatalog.items, tournamentCatalog.error]);
             await loadTournamentCatalog(true);
-            if (!tournamentCatalog.error) tournamentListCatalogSignature = signature;
             if (state.ui.activeTab === 'tournaments' &&
                 before !== JSON.stringify([tournamentCatalog.items, tournamentCatalog.error])) render();
+            if (tournamentCatalog.error) return false;
           }
+          return true;
         } catch (err) {
           if (!tournamentListRefreshErrorLogged) {
             console.error('Tournament list refresh failed:', err);
             showToast(`Could not refresh tournaments: ${err.message}`, 'error');
             tournamentListRefreshErrorLogged = true;
           }
+          return false;
         } finally {
           tournamentListRefreshInProgress = false;
         }
@@ -1249,6 +1452,7 @@
         tournamentCatalog.loaded = false;
         upsertPlayerDataTournament(tournamentId, state, result.updatedAt);
         saveRegistry();
+        scheduleChangeRefresh();
       }
 
       async function syncCheckInToServer(playerName, checkedIn, source, checkedInAt) {
@@ -1321,6 +1525,7 @@
         window.history.replaceState(window.history.state, '', getPageUrl(getRequestedPage()));
         saveRegistry();
         render();
+        scheduleChangeRefresh();
         if (getSyncApiUrl()) {
           pullFromTurso(true);
         }
@@ -1395,6 +1600,7 @@
         upsertPlayerDataTournament(id, closed, sync.lastSynced);
         saveRegistry();
         render();
+        scheduleChangeRefresh();
       }
 
       async function createNewTournament(name, date, venue) {
@@ -1497,6 +1703,7 @@
         }
         saveRegistry();
         render();
+        scheduleChangeRefresh();
         if (wasActive && apiUrl && nextId) await pullFromTurso(true);
         showToast('Tournament deleted', 'success');
       }
@@ -1785,6 +1992,9 @@
         } else if (password !== state.auth.pin) {
           showToast('Incorrect Admin PIN', 'error');
           return;
+        } else {
+          state.auth.localExpiresAt = Date.now() + 2 * 60 * 60 * 1000;
+          setSessionExpiry(new Date(state.auth.localExpiresAt).toISOString());
         }
         adminAuthError = '';
         if (usesAdminSession()) {
@@ -1797,6 +2007,7 @@
         state.auth.role = 'admin';
         saveRegistry();
         render();
+        scheduleChangeRefresh();
         showToast('Signed in as Admin', 'success');
       }
 
@@ -1807,6 +2018,7 @@
           state.ui.activeTab = state.phase === 'setup' ? 'dashboard' : state.phase;
         }
         saveRegistry();
+        scheduleChangeRefresh();
         if (state.ui.activeTab !== getRequestedPage()) {
           window.location.replace(getPageUrl(state.ui.activeTab));
           return;
@@ -2216,6 +2428,7 @@
           upsertPlayerDataTournament(tournamentId, state, result.updatedAt);
           saveRegistry();
           render();
+          scheduleChangeRefresh();
           document.querySelectorAll('[data-score-input], [data-final-input]').forEach(input => {
             const attr = input.hasAttribute('data-score-input') ? 'data-score-input' : 'data-final-input';
             const key = `${attr}|${input.getAttribute(attr)}`;
@@ -2381,6 +2594,7 @@
           bindPlayerAppEvents();
         } else {
           bindAppEvents();
+          if (state.auth.role === 'admin') restoreScoreDraft();
         }
       }
 
@@ -2516,6 +2730,7 @@
           throw new Error(`Unexpected response from player account API (HTTP ${response.status})`);
         }
         if (!response.ok) throw new Error(result.error || `Player account API request failed (HTTP ${response.status})`);
+        if (options?.method && options.method !== 'GET') scheduleChangeRefresh();
         return result;
       }
 
@@ -4058,7 +4273,7 @@
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
                     <h3 class="font-bold text-base truncate">${esc(tournamentName)}</h3>
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phase === 'completed' && data.closedEarly ? 'Closed' : phaseLabels[phase] || phase)}</span>
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${phase === 'completed' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-gold-500/15 text-gold-700 dark:text-gold-300'}">${esc(phase === 'completed' && (tournament.closedEarly || data.closedEarly) ? 'Closed' : phaseLabels[phase] || phase)}</span>
                     ${selected ? '<span class="text-[10px] font-semibold text-gold-700 dark:text-gold-300">Selected</span>' : ''}
                   </div>
                   <p class="text-xs text-stone-500 mt-1">${esc(dateLabel)}${(tournament.venue || config.venue) ? ` · ${esc(tournament.venue || config.venue)}` : ''}</p>
@@ -4072,9 +4287,9 @@
                 </div>
               </div>
               <div class="grid grid-cols-3 gap-2 border-t border-stone-100 dark:border-stone-800 pt-3">
-                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Players</div><div class="mt-1 text-sm font-bold tabular-nums">${players.size || groups.reduce((sum, group) => sum + (group.players?.length || 0), 0)}</div></div>
-                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Groups</div><div class="mt-1 text-sm font-bold tabular-nums">${groups.length || config.numGroups || 0}</div></div>
-                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Matches</div><div class="mt-1 text-sm font-bold tabular-nums">${completedMatches}/${matches.length}</div></div>
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Players</div><div class="mt-1 text-sm font-bold tabular-nums">${tournament.stats?.players ?? (players.size || groups.reduce((sum, group) => sum + (group.players?.length || 0), 0))}</div></div>
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Groups</div><div class="mt-1 text-sm font-bold tabular-nums">${tournament.stats?.groups ?? (groups.length || config.numGroups || 0)}</div></div>
+                <div><div class="text-[10px] uppercase tracking-wide text-stone-500">Matches</div><div class="mt-1 text-sm font-bold tabular-nums">${tournament.stats?.completedMatches ?? completedMatches}/${tournament.stats?.matches ?? matches.length}</div></div>
               </div>
             </article>
           `;
@@ -6741,11 +6956,11 @@
         document.getElementById('reset-btn')?.addEventListener('click', () => {
           openModal(`
             <div class="w-full max-w-sm rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
-              <h3 class="text-base font-bold">Reset Tournament?</h3>
-              <p class="text-xs text-stone-500">This clears all schedules, scores, roster entries, and attendance. Shared player profiles are not deleted.</p>
+              <h3 class="text-base font-bold">Reset tournament matches?</h3>
+              <p class="text-xs text-stone-500">This clears all match schedules, scores, and results for this tournament and returns it to setup. Tournament settings, groups, players, skills, and attendance are preserved. Start the tournament again to generate a new schedule.</p>
               <div class="flex justify-end gap-2">
                 <button id="modal-cancel" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
-                <button id="modal-reset-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Reset All</button>
+                <button id="modal-reset-confirm" class="px-4 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold">Reset Matches</button>
               </div>
             </div>
           `);
@@ -6785,18 +7000,34 @@
               }
               if (state !== previous) return;
             }
-            state = createDefaultState(previous.tournamentId);
-            state.auth = previous.auth;
-            state.sync = { ...previous.sync };
-            state.ui.activeTab = getRequestedPage();
+            if (state !== previous) {
+              showToast('Tournament changed while resetting; try again', 'error');
+              button.disabled = false;
+              return;
+            }
+            const resetState = {
+              ...previous,
+              phase: 'setup',
+              qr1Matches: [],
+              qr2Pools: {},
+              qr2Matches: {},
+              semis: {},
+              finals: {},
+              sync: { ...previous.sync },
+              ui: { ...previous.ui, activeTab: getRequestedPage() }
+            };
+            delete resetState.closedEarly;
+            state = resetState;
             if (getSyncApiUrl()) {
               syncGeneration++;
               if (!await pushToTurso(true, false, true)) {
-                state = previous;
-                state.sync.status = 'error';
-                saveRegistry();
-                closeModal();
-                render();
+                if (state === resetState) {
+                  state = previous;
+                  state.sync.status = 'error';
+                  saveRegistry();
+                  closeModal();
+                  render();
+                }
                 return;
               }
             } else {
@@ -6804,7 +7035,7 @@
             }
             closeModal();
             render();
-            showToast('Tournament reset', 'success');
+            showToast('Tournament matches reset', 'success');
           });
         });
 
@@ -7222,36 +7453,131 @@
         }
       });
 
-      window.addEventListener('focus', () => {
-        refreshLiveScores();
-        refreshTournamentList();
-        if (!playerData.loaded || playerData.loading || state.ui.activeTab !== 'players' || !getSyncApiUrl()) return;
-        loadPlayerData(true).then(() => {
-          if (state.ui.activeTab === 'players') render();
-        });
-      });
-
-      window.addEventListener('focusout', () => {
-        refreshLiveScores();
-      });
-
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') {
-          refreshLiveScores();
-          refreshTournamentList();
-        }
-      });
-
       async function refreshPlayerDirectory() {
         if (document.visibilityState === 'hidden' || !state.auth.loggedIn || state.ui.playerCheckInMode ||
             state.ui.activeTab !== 'players' ||
             !getSyncApiUrl() || playerData.loading || isEditingFormField() ||
-            !document.getElementById('modal-root').classList.contains('hidden')) return;
+            !document.getElementById('modal-root').classList.contains('hidden')) return null;
         const before = JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error]);
         await loadPlayerData(true);
         if (state.ui.activeTab === 'players' &&
             before !== JSON.stringify([playerData.tournaments, playerData.profiles, playerData.error])) render();
+        return !playerData.error;
       }
+
+      let changePollingStarted = false;
+      let changePollTimer = null;
+      let changePollInFlight = false;
+      let forceChangePollQueued = false;
+      let changePollFailures = 0;
+      let changePollErrorLogged = false;
+      let changePollApi = '';
+      let seenTournamentId = '';
+      let seenTournamentVersion = null;
+      let seenCatalogVersion = null;
+      let seenPlayerVersions = null;
+      let nextScoreCheck = 0;
+      let nextCatalogCheck = 0;
+      let nextPlayerCheck = 0;
+
+      function scheduleChangeRefresh() {
+        if (!changePollingStarted || !state.auth.loggedIn || !getSyncApiUrl()) return;
+        if (changePollInFlight) {
+          forceChangePollQueued = true;
+          return;
+        }
+        clearTimeout(changePollTimer);
+        changePollTimer = setTimeout(() => pollChanges(true), 0);
+      }
+
+      async function pollChanges(force = false) {
+        if (changePollInFlight) {
+          if (force) forceChangePollQueued = true;
+          return;
+        }
+        changePollInFlight = true;
+        let failed = false;
+        try {
+          const apiUrl = getSyncApiUrl();
+          if (!apiUrl || !state.auth.loggedIn || document.visibilityState === 'hidden') return;
+          const tournamentId = String(state.tournamentId || 'default');
+          if (changePollApi !== apiUrl) {
+            changePollApi = apiUrl;
+            seenTournamentId = '';
+            seenCatalogVersion = null;
+            seenPlayerVersions = null;
+          }
+          if (seenTournamentId !== tournamentId) {
+            seenTournamentId = tournamentId;
+            seenTournamentVersion = null;
+          }
+          const fresh = force ? `?fresh=${Date.now()}` : '';
+          const response = await fetch(`${apiUrl}/api/changes/${encodeURIComponent(tournamentId)}${fresh}`,
+            force ? { cache: 'no-store' } : {});
+          const versions = await response.json();
+          if (!response.ok) throw new Error(versions.error || `Change check failed (HTTP ${response.status})`);
+          if (!['tournament', 'tournaments', 'profiles'].every(key => Number.isSafeInteger(versions[key]) && versions[key] >= 0)) {
+            throw new Error('Invalid change versions from backend');
+          }
+          if (getSyncApiUrl() !== apiUrl || String(state.tournamentId || 'default') !== tournamentId || !state.auth.loggedIn) return;
+          const now = Date.now();
+          if (force || now >= nextScoreCheck) {
+            nextScoreCheck = now + 5000;
+            if (seenTournamentVersion !== versions.tournament) {
+              const refreshed = await refreshLiveScores();
+              if (refreshed === true) seenTournamentVersion = versions.tournament;
+              if (refreshed === false) failed = true;
+            }
+          }
+          if (force || now >= nextCatalogCheck) {
+            nextCatalogCheck = now + 15000;
+            if (seenCatalogVersion !== versions.tournaments) {
+              const refreshed = await refreshTournamentList();
+              if (refreshed === true) seenCatalogVersion = versions.tournaments;
+              if (refreshed === false) failed = true;
+            }
+          }
+          if (force || now >= nextPlayerCheck) {
+            nextPlayerCheck = now + 30000;
+            const playerVersions = `${versions.tournaments}:${versions.profiles}`;
+            if (state.ui.activeTab === 'players' && seenPlayerVersions !== playerVersions) {
+              const refreshed = await refreshPlayerDirectory();
+              if (refreshed === true) seenPlayerVersions = playerVersions;
+              if (refreshed === false) failed = true;
+            }
+          }
+          if (!failed) {
+            changePollFailures = 0;
+            changePollErrorLogged = false;
+          }
+        } catch (err) {
+          failed = true;
+          if (!changePollErrorLogged) {
+            console.error('Live update check failed:', err);
+            showToast(`Live updates could not be checked: ${err.message}`, 'error');
+            changePollErrorLogged = true;
+          }
+        } finally {
+          changePollInFlight = false;
+          if (failed) changePollFailures += 1;
+          const delay = failed
+            ? Math.round(Math.min(60000, 5000 * (2 ** Math.min(changePollFailures, 4))) * (0.8 + Math.random() * 0.4))
+            : 5000;
+          clearTimeout(changePollTimer);
+          if (forceChangePollQueued && document.visibilityState === 'visible') {
+            forceChangePollQueued = false;
+            changePollTimer = setTimeout(() => pollChanges(true), failed ? delay : 0);
+          } else {
+            forceChangePollQueued = false;
+            changePollTimer = setTimeout(pollChanges, delay);
+          }
+        }
+      }
+
+      window.addEventListener('focus', scheduleChangeRefresh);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') scheduleChangeRefresh();
+      });
 
       (async () => {
         if (playerInviteToken) {
@@ -7281,6 +7607,10 @@
         } else if (state.auth.role === 'player' || !state.auth.loggedIn) {
           await restorePlayerSession();
         }
+        if (state.auth.loggedIn && state.auth.role === 'admin' && !usesAdminSession()) {
+          if (Number(state.auth.localExpiresAt || 0) <= Date.now()) expireSession();
+          else setSessionExpiry(new Date(state.auth.localExpiresAt).toISOString());
+        }
         if (state.auth.loggedIn && state.auth.role === 'guest' && state.ui.activeTab !== getRequestedPage()) {
           window.location.replace(getPageUrl(state.ui.activeTab));
           return;
@@ -7288,9 +7618,9 @@
         render();
         if (getSyncApiUrl()) {
           await pullFromTurso(true);
-          window.setInterval(refreshLiveScores, 2000);
-          window.setInterval(refreshTournamentList, 2000);
-          window.setInterval(refreshPlayerDirectory, 2000);
         }
+        changePollingStarted = true;
+        changePollTimer = setTimeout(pollChanges, 5000);
+        scheduleChangeRefresh();
       })();
     })();

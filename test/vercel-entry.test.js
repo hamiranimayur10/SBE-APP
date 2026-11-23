@@ -5,6 +5,8 @@ const net = require('node:net');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const test = require('node:test');
+const { spawnSync } = require('node:child_process');
+const { getAssetVersions } = require('../badminton-backend/asset-versions');
 
 const root = path.join(__dirname, '..');
 
@@ -36,6 +38,7 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
       TURSO_AUTH_TOKEN: '',
       ADMIN_SYNC_KEY: '',
       ADMIN_PASSWORD: '',
+      NODE_ENV: 'production',
       VERCEL: ''
     },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -62,7 +65,18 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
 
     const response = await fetch(`${baseUrl}/`);
     assert.equal(response.status, 200);
-    assert.match(await response.text(), /SBE Light Vs Dark Side Tournament/);
+    const html = await response.text();
+    assert.match(html, /SBE Light Vs Dark Side Tournament/);
+    const versions = getAssetVersions();
+    assert.ok(html.includes(`app.js?v=${versions['app.js']}`));
+    const asset = await fetch(`${baseUrl}/app.js?v=${versions['app.js']}`);
+    assert.match(asset.headers.get('cache-control'), /max-age=31536000.*immutable/);
+    const unversioned = await fetch(`${baseUrl}/app.js`);
+    assert.doesNotMatch(unversioned.headers.get('cache-control'), /immutable/);
+    const incorrectVersion = await fetch(`${baseUrl}/app.js?v=wrong`);
+    assert.doesNotMatch(incorrectVersion.headers.get('cache-control'), /immutable/);
+    const versionCheck = spawnSync(process.execPath, [path.join(root, 'scripts', 'version-assets.js'), '--check'], { cwd: root });
+    assert.equal(versionCheck.status, 0, versionCheck.stderr.toString());
 
     const write = await fetch(`${baseUrl}/api/tournaments/test`, {
       method: 'PUT',

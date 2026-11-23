@@ -5,6 +5,7 @@ const { createClient } = require('@libsql/client');
 const crypto = require('crypto');
 const { promisify } = require('util');
 const { isDeepStrictEqual } = require('util');
+const { getAssetVersions } = require('./asset-versions');
 
 const app = express();
 app.use(cors());
@@ -12,9 +13,9 @@ app.use(express.json({ limit: '8mb' }));
 
 const scrypt = promisify(crypto.scrypt);
 const PLAYER_SESSION_COOKIE = 'sbe_player_session';
-const PLAYER_SESSION_SECONDS = 30 * 24 * 60 * 60;
+const PLAYER_SESSION_SECONDS = 2 * 60 * 60;
 const ADMIN_SESSION_COOKIE = 'sbe_admin_session';
-const ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60;
+const ADMIN_SESSION_SECONDS = 2 * 60 * 60;
 const PROFILE_VISIBILITY_FIELDS = [
   'name', 'nickname', 'photoUrl', 'age', 'gender', 'club', 'ranking', 'country', 'state', 'city',
   'emergencyContact', 'playingHand', 'preferredEvents', 'email', 'skill'
@@ -200,6 +201,53 @@ async function initSchema() {
           expires_at TEXT NOT NULL
         )
       `);
+      const sessionDeadline = new Date(Date.now() + ADMIN_SESSION_SECONDS * 1000).toISOString();
+      await getDb().execute({ sql: 'UPDATE admin_sessions SET expires_at = ? WHERE expires_at > ?', args: [sessionDeadline, sessionDeadline] });
+      await getDb().execute({ sql: 'UPDATE player_sessions SET expires_at = ? WHERE expires_at > ?', args: [sessionDeadline, sessionDeadline] });
+      const versionObjects = await getDb().execute(`SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE (type = 'table' AND name IN ('change_versions', 'tournament_change_versions'))
+           OR (type = 'trigger' AND name IN (
+             'tournament_version_insert', 'tournament_version_update', 'tournament_version_delete',
+             'profile_version_insert', 'profile_version_update', 'profile_version_delete'
+           ))`);
+      const versionSchemaReady = Number(versionObjects.rows[0].count) === 8;
+      const versionRowReady = versionSchemaReady &&
+        (await getDb().execute('SELECT id FROM change_versions WHERE id = 1')).rows.length > 0;
+      if (!versionRowReady) {
+        const versionTransaction = await getDb().transaction('write');
+        try {
+          await versionTransaction.execute(`CREATE TABLE IF NOT EXISTS change_versions (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            tournaments INTEGER NOT NULL,
+            profiles INTEGER NOT NULL
+          )`);
+          await versionTransaction.execute('INSERT OR IGNORE INTO change_versions VALUES (1, 0, 0)');
+          await versionTransaction.execute(`CREATE TABLE IF NOT EXISTS tournament_change_versions (
+            tournament_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL
+          )`);
+          for (const [operation, row] of [['INSERT', 'NEW'], ['UPDATE', 'NEW'], ['DELETE', 'OLD']]) {
+            await versionTransaction.execute(`CREATE TRIGGER IF NOT EXISTS tournament_version_${operation.toLowerCase()}
+              AFTER ${operation} ON tournaments BEGIN
+                UPDATE change_versions SET tournaments = tournaments + 1 WHERE id = 1;
+                INSERT INTO tournament_change_versions (tournament_id, version) VALUES (${row}.id, 1)
+                ON CONFLICT(tournament_id) DO UPDATE SET version = version + 1;
+              END`);
+            await versionTransaction.execute(`CREATE TRIGGER IF NOT EXISTS profile_version_${operation.toLowerCase()}
+              AFTER ${operation} ON player_profiles BEGIN
+                UPDATE change_versions SET profiles = profiles + 1 WHERE id = 1;
+              END`);
+          }
+          await versionTransaction.execute(`INSERT OR IGNORE INTO tournament_change_versions (tournament_id, version)
+            SELECT id, 1 FROM tournaments`);
+          await versionTransaction.commit();
+        } catch (err) {
+          await versionTransaction.rollback();
+          throw err;
+        } finally {
+          versionTransaction.close();
+        }
+      }
       await getDb().execute(`
         CREATE TABLE IF NOT EXISTS admin_login_attempts (
           id INTEGER PRIMARY KEY,
@@ -325,15 +373,27 @@ function setAdminCookie(req, res, token, maxAge) {
   res.setHeader('Set-Cookie', `${ADMIN_SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Strict${isSecure ? '; Secure' : ''}`);
 }
 
+function getActivityExpiry(req, seconds) {
+  const idleMs = req.body?.idleMs === undefined ? 0 : req.body.idleMs;
+  if (!Number.isSafeInteger(idleMs) || idleMs < 0 || idleMs >= seconds * 1000) {
+    throw new ValidationError('Invalid session activity age');
+  }
+  return new Date(Date.now() + seconds * 1000 - idleMs).toISOString();
+}
+
+function sessionCookieAge(expiresAt, seconds) {
+  return Math.min(seconds, Math.max(0, Math.ceil((Date.parse(expiresAt) - Date.now()) / 1000)));
+}
+
 async function findAdminSession(req) {
   const token = getCookie(req, ADMIN_SESSION_COOKIE);
   const password = configuredAdminPassword();
   if (!token || !password) return false;
   const result = await getDb().execute({
-    sql: 'SELECT token_hash FROM admin_sessions WHERE token_hash = ? AND credential_tag = ? AND expires_at > ?',
+    sql: 'SELECT token_hash, expires_at FROM admin_sessions WHERE token_hash = ? AND credential_tag = ? AND expires_at > ?',
     args: [hashToken(token), adminCredentialTag(password), new Date().toISOString()]
   });
-  return result.rows.length > 0;
+  return result.rows[0] || null;
 }
 
 app.post('/api/admin-auth/login', async (req, res) => {
@@ -367,14 +427,15 @@ app.post('/api/admin-auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Incorrect admin password' });
     }
     const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + ADMIN_SESSION_SECONDS * 1000).toISOString();
     await getDb().execute({
       sql: 'INSERT INTO admin_sessions (token_hash, credential_tag, expires_at) VALUES (?, ?, ?)',
-      args: [hashToken(token), adminCredentialTag(configured), new Date(Date.now() + ADMIN_SESSION_SECONDS * 1000).toISOString()]
+      args: [hashToken(token), adminCredentialTag(configured), expiresAt]
     });
     await getDb().execute('DELETE FROM admin_login_attempts WHERE id = 1');
     setAdminCookie(req, res, token, ADMIN_SESSION_SECONDS);
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ok: true });
+    res.json({ ok: true, expiresAt });
   } catch (err) {
     console.error('Admin login failed:', err);
     res.status(500).json({ error: 'Admin login is unavailable' });
@@ -384,13 +445,38 @@ app.post('/api/admin-auth/login', async (req, res) => {
 app.get('/api/admin-auth/me', async (req, res) => {
   try {
     res.setHeader('Cache-Control', 'no-store');
-    if (!await findAdminSession(req) || await findPlayerSession(req)) {
+    const session = await findAdminSession(req);
+    if (!session || await findPlayerSession(req)) {
       return res.status(401).json({ error: 'Admin session required' });
     }
-    res.json({ ok: true });
+    res.json({ ok: true, expiresAt: session.expires_at });
   } catch (err) {
     console.error('Admin session check failed:', err);
     res.status(500).json({ error: 'Admin authentication is unavailable' });
+  }
+});
+
+app.post('/api/admin-auth/activity', async (req, res) => {
+  try {
+    if (req.headers['x-sbe-admin-request'] !== '1') return res.status(403).json({ error: 'Admin request header required' });
+    const token = getCookie(req, ADMIN_SESSION_COOKIE);
+    const password = configuredAdminPassword();
+    if (!token || !password || await findPlayerSession(req)) return res.status(401).json({ error: 'Admin session required' });
+    const expiresAt = getActivityExpiry(req, ADMIN_SESSION_SECONDS);
+    const result = await getDb().execute({
+      sql: `UPDATE admin_sessions SET expires_at = MAX(expires_at, ?)
+            WHERE token_hash = ? AND credential_tag = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            RETURNING expires_at`,
+      args: [expiresAt, hashToken(token), adminCredentialTag(password)]
+    });
+    if (!result.rows.length) return res.status(401).json({ error: 'Admin session expired; sign in again' });
+    setAdminCookie(req, res, token, sessionCookieAge(result.rows[0].expires_at, ADMIN_SESSION_SECONDS));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, expiresAt: result.rows[0].expires_at });
+  } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Admin activity update failed:', err);
+    res.status(500).json({ error: 'Admin session activity could not be saved' });
   }
 });
 
@@ -436,7 +522,7 @@ async function findPlayerSession(req) {
   const now = new Date().toISOString();
   const result = await getDb().execute({
     sql: `SELECT s.account_id AS accountId, a.player_name AS playerName, a.email,
-                 a.must_change_password AS mustChangePassword
+                 a.must_change_password AS mustChangePassword, s.expires_at AS expiresAt
           FROM player_sessions s
           JOIN player_accounts a ON a.id = s.account_id
           WHERE s.token_hash = ? AND s.expires_at > ?`,
@@ -444,8 +530,8 @@ async function findPlayerSession(req) {
   });
   if (!result.rows.length) {
     await getDb().execute({
-      sql: 'DELETE FROM player_sessions WHERE token_hash = ?',
-      args: [hashToken(token)]
+      sql: 'DELETE FROM player_sessions WHERE token_hash = ? AND expires_at <= ?',
+      args: [hashToken(token), now]
     });
     return null;
   }
@@ -460,6 +546,7 @@ async function requirePlayer(req, res, next) {
     const allowedDuringPasswordChange =
       (req.method === 'GET' && req.path === '/api/player-auth/me') ||
       (req.method === 'PUT' && req.path === '/api/player-auth/me/password') ||
+      (req.method === 'POST' && req.path === '/api/player-auth/activity') ||
       (req.method === 'DELETE' && req.path === '/api/player-auth/me') ||
       (req.method === 'POST' && req.path === '/api/player-auth/logout');
     if (Number(session.mustChangePassword) && !allowedDuringPasswordChange) {
@@ -917,62 +1004,127 @@ app.get('/api/tournaments', async (_req, res) => {
   }
 });
 
-app.get('/api/tournament-history', async (req, res) => {
+app.get('/api/changes/:id', async (req, res) => {
   try {
-    const token = getCookie(req, PLAYER_SESSION_COOKIE);
-    const [result, profilesResult, sessionResult] = await getDb().batch([
+    const result = await getDb().execute({
+      sql: `SELECT tournaments, profiles,
+                   COALESCE((SELECT version FROM tournament_change_versions WHERE tournament_id = ?), 0) AS tournament
+            FROM change_versions WHERE id = 1`,
+      args: [req.params.id]
+    });
+    if (!result.rows.length) throw new Error('Change versions are unavailable');
+    res.set('Cache-Control', 'public, max-age=0, s-maxage=2');
+    res.json({
+      tournament: Number(result.rows[0].tournament),
+      tournaments: Number(result.rows[0].tournaments),
+      profiles: Number(result.rows[0].profiles)
+    });
+  } catch (err) {
+    console.error('Change version lookup failed:', err);
+    res.status(500).json({ error: 'Change versions are unavailable' });
+  }
+});
+
+function serializeTournamentHistory(rows, profiles) {
+  return rows.map(row => {
+    const state = JSON.parse(row.data);
+    if (!state || typeof state !== 'object' || Array.isArray(state) ||
+      !state.config || typeof state.config !== 'object' || Array.isArray(state.config) ||
+      (state.groups !== undefined && !Array.isArray(state.groups)) ||
+      (state.qr1Matches !== undefined && !Array.isArray(state.qr1Matches)) ||
+      ['qr2Pools', 'qr2Matches', 'semis', 'finals'].some(key =>
+        state[key] !== undefined && (!state[key] || typeof state[key] !== 'object' || Array.isArray(state[key]))
+      )) {
+      throw new Error(`Invalid tournament data for ${row.id}`);
+    }
+    return {
+      id: row.id,
+      name: row.name,
+      date: row.date,
+      phase: row.phase,
+      data: {
+        tournamentId: state.tournamentId || row.id,
+        config: state.config,
+        groups: state.groups || [],
+        qr1Matches: state.qr1Matches || [],
+        qr2Pools: state.qr2Pools || {},
+        qr2Matches: state.qr2Matches || {},
+        semis: state.semis || {},
+        finals: state.finals || {},
+        playerProfileIds: {
+          ...(state.playerProfileIds || {}),
+          ...getTournamentPlayerProfileIds(state, profiles)
+        }
+      },
+      updatedAt: row.updated_at
+    };
+  });
+}
+
+app.get('/api/tournament-catalog', async (_req, res) => {
+  try {
+    const result = await getDb().execute('SELECT id, name, date, venue, phase, data, updated_at FROM tournaments ORDER BY date DESC, updated_at DESC');
+    const tournaments = result.rows.map(row => {
+      const data = JSON.parse(row.data);
+      const groups = Array.isArray(data.groups) ? data.groups : [];
+      const players = new Set(groups.flatMap(group => Array.isArray(group.players) ? group.players : []));
+      Object.values(data.qr2Pools || {}).flat().forEach(name => players.add(name));
+      const matches = [
+        ...(Array.isArray(data.qr1Matches) ? data.qr1Matches : []),
+        ...Object.values(data.qr2Matches || {}).flat(),
+        ...Object.values(data.semis || {}).flat(),
+        ...Object.values(data.finals || {}).filter(Boolean)
+      ];
+      return {
+        id: row.id, name: row.name, date: row.date, venue: row.venue, phase: row.phase,
+        updatedAt: row.updated_at, closedEarly: Boolean(data.closedEarly),
+        stats: {
+          players: players.size || groups.reduce((sum, group) => sum + (group.players?.length || 0), 0),
+          groups: groups.length || data.config?.numGroups || 0,
+          matches: matches.length,
+          completedMatches: matches.filter(match => match.completed).length
+        }
+      };
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ tournaments });
+  } catch (err) {
+    console.error('Tournament catalog lookup failed:', err);
+    res.status(500).json({ error: 'Tournament catalog is unavailable' });
+  }
+});
+
+async function sendTournamentHistory(req, res, includeOwnPlayer) {
+  try {
+    const queries = [
       'SELECT id, name, date, phase, data, updated_at FROM tournaments ORDER BY date DESC, updated_at DESC',
-      'SELECT * FROM player_profiles ORDER BY player_name',
-      {
+      'SELECT * FROM player_profiles ORDER BY player_name'
+    ];
+    if (includeOwnPlayer) {
+      const token = getCookie(req, PLAYER_SESSION_COOKIE);
+      queries.push({
         sql: `SELECT a.player_name FROM player_sessions s JOIN player_accounts a ON a.id = s.account_id
               WHERE s.token_hash = ? AND s.expires_at > ?`,
         args: [token ? hashToken(token) : '', new Date().toISOString()]
-      }
-    ], 'read');
-    const ownName = sessionResult.rows[0]?.player_name;
+      });
+    }
+    const [result, profilesResult, sessionResult] = await getDb().batch(queries, 'read');
+    const ownName = sessionResult?.rows[0]?.player_name;
     const ownProfile = ownName && profilesResult.rows.find(row => normalizePlayerName(row.player_name) === normalizePlayerName(ownName));
     res.set('Cache-Control', 'no-store');
-    res.json({
+    const response = {
       players: profilesResult.rows.map(row => serializePlayerProfile(row, true)),
-      ownPlayer: ownProfile ? serializePlayerProfile(ownProfile, false) : null,
-      tournaments: result.rows.map(row => {
-        const state = JSON.parse(row.data);
-        if (!state || typeof state !== 'object' || Array.isArray(state) ||
-          !state.config || typeof state.config !== 'object' || Array.isArray(state.config) ||
-          (state.groups !== undefined && !Array.isArray(state.groups)) ||
-          (state.qr1Matches !== undefined && !Array.isArray(state.qr1Matches)) ||
-          ['qr2Pools', 'qr2Matches', 'semis', 'finals'].some(key =>
-            state[key] !== undefined && (!state[key] || typeof state[key] !== 'object' || Array.isArray(state[key]))
-          )) {
-          throw new Error(`Invalid tournament data for ${row.id}`);
-        }
-        return {
-          id: row.id,
-          name: row.name,
-          date: row.date,
-          phase: row.phase,
-          data: {
-            tournamentId: state.tournamentId || row.id,
-            config: state.config,
-            groups: state.groups || [],
-            qr1Matches: state.qr1Matches || [],
-            qr2Pools: state.qr2Pools || {},
-            qr2Matches: state.qr2Matches || {},
-            semis: state.semis || {},
-            finals: state.finals || {},
-            playerProfileIds: {
-              ...(state.playerProfileIds || {}),
-              ...getTournamentPlayerProfileIds(state, profilesResult.rows)
-            }
-          },
-          updatedAt: row.updated_at
-        };
-      })
-    });
+      tournaments: serializeTournamentHistory(result.rows, profilesResult.rows)
+    };
+    if (includeOwnPlayer) response.ownPlayer = ownProfile ? serializePlayerProfile(ownProfile, false) : null;
+    res.json(response);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
+}
+
+app.get('/api/tournament-history/public', (req, res) => sendTournamentHistory(req, res, false));
+app.get('/api/tournament-history', (req, res) => sendTournamentHistory(req, res, true));
 
 app.get('/api/player-auth/invites/:token', async (req, res) => {
   try {
@@ -1102,7 +1254,7 @@ app.post('/api/player-auth/register', async (req, res) => {
     await transaction.commit();
     setPlayerCookie(req, res, sessionToken, PLAYER_SESSION_SECONDS);
     const savedProfile = await getPlayerProfile(canonicalName);
-    res.status(201).json({ player: serializePlayerProfile(savedProfile, false) });
+    res.status(201).json({ player: serializePlayerProfile(savedProfile, false), expiresAt });
   } catch (err) {
     if (transaction) await transaction.rollback();
     if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
@@ -1141,7 +1293,8 @@ app.post('/api/player-auth/login', async (req, res) => {
     setPlayerCookie(req, res, token, PLAYER_SESSION_SECONDS);
     res.json({
       player: serializePlayerProfile(profile, false),
-      mustChangePassword: Boolean(Number(account.must_change_password))
+      mustChangePassword: Boolean(Number(account.must_change_password)),
+      expiresAt
     });
   } catch (err) {
     console.error('Player login failed:', err);
@@ -1155,11 +1308,34 @@ app.get('/api/player-auth/me', requirePlayer, async (req, res) => {
     if (!profile) return res.status(404).json({ error: 'Player profile is unavailable' });
     res.json({
       player: serializePlayerProfile(profile, false),
-      mustChangePassword: Boolean(Number(req.playerSession.mustChangePassword))
+      mustChangePassword: Boolean(Number(req.playerSession.mustChangePassword)),
+      expiresAt: req.playerSession.expiresAt
     });
   } catch (err) {
     console.error('Failed to load player account:', err);
     res.status(500).json({ error: 'Player profile is unavailable' });
+  }
+});
+
+app.post('/api/player-auth/activity', requirePlayer, async (req, res) => {
+  try {
+    if (req.headers['x-sbe-player-request'] !== '1') return res.status(403).json({ error: 'Player request header required' });
+    const token = getCookie(req, PLAYER_SESSION_COOKIE);
+    const expiresAt = getActivityExpiry(req, PLAYER_SESSION_SECONDS);
+    const result = await getDb().execute({
+      sql: `UPDATE player_sessions SET expires_at = MAX(expires_at, ?)
+            WHERE token_hash = ? AND account_id = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            RETURNING expires_at`,
+      args: [expiresAt, hashToken(token), req.playerSession.accountId]
+    });
+    if (!result.rows.length) return res.status(401).json({ error: 'Player session expired; sign in again' });
+    setPlayerCookie(req, res, token, sessionCookieAge(result.rows[0].expires_at, PLAYER_SESSION_SECONDS));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, expiresAt: result.rows[0].expires_at });
+  } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message });
+    console.error('Player activity update failed:', err);
+    res.status(500).json({ error: 'Player session activity could not be saved' });
   }
 });
 
@@ -2420,6 +2596,15 @@ app.post('/api/player-auth/tournaments/:id/checkin', requirePlayer, async (req, 
   }
 });
 
+const assetVersions = getAssetVersions();
+app.use((req, res, next) => {
+  const name = req.path.slice(1);
+  if (process.env.NODE_ENV === 'production' && Object.prototype.hasOwnProperty.call(assetVersions, name) &&
+      req.query.v === assetVersions[name]) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+  next();
+});
 app.use(express.static(require('path').join(__dirname, '..', 'public')));
 
 if (require.main === module) {

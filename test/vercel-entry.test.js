@@ -68,6 +68,7 @@ test('Vercel Express entry serves the frontend at the root path', { timeout: 300
     const html = await response.text();
     assert.match(html, /SBE Light Vs Dark Side Tournament/);
     assert.match(html, /<meta name="robots" content="noindex, nofollow"\s*\/?>/i);
+    assert.equal((await fetch(`${baseUrl}/privacy.html`)).status, 404);
     const robots = await fetch(`${baseUrl}/robots.txt`);
     assert.equal(robots.status, 200);
     assert.match(await robots.text(), /^User-agent: \*\s+Disallow: \/api\/\s*$/i);

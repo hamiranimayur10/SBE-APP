@@ -569,6 +569,10 @@
         return headers;
       }
 
+      function getProfileReadHeaders() {
+        return state.auth.role === 'admin' ? getSyncHeaders() : {};
+      }
+
       function getSyncApiUrl() {
         const configuredUrl = (state.sync?.apiUrl || '').trim().replace(/\/+$/, '');
         if (configuredUrl) {
@@ -893,7 +897,7 @@
             if (id) params.set('id', id);
             else params.set('name', name);
             if (opponentId) params.set('opponent', opponentId);
-            const response = await fetch(`${apiUrl}/api/player-performance?${params}`, { cache: 'no-store' });
+            const response = await fetch(`${apiUrl}/api/player-performance?${params}`, { cache: 'no-store', headers: getProfileReadHeaders() });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Player history request failed (HTTP ${response.status})`);
             if (!result.player?.profile?.playerId || !Array.isArray(result.player.results) || !Array.isArray(result.partnerships)) {
@@ -983,7 +987,7 @@
           let remoteUpdatedAt = null;
           const apiUrl = getSyncApiUrl();
           if (apiUrl) {
-            const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`);
+            const response = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(id)}`, { headers: getProfileReadHeaders() });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Tournament request failed (HTTP ${response.status})`);
             if (!result.exists || !result.data) throw new Error('Tournament no longer exists; refresh the list');
@@ -1224,7 +1228,7 @@
           } catch (e) {}
 
           const tid = encodeURIComponent(state.tournamentId || 'default');
-          const res = await fetch(`${apiUrl}/api/tournaments/${tid}`);
+          const res = await fetch(`${apiUrl}/api/tournaments/${tid}`, { headers: getProfileReadHeaders() });
           const json = await res.json();
           if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
           if (state !== target || syncGeneration !== generation || state.sync.revision !== startingRevision || scoreSaveInProgress || checkInSaveInProgress ||
@@ -1296,7 +1300,7 @@
           const query = revision ? `?revision=${encodeURIComponent(revision)}` : '';
           const response = await fetch(
             `${apiUrl}/api/tournaments/${encodeURIComponent(tournamentId)}${query}`,
-            { cache: 'no-store' }
+            { cache: 'no-store', headers: getProfileReadHeaders() }
           );
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Tournament refresh failed (HTTP ${response.status})`);
@@ -1406,7 +1410,7 @@
               let nextRevision = 'new';
               let nextUpdatedAt = null;
               if (next) {
-                const nextResponse = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(next.id)}`, { cache: 'no-store' });
+                const nextResponse = await fetch(`${apiUrl}/api/tournaments/${encodeURIComponent(next.id)}`, { cache: 'no-store', headers: getProfileReadHeaders() });
                 const nextResult = await nextResponse.json();
                 if (!nextResponse.ok) throw new Error(nextResult.error || `Tournament request failed (HTTP ${nextResponse.status})`);
                 if (!nextResult.exists || !nextResult.data || !nextResult.revision) return null;
@@ -1611,7 +1615,7 @@
         let sync = local?.sync || state.sync;
         if (apiUrl) {
           const url = `${apiUrl}/api/tournaments/${encodeURIComponent(id)}`;
-          const response = await fetch(url, { cache: 'no-store' });
+          const response = await fetch(url, { cache: 'no-store', headers: getProfileReadHeaders() });
           const current = await response.json();
           if (!response.ok) throw new Error(current.error || `HTTP ${response.status}`);
           if (current.exists) {
@@ -2047,6 +2051,7 @@
         }
         state.auth.loggedIn = true;
         state.auth.role = 'admin';
+        if (state.sync.revision?.endsWith(':guest')) await pullFromTurso(true);
         saveRegistry();
         render();
         scheduleChangeRefresh();
@@ -2695,7 +2700,7 @@
         }
         if (state.ui.playerCheckInMode) {
           app.innerHTML = renderPlayerCheckInScreen();
-          if (state.auth.role === 'admin') bindPlayerCheckInEvents();
+          if (state.auth.loggedIn && state.auth.role === 'admin') bindPlayerCheckInEvents();
           else bindReadOnlyPlayerCheckInEvents();
           return;
         }
@@ -3531,7 +3536,7 @@
                   </div>
                 </div>
               </details>
-              <details class="relative min-w-[8rem]">
+              ${state.auth.role !== 'guest' ? `<details class="relative min-w-[8rem]">
                 <summary class="${summaryClass(peopleActive)}">
                   <span class="${categoryLabel.replace('block ', 'inline-block ')} !px-0 !pb-0">Players &amp; Check-In</span>
                   <span aria-hidden="true" class="text-[10px]">▾</span>
@@ -3541,7 +3546,7 @@
                   ${navButton('players', isPlayer ? 'My Player Card' : 'Players & Performance')}
                   ${navButton('checkin', 'Attendance', `${checkIns.filter(player => state.checkIns?.[player.name]?.checkedIn).length}/${checkIns.length}`)}
                 </div>
-              </details>
+              </details>` : ''}
               <div class="min-w-[5rem]">
                 <span class="${categoryLabel}">Information</span>
                 ${navButton('rules', 'Rules & Format')}
@@ -3569,13 +3574,19 @@
             return renderTournamentCatalogView();
           case 'rules': return renderRulesView();
           case 'players':
+            if (state.auth.role === 'guest') {
+              return renderEmptyState('Player profiles are unavailable to guests', 'Sign in as a player or administrator to view player cards.');
+            }
             if (!playerData.loaded && !playerData.loading) {
               loadPlayerData().then(() => {
                 if (state.ui.activeTab === 'players') render();
               });
             }
             return renderPlayerProfilesView();
-          case 'checkin': return renderCheckInView();
+          case 'checkin':
+            return state.auth.role === 'guest'
+              ? renderEmptyState('Attendance is unavailable to guests', 'Sign in as a player or administrator to access check-in.')
+              : renderCheckInView();
           default: return renderDashboardView();
         }
       }
@@ -3925,7 +3936,7 @@
                         <td class="px-3 py-2 font-semibold ${isTop ? 'text-gold-600 dark:text-gold-400' : 'text-stone-400'}">${idx + 1}</td>
                         <td class="px-3 py-2 font-medium">
                           ${esc(r.player)}
-                          <span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-stone-100 dark:bg-stone-800 text-stone-500 dark:text-stone-400 font-semibold" title="Skill level">${getPlayerSkill(r.player)}</span>
+                          ${state.auth.role !== 'guest' ? `<span class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-stone-100 dark:bg-stone-800 text-stone-500 dark:text-stone-400 font-semibold" title="Skill level">${getPlayerSkill(r.player)}</span>` : ''}
                           ${r.tiedFlag ? `<span title="Tied on all tiebreakers — officiating table" class="ml-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-500">TIE</span>` : ''}
                         </td>
                         <td class="px-2 py-2 text-center">${r.played}</td>
@@ -4977,6 +4988,7 @@
                         ${isOwnProfile ? '<button id="player-change-password-btn" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-semibold">Change Password</button><button id="player-delete-own-account-btn" class="px-3 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-xs font-semibold text-red-600 dark:text-red-400">Delete My Account</button>' : ''}
                         ${isOwnProfile && ownRosterPlayer ? `<button id="player-self-checkin-btn" ${ownCheckIn?.checkedIn ? 'disabled' : ''} class="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold ${ownCheckIn?.checkedIn ? 'opacity-70 cursor-not-allowed' : 'hover:bg-emerald-500'}">${ownCheckIn?.checkedIn ? `Checked In${ownCheckIn.time ? ` · ${esc(ownCheckIn.time)}` : ''}` : 'Check In'}</button>` : ''}
                       </div>
+                      ${isOwnProfile && ownRosterPlayer ? `<p class="w-full text-xs text-stone-500">Check-in tournament: <span class="font-semibold">${esc(state.config.name)}</span></p>` : ''}
                       ${isOwnProfile && !ownRosterParticipant && !ownCheckInClosed ? '<p class="w-full text-xs text-stone-500">You are not on this tournament roster, so check-in is unavailable.</p>' : ''}
                       ${isOwnProfile && ownRosterParticipant && ownCheckInClosed ? '<p class="w-full text-xs text-stone-500">Check-in is closed for this completed tournament.</p>' : ''}
                     </article>
@@ -5141,7 +5153,7 @@
           const query = search.value.trim();
           const request = ++requestNumber;
           try {
-            const response = await fetch(`${getSyncApiUrl()}/api/player-directory?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
+            const response = await fetch(`${getSyncApiUrl()}/api/player-directory?q=${encodeURIComponent(query)}`, { cache: 'no-store', headers: getProfileReadHeaders() });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || `Player search failed (HTTP ${response.status})`);
             if (!Array.isArray(result.players)) throw new Error('Invalid player search response');
@@ -5241,6 +5253,18 @@
       }
 
       function renderPlayerCheckInScreen() {
+        if (!state.auth.loggedIn || state.auth.role === 'guest') {
+          return `
+            <div class="min-h-screen flex flex-col items-center justify-center p-4">
+              <div class="absolute top-4 right-4">${renderThemeSwitcher()}</div>
+              <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 space-y-4">
+                <h1 class="text-lg font-bold">Check-in requires sign-in</h1>
+                <p class="text-sm text-stone-500">Sign in as a player or administrator to access check-in for ${esc(state.config.name)}.</p>
+                <button id="checkin-login-btn" class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold">Sign In</button>
+              </div>
+            </div>
+          `;
+        }
         if (state.auth.role !== 'admin') {
           const players = getAllImportedPlayers();
           const checkedInCount = players.filter(p => state.checkIns?.[p.name]?.checkedIn).length;
@@ -5253,6 +5277,7 @@
               <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 space-y-5">
                 <div class="flex items-center justify-between gap-2">
                   <div>
+                    <p class="text-xs font-semibold text-stone-500">Check-in tournament</p>
                     <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
                     <p class="text-xs text-stone-500">${message}</p>
                   </div>
@@ -5274,6 +5299,7 @@
             <div class="w-full max-w-md rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 shadow-xl p-6 sm:p-8 space-y-5">
               <div class="flex items-center justify-between gap-2">
                 <div>
+                  <p class="text-xs font-semibold text-stone-500">Check-in tournament</p>
                   <h1 class="text-lg font-bold tracking-tight">${esc(state.config.name)}</h1>
                   <p class="text-xs text-stone-500 dark:text-stone-400">Player QR Check-In · ${checkedInCount}/${players.length} signed in</p>
                 </div>
@@ -5312,6 +5338,7 @@
 
       function renderCheckInView() {
         const isAdmin = state.auth.role === 'admin';
+        const showSkill = state.auth.role !== 'guest';
         const ownRosterPlayer = state.auth.role === 'player' ? getOwnPlayerRosterEntry() : null;
         const ownCheckIn = ownRosterPlayer ? state.checkIns?.[ownRosterPlayer.name] : null;
         const players = getAllImportedPlayers();
@@ -5330,7 +5357,7 @@
           if (filter === 'SIGNED_IN' && !isSignedIn) return false;
           if (filter === 'PENDING' && isSignedIn) return false;
           if (groupFilter !== 'ALL' && String(p.groupIndex) !== String(groupFilter)) return false;
-          if (skill < skillMin || skill > skillMax) return false;
+          if (showSkill && (skill < skillMin || skill > skillMax)) return false;
           if (search && !p.name.toLowerCase().includes(search) && !p.group.toLowerCase().includes(search)) return false;
           return true;
         });
@@ -5340,6 +5367,7 @@
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h2 class="text-base font-bold">Imported vs. Signed-In Players</h2>
+                <p class="text-sm text-stone-600 dark:text-stone-300">Check-in tournament: <span class="font-semibold">${esc(state.config.name)}</span></p>
                 <p class="text-xs text-stone-500 dark:text-stone-400">Track attendance from your imported roster and QR check-ins</p>
               </div>
               <div class="flex flex-wrap items-center gap-2">
@@ -5381,13 +5409,13 @@
                   <option value="ALL" ${groupFilter === 'ALL' ? 'selected' : ''}>All Groups</option>
                   ${state.groups.map((g, gi) => `<option value="${gi}" ${String(groupFilter) === String(gi) ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}
                 </select>
-                <div class="inline-flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
+                ${showSkill ? `<div class="inline-flex items-center gap-1 text-xs text-stone-500 dark:text-stone-400">
                   <span>Skill:</span>
                   <input id="checkin-skill-min" type="number" min="1" max="10" placeholder="1" value="${esc(state.ui.checkInSkillMin ?? '')}" class="w-12 px-1.5 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs text-center tabular-nums" />
                   <span>–</span>
                   <input id="checkin-skill-max" type="number" min="1" max="10" placeholder="10" value="${esc(state.ui.checkInSkillMax ?? '')}" class="w-12 px-1.5 py-1.5 rounded-lg bg-white dark:bg-[#191B1F] border border-stone-300 dark:border-stone-700 text-xs text-center tabular-nums" />
-                </div>
-                ${(filter !== 'ALL' || search || groupFilter !== 'ALL' || state.ui.checkInSkillMin || state.ui.checkInSkillMax)
+                </div>` : ''}
+                ${(filter !== 'ALL' || search || groupFilter !== 'ALL' || (showSkill && (state.ui.checkInSkillMin || state.ui.checkInSkillMax)))
                   ? '<button id="checkin-clear-filters" class="px-2.5 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Clear</button>'
                   : ''}
               </div>
@@ -5416,14 +5444,14 @@
                     <tr>
                       <th class="px-4 py-2.5">Player</th>
                       <th class="px-4 py-2.5">Group</th>
-                      <th class="px-4 py-2.5 text-center">Skill</th>
+                      ${showSkill ? '<th class="px-4 py-2.5 text-center">Skill</th>' : ''}
                       <th class="px-4 py-2.5">Status</th>
                       <th class="px-4 py-2.5">Sign-In Time</th>
                       ${isAdmin ? '<th class="px-4 py-2.5 text-right">Action</th>' : ''}
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-stone-100 dark:divide-stone-800/70">
-                    ${filtered.length === 0 ? `<tr><td colspan="${isAdmin ? 5 : 4}" class="px-4 py-6 text-center text-xs text-stone-500">No players match this filter.</td></tr>` : filtered.map(p => {
+                    ${filtered.length === 0 ? `<tr><td colspan="${isAdmin ? 6 : showSkill ? 5 : 4}" class="px-4 py-6 text-center text-xs text-stone-500">No players match this filter.</td></tr>` : filtered.map(p => {
                       const info = state.checkIns?.[p.name];
                       const isSignedIn = Boolean(info?.checkedIn);
                       return `
@@ -5443,11 +5471,11 @@
                               </select>
                             ` : `<span class="text-stone-500 dark:text-stone-400">${esc(p.group)}</span>`}
                           </td>
-                          <td class="px-4 py-2 text-center">
+                          ${showSkill ? `<td class="px-4 py-2 text-center">
                             ${isAdmin ? `
                               <input data-ci-edit-skill="${esc(p.name)}" type="number" min="1" max="10" value="${getPlayerSkill(p.name)}" class="w-12 px-1.5 py-1 rounded-md bg-cream-50 dark:bg-[#111214] border border-stone-200 dark:border-stone-800 text-xs text-center font-semibold tabular-nums" />
                             ` : `<span class="font-semibold tabular-nums">${getPlayerSkill(p.name)}/10</span>`}
-                          </td>
+                          </td>` : ''}
                           <td class="px-4 py-2">
                             ${isSignedIn
                               ? '<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">Signed In</span>'
@@ -5552,6 +5580,15 @@
 
       function bindReadOnlyPlayerCheckInEvents() {
         bindThemeButtons();
+        document.getElementById('checkin-login-btn')?.addEventListener('click', () => {
+          state.ui.playerCheckInMode = false;
+          state.auth.loggedIn = false;
+          if (window.location.hash === '#checkin') {
+            history.replaceState(null, '', window.location.pathname + window.location.search);
+          }
+          saveRegistry();
+          render();
+        });
         document.getElementById('exit-player-checkin-btn')?.addEventListener('click', () => {
           state.ui.playerCheckInMode = false;
           if (window.location.hash === '#checkin') {
@@ -7692,7 +7729,7 @@
       });
 
       async function refreshPlayerDirectory() {
-        if (document.visibilityState === 'hidden' || !state.auth.loggedIn || state.ui.playerCheckInMode ||
+        if (document.visibilityState === 'hidden' || !state.auth.loggedIn || state.auth.role === 'guest' || state.ui.playerCheckInMode ||
             state.ui.activeTab !== 'players' ||
             !getSyncApiUrl() || playerData.loading || isEditingFormField() ||
             !document.getElementById('modal-root').classList.contains('hidden')) return null;

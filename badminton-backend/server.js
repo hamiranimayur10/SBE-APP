@@ -565,6 +565,22 @@ async function requirePlayer(req, res, next) {
   }
 }
 
+async function findProfileReader(req) {
+  const player = await findPlayerSession(req);
+  if (player) return Number(player.mustChangePassword) ? null : player;
+  return await findAdminSession(req) || validAdminKey(req);
+}
+
+async function requireProfileReader(req, res, next) {
+  try {
+    if (!await findProfileReader(req)) return res.status(401).json({ error: 'Player or admin login required' });
+    next();
+  } catch (err) {
+    console.error('Failed to validate profile access:', err);
+    res.status(500).json({ error: 'Profile permission check is unavailable' });
+  }
+}
+
 async function denyPlayerWrite(req, res, next) {
   try {
     if (await findPlayerSession(req)) return res.status(403).json({ error: 'Player accounts cannot modify tournament data' });
@@ -1126,10 +1142,10 @@ async function sendTournamentHistory(req, res, includeOwnPlayer) {
   }
 }
 
-app.get('/api/tournament-history/public', (req, res) => sendTournamentHistory(req, res, false));
-app.get('/api/tournament-history', (req, res) => sendTournamentHistory(req, res, true));
+app.get('/api/tournament-history/public', requireProfileReader, (req, res) => sendTournamentHistory(req, res, false));
+app.get('/api/tournament-history', requireProfileReader, (req, res) => sendTournamentHistory(req, res, true));
 
-app.get('/api/player-directory', async (req, res) => {
+app.get('/api/player-directory', requireProfileReader, async (req, res) => {
   try {
     const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
     if (query.length > 120) throw new ValidationError('Search must be at most 120 characters');
@@ -1163,7 +1179,7 @@ app.get('/api/player-directory', async (req, res) => {
 });
 
 let playerIdentityCache = null;
-app.get('/api/player-performance', async (req, res) => {
+app.get('/api/player-performance', requireProfileReader, async (req, res) => {
   let transaction;
   try {
     const id = typeof req.query.id === 'string' ? req.query.id.trim() : '';
@@ -1639,7 +1655,7 @@ app.post('/api/player-auth/logout', async (req, res) => {
   }
 });
 
-app.get('/api/players', async (_req, res) => {
+app.get('/api/players', requireProfileReader, async (_req, res) => {
   try {
     const result = await getDb().execute('SELECT * FROM player_profiles ORDER BY player_name');
     res.set('Cache-Control', 'no-store');
@@ -2336,12 +2352,21 @@ app.get('/api/tournaments/:id', async (req, res) => {
       return res.json({ exists: false, data: null });
     }
     const row = result.rows[0];
-    const revision = tournamentRevision(row.data);
+    const profileReader = await findProfileReader(req);
+    const revision = tournamentRevision(row.data) + (profileReader ? '' : ':v2:guest');
     if ((req.query.revision && req.query.revision === revision) ||
         (!req.query.revision && since && since === row.updated_at)) {
       return res.json({ exists: true, unchanged: true, updatedAt: row.updated_at, revision });
     }
-    res.json({ exists: true, data: JSON.parse(row.data), updatedAt: row.updated_at, revision });
+    const data = JSON.parse(row.data);
+    if (!profileReader) {
+      delete data.playerSkills;
+      delete data.playerProfileIds;
+      delete data.checkIns;
+      delete data.auth;
+      delete data.ui;
+    }
+    res.json({ exists: true, data, updatedAt: row.updated_at, revision });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -70,6 +70,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
   const baseUrl = `http://127.0.0.1:${port}`;
   const adminHeaders = { 'content-type': 'application/json', 'x-sync-key': 'player-auth-test-admin-key' };
   const api = async (endpoint, options) => {
+    if (!options && /^\/api\/(players(?:\?|$)|player-directory|player-performance|tournament-history|tournaments\/[^/?]+(?:\?|$))/.test(endpoint)) {
+      options = { headers: adminHeaders };
+    }
     const response = await fetch(`${baseUrl}${endpoint}`, options);
     const body = await response.json();
     return { response, body };
@@ -205,6 +208,24 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.ok(versionsAfterCreate.profiles > versionsBeforeCreate.body.profiles);
     assert.match(savedTournament.body.playerProfileIds['roster alice'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     assert.match(savedTournament.body.playerProfileIds['roster bob'], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    for (const endpoint of ['/api/players', '/api/player-directory', '/api/player-performance?id=missing',
+      '/api/tournament-history', '/api/tournament-history/public']) {
+      assert.equal((await api(endpoint, {})).response.status, 401, endpoint);
+      assert.equal((await api(endpoint, { headers: { cookie: 'sbe_player_session=invalid' } })).response.status, 401, endpoint);
+      assert.equal((await api(endpoint, { headers: { cookie: secondAdminCookie } })).response.status === 401, false, endpoint);
+    }
+    const guestTournament = await api('/api/tournaments/auth-test', {});
+    assert.equal(guestTournament.response.status, 200);
+    assert.deepEqual(guestTournament.body.data.groups[0].players, ['Roster Alice', 'Roster Bob']);
+    assert.equal(guestTournament.body.data.playerSkills, undefined);
+    assert.equal(guestTournament.body.data.playerProfileIds, undefined);
+    assert.equal(guestTournament.body.data.checkIns, undefined);
+    assert.equal(guestTournament.body.data.auth, undefined);
+    assert.equal(guestTournament.body.data.ui, undefined);
+    assert.match(guestTournament.body.revision, /:guest$/);
+    const upgradedTournament = await api(`/api/tournaments/auth-test?revision=${encodeURIComponent(guestTournament.body.revision)}`);
+    assert.equal(upgradedTournament.body.unchanged, undefined);
+    assert.equal(upgradedTournament.body.revision, savedTournament.body.revision);
     const publicTournamentHistory = await api('/api/tournament-history');
     assert.equal(publicTournamentHistory.response.status, 200);
     assert.ok(publicTournamentHistory.body.tournaments.some(tournament => tournament.id === 'auth-test'));
@@ -622,6 +643,8 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     const splitPublicHistory = await api('/api/tournament-history/public', { headers: { cookie: playerCookie } });
     assert.equal(Object.hasOwn(splitPublicHistory.body, 'ownPlayer'), false);
     assert.equal(splitPublicHistory.body.players.find(player => player.playerId === update.body.player.playerId).city, '');
+    assert.equal((await api('/api/players', { headers: { cookie: playerCookie } })).response.status, 200);
+    assert.equal((await api('/api/player-directory', { headers: { cookie: playerCookie } })).response.status, 200);
     const renamedSearch = await api('/api/player-directory?q=Ace');
     assert.ok(renamedSearch.body.players.some(player => player.playerId === update.body.player.playerId));
     const hiddenNameSearch = await api('/api/player-directory?q=Renamed');
@@ -634,8 +657,8 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(publicPerformance.body.player.profile.skill, null);
     assert.equal(publicPerformance.body.player.name, 'Ace');
     assert.equal(publicPerformance.body.player.profile.name, 'Ace');
-    const anonymousSnapshot = await api('/api/tournament-history');
-    assert.equal(anonymousSnapshot.body.ownPlayer, null);
+    const anonymousSnapshot = await api('/api/tournament-history', {});
+    assert.equal(anonymousSnapshot.response.status, 401);
 
     const publicProfiles = await api('/api/players');
     assert.equal(publicProfiles.response.status, 200);
@@ -834,6 +857,9 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal((await api('/api/changes/auth-test')).body.tournament, beforeAdminCheckIn.tournament + 1);
     assert.equal(adminCheckIn.body.data.checkIns['Roster Bob'].checkedIn, true);
     assert.match(adminCheckIn.body.revision, /^[0-9a-f]{64}$/);
+    assert.equal((await api('/api/tournaments/auth-test', {})).body.data.checkIns, undefined);
+    assert.equal((await api('/api/tournaments/auth-test', { headers: adminHeaders })).body.data.checkIns['Roster Bob'].checkedIn, true);
+    assert.equal((await api('/api/tournaments/auth-test', { headers: { cookie: changedPasswordCookie } })).body.data.checkIns['Roster Bob'].checkedIn, true);
 
     const removeCheckIn = await api('/api/tournaments/auth-test/checkin', {
       method: 'POST',
@@ -924,6 +950,10 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(aliceSkillUpdate.response.status, 200);
     assert.equal(aliceSkillUpdate.body.player.skill, 4);
     assert.equal((await api('/api/tournaments/auth-test')).body.data.playerSkills['Roster Alice'], 7);
+    const guestSkillState = await api('/api/tournaments/auth-test', {});
+    assert.equal(guestSkillState.body.data.playerSkills, undefined);
+    assert.ok(guestSkillState.body.data.groups.length);
+    assert.equal((await api(`/api/tournaments/auth-test?revision=${encodeURIComponent(guestSkillState.body.revision)}`, {})).body.unchanged, true);
 
     const duplicateSelfCheckIn = await api('/api/player-auth/tournaments/auth-test/checkin', {
       method: 'POST',
@@ -985,6 +1015,7 @@ test('player invitations, sessions, profile ownership, and visibility', { timeou
     assert.equal(temporaryLogin.response.status, 200);
     assert.equal(temporaryLogin.body.mustChangePassword, true);
     const temporaryCookie = temporaryLogin.response.headers.get('set-cookie').split(';')[0];
+    assert.equal((await api('/api/player-directory', { headers: { cookie: temporaryCookie } })).response.status, 401);
     assert.equal((await api('/api/player-auth/activity', { method: 'POST', headers: { cookie: temporaryCookie, 'x-sbe-player-request': '1' } })).response.status, 200);
     const blockedUntilPasswordChange = await api('/api/player-auth/tournaments/auth-test/checkin', {
       method: 'POST',

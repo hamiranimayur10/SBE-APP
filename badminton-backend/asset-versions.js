@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const publicDir = path.join(__dirname, '..', 'public');
-const assets = ['app.js', 'app.css', 'player-analytics.js', 'tournament-draw.js', 'tailwind-config.js'];
+const assets = ['app.js', 'app.css', 'analytics.js', 'player-analytics.js', 'tournament-draw.js', 'tailwind-config.js'];
 
 function getAssetVersions() {
   return Object.fromEntries(assets.map(name => [

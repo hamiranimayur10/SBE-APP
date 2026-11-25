@@ -22,6 +22,92 @@ async function getAvailablePort() {
   return port;
 }
 
+test('admin replaces an unplayed draw player atomically and clears attendance', { timeout: 30000 }, async () => {
+    const databasePath = path.join(__dirname, `player-replacement-${process.pid}.db`);
+    const port = await getAvailablePort();
+    const child = spawn(process.execPath, [path.join(root, 'badminton-backend', 'server.js')], {
+      cwd: root,
+      env: {
+        ...process.env, PORT: String(port), ADMIN_SYNC_KEY: 'replacement-test-key',
+        SBE_TURSO_DATABASE_URL_Direct: `file:${databasePath.replace(/\\/g, '/')}`,
+        SBE_TURSO_AUTH_TOKEN_Direct: '', VERCEL: ''
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk.toString(); });
+    child.stderr.on('data', chunk => { output += chunk.toString(); });
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const adminHeaders = { 'content-type': 'application/json', 'x-sync-key': 'replacement-test-key' };
+    const api = async (endpoint, options) => {
+      const response = await fetch(`${baseUrl}${endpoint}`, options);
+      return { response, body: await response.json() };
+    };
+    try {
+      let healthy = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (child.exitCode !== null) throw new Error(`Test backend exited early:\n${output}`);
+        try {
+          if ((await fetch(`${baseUrl}/api/health`)).ok) { healthy = true; break; }
+        } catch (_err) {}
+        await delay(100);
+      }
+      assert.ok(healthy, `Test backend did not become ready:\n${output}`);
+      const draw = {
+        tournamentId: 'replacement-test', phase: 'qr1', config: { name: 'Replacement test' },
+        groups: [{ id: 'A', name: 'Group A', leader: 'Alice', players: ['Alice', 'Bob', 'Cathy', 'Dan'] }],
+        qr1Matches: [{ id: 'm1', groupId: 'A', p1: 'Alice & Bob', p2: 'Cathy & Dan', s1: null, s2: null, completed: false }],
+        playerSkills: { Alice: 8 }, checkIns: {}, qr2Pools: {}, qr2Matches: {}, semis: {}, finals: {}
+      };
+      const created = await api('/api/tournaments/replacement-test', {
+        method: 'PUT', headers: { ...adminHeaders, 'x-tournament-revision': 'new' }, body: JSON.stringify(draw)
+      });
+      assert.equal(created.response.status, 200);
+      const imported = await api('/api/player-import', {
+        method: 'POST', headers: adminHeaders, body: JSON.stringify({ players: [{ name: 'Eve', skill: 7 }] })
+      });
+      assert.equal(imported.response.status, 200);
+      const directory = await api('/api/player-import/directory', { headers: adminHeaders });
+      const replacement = directory.body.profiles.find(profile => profile.name === 'Eve');
+      const bob = directory.body.profiles.find(profile => profile.name === 'Bob');
+      const checkin = await api('/api/tournaments/replacement-test/checkin', {
+        method: 'POST', headers: adminHeaders, body: JSON.stringify({ playerName: 'Alice', groupName: 'Group A', skill: 8 })
+      });
+      assert.equal(checkin.response.status, 200);
+      const body = JSON.stringify({ withdrawnName: 'Alice', replacementId: replacement.playerId, replacementRevision: replacement.revision });
+      const replace = (headers, data = body) => api('/api/tournaments/replacement-test/replace-player', { method: 'POST', headers, body: data });
+      assert.equal((await replace({ 'content-type': 'application/json', 'x-tournament-revision': checkin.body.revision })).response.status, 401);
+      assert.equal((await replace({ ...adminHeaders, 'x-tournament-revision': created.body.revision })).response.status, 409);
+      assert.equal((await replace({ ...adminHeaders, 'x-tournament-revision': checkin.body.revision },
+        JSON.stringify({ withdrawnName: 'Alice', replacementId: replacement.playerId, replacementRevision: 'stale' }))).response.status, 409);
+      assert.equal((await replace({ ...adminHeaders, 'x-tournament-revision': checkin.body.revision },
+        JSON.stringify({ withdrawnName: 'Alice', replacementId: bob.playerId, replacementRevision: bob.revision }))).response.status, 409);
+      const saved = await replace({ ...adminHeaders, 'x-tournament-revision': checkin.body.revision });
+      assert.equal(saved.response.status, 200);
+      assert.equal(saved.body.data.groups[0].leader, 'Eve');
+      assert.equal(saved.body.data.qr1Matches[0].p1, 'Eve & Bob');
+      assert.equal(saved.body.data.playerProfileIds.eve, replacement.playerId);
+      assert.equal(saved.body.data.checkIns.Alice, undefined);
+      const persisted = await api('/api/tournaments/replacement-test', { headers: adminHeaders });
+      assert.equal(persisted.body.revision, saved.body.revision);
+      assert.equal(persisted.body.data.groups[0].players[0], 'Eve');
+      const db = createClient({ url: `file:${databasePath.replace(/\\/g, '/')}` });
+      const attendance = await db.execute("SELECT player_name FROM player_checkins WHERE tournament_id = 'replacement-test'");
+      assert.equal(attendance.rows.length, 0);
+      assert.equal((await db.execute("SELECT player_name FROM player_profiles WHERE player_name = 'Alice'")).rows.length, 1);
+      db.close();
+    } finally {
+      if (child.exitCode === null) {
+        const exited = new Promise(resolve => child.once('exit', resolve));
+        child.kill();
+        await exited;
+      }
+      for (const suffix of ['', '-shm', '-wal']) {
+        try { await fs.unlink(`${databasePath}${suffix}`); } catch (_err) {}
+      }
+    }
+});
+
 test('player invitations, sessions, profile ownership, and visibility', { timeout: 30000 }, async () => {
   const databasePath = path.join(__dirname, `player-auth-${process.pid}.db`);
   const databaseUrl = `file:${databasePath.replace(/\\/g, '/')}`;

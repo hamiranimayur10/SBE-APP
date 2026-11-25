@@ -7,6 +7,7 @@ const { promisify } = require('util');
 const { isDeepStrictEqual } = require('util');
 const { getAssetVersions } = require('./asset-versions');
 const PlayerAnalytics = require('../public/player-analytics');
+const TournamentDraw = require('../public/tournament-draw');
 
 const app = express();
 app.use(cors());
@@ -2369,6 +2370,59 @@ app.get('/api/tournaments/:id', async (req, res) => {
     res.json({ exists: true, data, updatedAt: row.updated_at, revision });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/tournaments/:id/replace-player', requireAdminKey, async (req, res) => {
+  let transaction;
+  try {
+    const { withdrawnName, replacementId, replacementRevision } = req.body || {};
+    const revision = req.get('x-tournament-revision');
+    if (typeof withdrawnName !== 'string' || !withdrawnName.trim() || !isPlayerId(replacementId) ||
+        typeof replacementRevision !== 'string' || !replacementRevision) {
+      return res.status(400).json({ error: 'Select a valid player and replacement profile' });
+    }
+    if (!revision) return res.status(428).json({ error: 'Tournament revision is required; reload before replacing a player' });
+    transaction = await getDb().transaction('write');
+    const tournamentResult = await transaction.execute({
+      sql: 'SELECT data FROM tournaments WHERE id = ?', args: [req.params.id]
+    });
+    if (!tournamentResult.rows.length) throw new NotFoundError('Tournament not found');
+    const original = tournamentResult.rows[0].data;
+    if (revision !== tournamentRevision(original)) throw new ConflictError('Tournament changed; reload before replacing a player');
+    const profileResult = await transaction.execute({
+      sql: 'SELECT * FROM player_profiles WHERE player_id = ?', args: [replacementId]
+    });
+    const row = profileResult.rows[0];
+    if (!row || row.revision !== replacementRevision) throw new ConflictError('Replacement profile changed; refresh the player directory');
+    const tournament = JSON.parse(original);
+    const profile = serializePlayerProfile(row, false);
+    TournamentDraw.replaceRound1Player(tournament, withdrawnName, profile);
+    const profiles = await transaction.execute('SELECT player_id, player_name, aliases FROM player_profiles');
+    tournament.playerProfileIds = getTournamentPlayerProfileIds(tournament, profiles.rows);
+    if (tournament.playerProfileIds[normalizeImportName(profile.name)] !== profile.playerId) {
+      throw new ConflictError('Replacement profile has an ambiguous roster identity');
+    }
+    const data = JSON.stringify(tournament);
+    const updatedAt = new Date().toISOString();
+    await transaction.execute({
+      sql: 'UPDATE tournaments SET data = ?, updated_at = ? WHERE id = ?',
+      args: [data, updatedAt, req.params.id]
+    });
+    await transaction.execute({
+      sql: 'DELETE FROM player_checkins WHERE tournament_id = ? AND player_name IN (?, ?)',
+      args: [req.params.id, withdrawnName, profile.name]
+    });
+    await transaction.commit();
+    res.json({ ok: true, data: tournament, updatedAt, revision: tournamentRevision(data) });
+  } catch (err) {
+    if (transaction) await transaction.rollback();
+    if (err instanceof NotFoundError) return res.status(404).json({ error: err.message });
+    if (err instanceof ConflictError || err instanceof RangeError) return res.status(409).json({ error: err.message });
+    console.error('Player replacement failed:', err);
+    res.status(500).json({ error: 'Player replacement failed' });
+  } finally {
+    if (transaction) transaction.close();
   }
 });
 

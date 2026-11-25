@@ -1480,9 +1480,9 @@
         }
       }
 
-      function applyCheckInResult(result, tournamentId) {
+      function applyTournamentMutationResult(result, tournamentId) {
         if (state.tournamentId !== tournamentId || !result.data || !result.revision) {
-          throw new Error('Check-in was saved, but the tournament must be reloaded');
+          throw new Error('The change was saved, but the tournament must be reloaded');
         }
         state = normalizeTournamentState({
           ...result.data, tournamentId, auth: state.auth, ui: state.ui,
@@ -1532,7 +1532,7 @@
           });
           const result = await response.json();
           if (!response.ok) throw new Error(result.error || `Check-in sync failed (HTTP ${response.status})`);
-          applyCheckInResult(result, tournamentId);
+          applyTournamentMutationResult(result, tournamentId);
         } finally {
           checkInSaveInProgress = false;
           app.inert = false;
@@ -4065,6 +4065,7 @@
               </div>
               ${isAdmin ? `
                 <div class="flex items-center gap-2">
+                  <button id="replace-draw-player-btn" ${state.phase !== 'qr1' || round2Exists ? 'disabled title="Available before Round 2 is scheduled"' : ''} class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-50">Replace Player</button>
                   ${!allDone ? `<button id="sim-qr1-btn" class="px-3 py-1.5 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium hover:bg-stone-100 dark:hover:bg-stone-800">Simulate Remaining</button>` : ''}
                   <button id="advance-qr2-btn" ${allDone && !round2Exists ? '' : 'disabled'} class="px-4 py-1.5 rounded-lg text-xs font-bold transition ${allDone && !round2Exists ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-stone-300 dark:bg-stone-800 text-stone-500 cursor-not-allowed'}">
                     ${round2Exists ? 'Round 2 scheduled' : 'Advance to QR2 →'}
@@ -4550,6 +4551,97 @@
             ${photoUrl ? `<img data-player-photo src="${esc(photoUrl)}" alt="${esc(displayName)}" class="absolute inset-0 w-full h-full object-cover" />` : ''}
           </div>
         `;
+      }
+
+      async function openDrawPlayerReplacement() {
+        if (state.auth.role !== 'admin') return;
+        if (scoreSaveInProgress || checkInSaveInProgress || hasUnsavedScoreEntry()) {
+          showToast('Save or clear score entries before replacing a player', 'error');
+          return;
+        }
+        const tournamentId = state.tournamentId;
+        let profiles;
+        try {
+          profiles = await getPlayerProfileDirectory();
+        } catch (err) {
+          showToast(`Could not load player profiles: ${err.message}`, 'error');
+          return;
+        }
+        if (state.tournamentId !== tournamentId || state.auth.role !== 'admin') return;
+        const available = profiles.filter(profile => profile?.name && isValidPlayerId(profile.playerId) && !isPlayerProfileInRoster(profile))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        openModal(`
+          <div class="w-full max-w-lg rounded-2xl bg-white dark:bg-[#191B1F] border border-stone-200 dark:border-stone-800 p-6 space-y-4">
+            <h3 class="text-lg font-bold">Replace a player in the draw</h3>
+            <p class="text-xs text-stone-500">Available in Round 1 before the withdrawn player has a recorded score. Their unplayed matches and group position transfer to the replacement; attendance is cleared for both players. Other scores remain unchanged.</p>
+            <label class="block text-xs font-semibold">Withdrawn player
+              <select id="draw-withdrawn" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                <option value="">Select a player</option>
+                ${state.groups.map(group => `<optgroup label="${esc(group.name)}">${group.players.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}</optgroup>`).join('')}
+              </select>
+            </label>
+            <label class="block text-xs font-semibold">Replacement profile
+              <select id="draw-replacement" class="mt-1 w-full px-3 py-2 rounded-lg bg-cream-50 dark:bg-[#111214] border border-stone-300 dark:border-stone-700 text-sm">
+                <option value="">${available.length ? 'Select an unassigned player' : 'No unassigned profiles available'}</option>
+                ${available.map(profile => `<option value="${esc(profile.playerId)}">${esc(profile.name)}${profile.playerCode ? ` · ${esc(profile.playerCode)}` : ''}</option>`).join('')}
+              </select>
+            </label>
+            <p id="draw-replacement-error" role="alert" class="hidden text-xs text-red-600"></p>
+            <div class="flex justify-end gap-2">
+              <button id="draw-replacement-cancel" class="px-3 py-2 rounded-lg border border-stone-300 dark:border-stone-700 text-xs font-medium">Cancel</button>
+              <button id="draw-replacement-confirm" ${available.length ? '' : 'disabled'} class="px-4 py-2 rounded-lg bg-gold-500 text-stone-950 text-xs font-bold disabled:opacity-50">Replace Player</button>
+            </div>
+          </div>
+        `);
+        document.getElementById('draw-replacement-cancel').addEventListener('click', closeModal);
+        document.getElementById('draw-replacement-confirm').addEventListener('click', async event => {
+          const button = event.currentTarget;
+          const error = document.getElementById('draw-replacement-error');
+          const withdrawn = document.getElementById('draw-withdrawn').value;
+          const replacement = available.find(profile => profile.playerId === document.getElementById('draw-replacement').value);
+          button.disabled = true;
+          error.classList.add('hidden');
+          try {
+            if (state.auth.role !== 'admin' || state.tournamentId !== tournamentId || scoreSaveInProgress ||
+                checkInSaveInProgress || hasUnsavedScoreEntry()) throw new Error('Tournament or score entry changed; close and try again');
+            const preview = JSON.parse(JSON.stringify(state));
+            TournamentDraw.replaceRound1Player(preview, withdrawn, replacement);
+            if (getSyncApiUrl()) {
+              if (state.sync.status === 'error') throw new Error('Resolve the tournament sync error before replacing a player');
+              if (syncTimer || syncInFlight || state.sync.status === 'pending') {
+                do {
+                  clearTimeout(syncTimer);
+                  syncTimer = null;
+                  if (!await pushToTurso(true)) throw new Error('Tournament changes could not be synced');
+                } while (state.sync.status === 'pending');
+              }
+              if (state.tournamentId !== tournamentId || state.auth.role !== 'admin' ||
+                  scoreSaveInProgress || checkInSaveInProgress || hasUnsavedScoreEntry() ||
+                  state.sync.status !== 'synced' || !state.sync.revision || state.sync.revision === 'new') {
+                throw new Error('Reload the tournament before replacing a player');
+              }
+              checkInSaveInProgress = true;
+              const result = await requestAdminApi(`/api/tournaments/${encodeURIComponent(tournamentId)}/replace-player`, {
+                method: 'POST',
+                headers: { 'x-tournament-revision': state.sync.revision },
+                body: JSON.stringify({ withdrawnName: withdrawn, replacementId: replacement.playerId, replacementRevision: replacement.revision })
+              });
+              applyTournamentMutationResult(result, tournamentId);
+            } else {
+              state = preview;
+              saveState();
+            }
+            closeModal();
+            render();
+            showToast(`${withdrawn} was replaced by ${replacement.name}`, 'success');
+          } catch (err) {
+            error.textContent = err.message;
+            error.classList.remove('hidden');
+            button.disabled = false;
+          } finally {
+            checkInSaveInProgress = false;
+          }
+        });
       }
 
       async function openGroupPlayerPicker(groupIndex) {
@@ -5880,7 +5972,7 @@
               method: 'POST',
               body: JSON.stringify({ playerName })
             });
-            applyCheckInResult(result, tournamentId);
+            applyTournamentMutationResult(result, tournamentId);
             render();
             showToast('You are checked in', 'success');
           } catch (err) {
@@ -7476,6 +7568,7 @@
         document.getElementById('start-tournament-btn')?.addEventListener('click', startTournament);
 
         // QR1, QR2, Semis, Finals bindings
+        document.getElementById('replace-draw-player-btn')?.addEventListener('click', openDrawPlayerReplacement);
         document.getElementById('sim-qr1-btn')?.addEventListener('click', () => simulateMatches(state.qr1Matches));
         document.getElementById('advance-qr2-btn')?.addEventListener('click', advanceToQR2);
         document.getElementById('sim-qr2-btn')?.addEventListener('click', () => simulateMatches(Object.values(state.qr2Matches || {}).flat()));

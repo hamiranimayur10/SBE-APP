@@ -55,6 +55,58 @@ const TournamentDraw = (() => {
       .filter(Boolean);
   }
 
+  function replaceRound1Player(tournament, withdrawnName, replacement) {
+    const identity = name => String(name || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+    const replacementName = String(replacement?.name || '').trim();
+    const replacementId = String(replacement?.playerId || '');
+    if (!withdrawnName || !replacementName || !replacementId || replacementName.includes('&')) {
+      throw new RangeError('Select a valid replacement profile');
+    }
+    if (tournament.phase !== 'qr1' || !Array.isArray(tournament.qr1Matches) ||
+        Object.values(tournament.qr2Pools || {}).some(pool => pool.length) ||
+        Object.values(tournament.qr2Matches || {}).some(matches => matches.length) ||
+        Object.values(tournament.semis || {}).some(matches => matches.length) ||
+        Object.values(tournament.finals || {}).some(Boolean)) {
+      throw new RangeError('Players can only be replaced before Round 2 is scheduled');
+    }
+    const groups = tournament.groups || [];
+    const matches = groups.flatMap(group => group.players.map((name, index) => ({ group, index, name })))
+      .filter(item => item.name === withdrawnName);
+    if (matches.length !== 1) throw new RangeError('The withdrawn player is not uniquely assigned to a group');
+    const replacementNames = new Set([replacementName, ...(replacement.aliases || [])].map(identity));
+    if (groups.some(group => group.players.some(name =>
+      replacementNames.has(identity(name)) ||
+      String(tournament.playerProfileIds?.[identity(name)] || '').toLowerCase() === replacementId.toLowerCase()
+    ))) throw new RangeError('The replacement is already on this tournament roster');
+    const affected = tournament.qr1Matches.filter(match => getMatchPlayers(match).includes(normalizePlayerName(withdrawnName)));
+    if (!affected.length) throw new RangeError('The player has no Round 1 matches in this draw');
+    if (affected.some(match => match.completed || match.s1 != null || match.s2 != null)) {
+      throw new RangeError('Cannot replace a player after a score has been recorded for their match');
+    }
+    const { group, index } = matches[0];
+    group.players[index] = replacementName;
+    if (group.leader === withdrawnName) group.leader = replacementName;
+    const replaceSide = side => String(side || '').split(/\s*&\s*/)
+      .map(name => normalizePlayerName(name) === normalizePlayerName(withdrawnName) ? replacementName : name).join(' & ');
+    affected.forEach(match => {
+      match.p1 = replaceSide(match.p1);
+      match.p2 = replaceSide(match.p2);
+    });
+    tournament.playerSkills = tournament.playerSkills || {};
+    delete tournament.playerSkills[withdrawnName];
+    tournament.playerSkills[replacementName] = replacement.skill == null ? 5 : replacement.skill;
+    tournament.checkIns = tournament.checkIns || {};
+    delete tournament.checkIns[withdrawnName];
+    delete tournament.checkIns[replacementName];
+    tournament.playerProfileIds = tournament.playerProfileIds || {};
+    const oldId = tournament.playerProfileIds[identity(withdrawnName)];
+    for (const [name, id] of Object.entries(tournament.playerProfileIds)) {
+      if (identity(name) === identity(withdrawnName) || (oldId && id === oldId)) delete tournament.playerProfileIds[name];
+    }
+    tournament.playerProfileIds[identity(replacementName)] = replacementId;
+  }
+
   function validateGroupMatchCount(playerCount, matchesPerPlayer) {
     if (!Number.isInteger(matchesPerPlayer) || matchesPerPlayer < 1) {
       throw new RangeError('Matches per player must be a positive whole number');
@@ -205,7 +257,7 @@ const TournamentDraw = (() => {
     return topFour.map((player, index) => [player, bottomFour[index]]);
   }
 
-  return { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, scheduleMatchesForCourts, validateGroupMatchCount, validateGroupPlayers };
+  return { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, replaceRound1Player, scheduleMatchesForCourts, validateGroupMatchCount, validateGroupPlayers };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = TournamentDraw;

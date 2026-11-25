@@ -54,6 +54,8 @@ After player sign-in, the app opens the tournament library with current/upcoming
 
 Guests and players can use **Match Center** to view fixtures, scores, standings, and brackets, including the Round 1 group filters. Score entry, schedule changes, and round advancement are available only to admins.
 
+In Qualifier Round 1, admins can use **Replace Player** to select an unassigned player profile for a withdrawal before the withdrawn player has a recorded score and before Round 2 is scheduled. The replacement takes the same group, leader position and unplayed match slots; unrelated results remain unchanged. Attendance for both players is cleared and the replacement must check in separately. The withdrawn player's profile and other tournament history are retained. Cloud replacements use the current tournament and profile revisions and are saved atomically.
+
 Guests and unauthenticated visitors must sign in to access attendance and QR check-in views. Admins can manage attendance; a signed-in player can check in only their own roster entry from Attendance or My Player Card, once, and only before the tournament is completed.
 
 The check-in views and the player's check-in control show the selected tournament name so players can confirm the event before checking in.

@@ -2,7 +2,54 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, scheduleMatchesForCourts } = require('../public/tournament-draw');
+const { drawSemiFinalPartners, generateGroupPairings, generateGroupSchedule, groupRankedPlayers, isTournamentReadyToComplete, replaceRound1Player, scheduleMatchesForCourts } = require('../public/tournament-draw');
+
+test('replacing a withdrawn Round 1 player preserves unrelated results and transfers only their draw', () => {
+  const tournament = {
+    phase: 'qr1',
+    groups: [{ id: 'A', leader: 'Ann', players: ['Ann', 'Bob', 'Cathy', 'Dan', 'Anna'] }],
+    qr1Matches: [
+      { id: '1', p1: 'Ann & Bob', p2: 'Cathy & Dan', s1: null, s2: null, completed: false, round: 1, court: 1 },
+      { id: '2', p1: 'Anna & Cathy', p2: 'Bob & Dan', s1: 21, s2: 15, completed: true }
+    ],
+    playerSkills: { Ann: 8 }, checkIns: { Ann: { checkedIn: true }, Eve: { checkedIn: true } },
+    playerProfileIds: { ann: 'old-id', 'former ann': 'old-id', bob: 'bob-id' }
+  };
+  replaceRound1Player(tournament, 'Ann', { name: 'Eve', playerId: 'new-id', skill: 7 });
+  assert.deepEqual(tournament.groups[0].players, ['Eve', 'Bob', 'Cathy', 'Dan', 'Anna']);
+  assert.equal(tournament.groups[0].leader, 'Eve');
+  assert.equal(tournament.qr1Matches[0].p1, 'Eve & Bob');
+  assert.equal(tournament.qr1Matches[0].round, 1);
+  assert.equal(tournament.qr1Matches[1].p1, 'Anna & Cathy');
+  assert.equal(tournament.qr1Matches[1].s1, 21);
+  assert.deepEqual(tournament.checkIns, {});
+  assert.deepEqual(tournament.playerSkills, { Eve: 7 });
+  assert.deepEqual(tournament.playerProfileIds, { bob: 'bob-id', eve: 'new-id' });
+});
+
+test('replacement rejects scored matches, later rounds and already-rostered identities without changing the draw', () => {
+  const fixture = () => ({
+    phase: 'qr1', groups: [{ players: ['Ann', 'Bob', 'Cathy', 'Dan'] }],
+    qr1Matches: [{ p1: 'Ann & Bob', p2: 'Cathy & Dan', s1: null, s2: null, completed: false }],
+    playerProfileIds: { bob: 'bob-id' }
+  });
+  const replacement = { name: 'Eve', playerId: 'eve-id' };
+  for (const change of [
+    state => { state.qr1Matches[0].s1 = 0; },
+    state => { state.qr1Matches[0].completed = true; },
+    state => { state.qr2Pools = { A: ['Ann'] }; },
+    state => { state.phase = 'finals'; }
+  ]) {
+    const state = fixture();
+    change(state);
+    const before = structuredClone(state);
+    assert.throws(() => replaceRound1Player(state, 'Ann', replacement), RangeError);
+    assert.deepEqual(state, before);
+  }
+  const state = fixture();
+  assert.throws(() => replaceRound1Player(state, 'Ann', { name: 'Robert', playerId: 'bob-id' }), /already/);
+  assert.throws(() => replaceRound1Player(state, 'Ann', { name: 'Robert', playerId: 'other', aliases: ['Bob'] }), /already/);
+});
 
 test('completion requires every stage and every group final to be finished', () => {
   const done = () => ({ completed: true });
